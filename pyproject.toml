@@ -8,4 +8,5 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy<2.0",
     "pvtrace>=2.1.6",
+    "viser>=0.2.0",
 ]
