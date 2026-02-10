@@ -30,11 +30,11 @@ except ImportError as e:
 
 class LED:
     """
-    Square planar LED with hemispherical (Lambertian) emission pattern.
+    Square planar LED with uniform emission pattern across viewing cone.
     
     Attributes:
         width: Width and height of the square LED (cm)
-        viewing_angle: Half-angle of emission cone (degrees), 90 = hemisphere
+        viewing_angle: Half-angle of emission cone (degrees)
         power: Electrical power (Watts)
         efficiency: Luminous efficacy (lumens/Watt)
         position: (x, y, z) position in world coordinates
@@ -53,7 +53,7 @@ class LED:
     
     def emit_rays(self, num_rays):
         """
-        Generate rays with Lambertian (hemispherical) distribution.
+        Generate rays with uniform distribution across the viewing cone.
         Returns list of (position, direction) tuples in world coordinates.
         """
         rays = []
@@ -68,29 +68,32 @@ class LED:
         x_axis = x_axis / np.linalg.norm(x_axis)
         y_axis = np.cross(z_axis, x_axis)
         
-        for _ in range(num_rays):
-            # Lambertian distribution: cos(theta) weighted
-            # theta = arcsin(sqrt(random)), phi = 2*pi*random
-            u1, u2 = np.random.uniform(0, 1, 2)
-            theta = np.arcsin(np.sqrt(u1))  # Lambertian
-            phi = 2 * np.pi * u2
+        # Uniform grid sampling for uniform beam coverage
+        # From center (theta=0) to edge (theta=viewing_angle)
+        n_theta = max(10, int(np.sqrt(num_rays)))
+        n_phi = n_theta * 4  # More azimuthal samples for complete coverage
+        
+        for i_theta in range(n_theta + 1):  # +1 to include edge at viewing_angle
+            # At center (theta=0), all phi directions are the same, so only need 1 ray
+            n_phi_actual = 1 if i_theta == 0 else n_phi
             
-            # Limit to viewing angle
-            max_theta = np.radians(self.viewing_angle)
-            theta = theta * (max_theta / (np.pi/2))  # Scale to viewing angle
-            
-            # Local direction
-            local_dir = np.array([
-                np.sin(theta) * np.cos(phi),
-                np.sin(theta) * np.sin(phi),
-                np.cos(theta)
-            ])
-            
-            # Transform to world coordinates
-            world_dir = local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis
-            world_dir = world_dir / np.linalg.norm(world_dir)
-            
-            rays.append((self.position.copy(), world_dir))
+            for i_phi in range(n_phi_actual):
+                # Sample from 0 to viewing_angle (inclusive)
+                theta = i_theta / n_theta * np.radians(self.viewing_angle)
+                phi = i_phi / n_phi * 2 * np.pi if i_theta > 0 else 0
+                
+                # Local direction
+                local_dir = np.array([
+                    np.sin(theta) * np.cos(phi),
+                    np.sin(theta) * np.sin(phi),
+                    np.cos(theta)
+                ])
+                
+                # Transform to world coordinates
+                world_dir = local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis
+                world_dir = world_dir / np.linalg.norm(world_dir)
+                
+                rays.append((self.position.copy(), world_dir))
         
         return rays
     
@@ -130,7 +133,7 @@ class LED:
 def main():
     parser = argparse.ArgumentParser(description="Lighting Simulation")
     parser.add_argument("--visualize", action="store_true", help="Enable 3D visualization")
-    parser.add_argument("--rays", type=int, default=1000, help="Rays per light source for heatmap")
+    parser.add_argument("--rays", type=int, default=5000, help="Rays per light source for heatmap")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--show-rays", dest="show_rays", action="store_true", help="Show rays in 3D visualization")
     group.add_argument("--hide-rays", dest="show_rays", action="store_false", help="Hide rays in 3D visualization")
