@@ -203,7 +203,7 @@ def main():
             "Side LED angle (°)", min=20, max=80, step=1, initial_value=47
         )
         viewing_angle_slider = server.gui.add_slider(
-            "Viewing angle (°)", min=10, max=130, step=5, initial_value=10
+            "Viewing angle (°)", min=10, max=130, step=5, initial_value=120
         )
         # Per-group rotation sliders (rotate beam and visual together)
         rot_front_pos = server.gui.add_slider("Rotate front+ (°)", min=-180, max=180, step=1, initial_value=0)
@@ -271,14 +271,15 @@ def main():
     with server.gui.add_folder("Camera FOV"):
         show_camera_fov = server.gui.add_checkbox("Show Camera FOV", initial_value=True)
         camera_fov_h = server.gui.add_slider(
-            "Horizontal FOV (°)", min=10, max=120, step=1, initial_value=60
+            "Horizontal FOV (°)", min=10, max=120, step=1, initial_value=75
         )
         camera_fov_v = server.gui.add_slider(
-            "Vertical FOV (°)", min=10, max=90, step=1, initial_value=45
+            "Vertical FOV (°)", min=10, max=90, step=1, initial_value=60
         )
         camera_pos_x = server.gui.add_slider(
             "Camera X pos (cm)", min=-100, max=100, step=1, initial_value=0
         )
+        capture_fov_btn = server.gui.add_button("Capture FOV Image", color="green")
 
     # Store handles for dynamic objects
     camera_fov_handles = []
@@ -371,8 +372,13 @@ def main():
                 uniformity = float(ray_uniformity_slider.value)
                 n = 1.0 + uniformity * 3.0  # Exponent from 1 to 4
                 
-                # Cosine power distribution sampling
-                theta = np.arccos(np.power(1 - u1 * (1 - np.power(np.cos(max_theta), n + 1)), 1.0 / (n + 1)))
+                # Cosine power distribution sampling with clamping to avoid numerical issues
+                cos_max = np.cos(max_theta)
+                base = 1 - u1 * (1 - np.power(cos_max, n + 1))
+                base = np.clip(base, 0.0, 1.0)  # Clamp to valid range
+                cos_theta_sampled = np.power(base, 1.0 / (n + 1))
+                cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)  # Clamp for arccos
+                theta = np.arccos(cos_theta_sampled)
                 phi = 2 * np.pi * u2
 
                 local_dir = np.array(
@@ -446,6 +452,271 @@ def main():
                             grid[grid_z, grid_y] += lumens_per_ray
 
         return grid, wall_size
+
+    def capture_camera_fov_image():
+        """Capture intensity image within camera FOV at 1cm resolution."""
+        from datetime import datetime
+        from PIL import Image
+        
+        # Get current camera and wall settings
+        wall_dist = wall_dist_slider.value
+        cam_x = camera_pos_x.value
+        fov_h_deg = camera_fov_h.value
+        fov_v_deg = camera_fov_v.value
+        
+        # Calculate FOV dimensions on wall
+        fov_h_rad = np.radians(fov_h_deg)
+        fov_v_rad = np.radians(fov_v_deg)
+        fov_width_cm = 2 * (wall_dist - cam_x) * np.tan(fov_h_rad / 2)
+        fov_height_cm = 2 * (wall_dist - cam_x) * np.tan(fov_v_rad / 2)
+        
+        # Cell resolution: 1cm × 1cm (10mm²)
+        cell_size_cm = 1.0
+        grid_width = int(np.ceil(fov_width_cm / cell_size_cm))
+        grid_height = int(np.ceil(fov_height_cm / cell_size_cm))
+        
+        # Create grid for FOV region
+        fov_grid = np.zeros((grid_height, grid_width))
+        
+        # Get LEDs configuration
+        front_angle = front_angle_slider.value
+        side_angle = side_angle_slider.value
+        viewing_angle = viewing_angle_slider.value
+        radius = radius_slider.value
+        circle_center_x = circle_center_slider.value
+        num_rays = int(intensity_rays_slider.value)
+        
+        rotations = [
+            rot_front_pos.value,
+            rot_front_neg.value,
+            rot_side_pos.value,
+            rot_side_neg.value,
+        ]
+        
+        leds = create_leds(
+            front_angle,
+            side_angle,
+            viewing_angle,
+            radius,
+            circle_center_x,
+            group_rotations=rotations,
+            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
+            led_states=led_states,
+        )
+        
+        # Build absorbers
+        absorbers = []
+        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
+        for i, angle_deg in enumerate(angles_deg):
+            if i not in (0, 1):
+                continue
+            angle_rad = np.radians(angle_deg)
+            gx = circle_center_x + radius * np.cos(angle_rad)
+            gy = radius * np.sin(angle_rad)
+            y_offset = 6.5 if i == 0 else -6.5
+            gy = gy + y_offset
+            
+            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
+            if np.linalg.norm(radial) == 0:
+                radial_unit = np.array((1.0, 0.0, 0.0))
+            else:
+                radial_unit = radial / np.linalg.norm(radial)
+            
+            abs_cx = gx - radial_unit[0] * 1.0
+            abs_cy = gy - radial_unit[1] * 1.0
+            abs_cz = 0.0
+            half_length_x = 0.35
+            half_width_y = 1.0
+            half_thickness_z = 1.5
+            
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+            })
+        
+        # Ray tracing for FOV region
+        lumens_per_led = float(led_lumens_slider.value)
+        num_rays_per_led = num_rays // 4
+        
+        print(f"Capturing FOV image: {grid_width}x{grid_height} pixels...")
+        
+        for led_idx, led in enumerate(leds):
+            if hasattr(led, 'enabled') and not led.enabled:
+                continue
+            
+            idx = getattr(led, 'led_index', led_idx)
+            np.random.seed((42 + idx) % (2**32))
+            
+            z_axis = led.direction
+            if abs(z_axis[2]) < 0.9:
+                x_axis = np.cross(z_axis, [0, 0, 1])
+            else:
+                x_axis = np.cross(z_axis, [0, 1, 0])
+            x_axis = x_axis / np.linalg.norm(x_axis)
+            y_axis = np.cross(z_axis, x_axis)
+            
+            for _ in range(num_rays_per_led):
+                u1, u2 = np.random.uniform(0, 1, 2)
+                max_theta = np.radians(led.viewing_angle)
+                
+                uniformity = float(ray_uniformity_slider.value)
+                n = 1.0 + uniformity * 3.0
+                
+                # Cosine power distribution sampling with clamping
+                cos_max = np.cos(max_theta)
+                base = 1 - u1 * (1 - np.power(cos_max, n + 1))
+                base = np.clip(base, 0.0, 1.0)
+                cos_theta_sampled = np.power(base, 1.0 / (n + 1))
+                cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)
+                theta = np.arccos(cos_theta_sampled)
+                phi = 2 * np.pi * u2
+                
+                local_dir = np.array([
+                    np.sin(theta) * np.cos(phi),
+                    np.sin(theta) * np.sin(phi),
+                    np.cos(theta),
+                ])
+                world_dir = (
+                    local_dir[0] * x_axis
+                    + local_dir[1] * y_axis
+                    + local_dir[2] * z_axis
+                )
+                world_dir = world_dir / np.linalg.norm(world_dir)
+                
+                # Check absorber intersection
+                def ray_box_intersection(pos, direction, box):
+                    center = np.array(box['center'], dtype=float)
+                    half = np.array(box['half_sizes'], dtype=float)
+                    tmin = -np.inf
+                    tmax = np.inf
+                    for k in range(3):
+                        if abs(direction[k]) < 1e-12:
+                            if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
+                                return None
+                        else:
+                            t1 = (center[k] - half[k] - pos[k]) / direction[k]
+                            t2 = (center[k] + half[k] - pos[k]) / direction[k]
+                            t_near = min(t1, t2)
+                            t_far = max(t1, t2)
+                            tmin = max(tmin, t_near)
+                            tmax = min(tmax, t_far)
+                            if tmin > tmax:
+                                return None
+                    if tmax < 0:
+                        return None
+                    return tmin if tmin > 0 else (tmax if tmax > 0 else None)
+                
+                hit_absorbed = False
+                for a in absorbers:
+                    t_hit = ray_box_intersection(led.position, world_dir, a)
+                    if t_hit is not None and t_hit > 0:
+                        hit_absorbed = True
+                        break
+                
+                if hit_absorbed:
+                    continue
+                
+                if world_dir[0] > 0:
+                    t = (wall_dist - led.position[0]) / world_dir[0]
+                    if t > 0:
+                        hit_y = led.position[1] + world_dir[1] * t
+                        hit_z = led.position[2] + world_dir[2] * t
+                        
+                        # Check if hit is within FOV bounds (centered at 0,0)
+                        half_w = fov_width_cm / 2
+                        half_h = fov_height_cm / 2
+                        
+                        if -half_w <= hit_y <= half_w and -half_h <= hit_z <= half_h:
+                            # Convert to FOV grid indices
+                            grid_x = int((hit_y + half_w) / cell_size_cm)
+                            grid_y = int((hit_z + half_h) / cell_size_cm)
+                            
+                            if 0 <= grid_x < grid_width and 0 <= grid_y < grid_height:
+                                cos_theta = np.cos(theta)
+                                intensity_coefficient = np.power(cos_theta, n)
+                                lumens_per_ray = (lumens_per_led / max(1, num_rays_per_led)) * intensity_coefficient
+                                fov_grid[grid_y, grid_x] += lumens_per_ray
+        
+        # Convert to lux and create image
+        cell_area_m2 = (cell_size_cm / 100.0) ** 2
+        lux_grid = fov_grid / cell_area_m2
+        
+        # Get max intensity for color mapping
+        max_lumens = fov_grid.max()
+        max_lux = lux_grid.max()
+        
+        # Create image using same colormap as render (intensity_to_color)
+        img_rgb = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
+        for i in range(grid_height):
+            for j in range(grid_width):
+                lumen_val = fov_grid[i, j]
+                color = intensity_to_color(lumen_val, max_lumens)
+                img_rgb[i, j] = [int(c * 255) for c in color]
+        
+        # Add legend to the right (50 pixels wide)
+        legend_width = 50
+        legend_steps = 100
+        full_width = grid_width + legend_width + 10  # 10px padding
+        img_with_legend = np.ones((grid_height, full_width, 3), dtype=np.uint8) * 255  # White background
+        
+        # Copy main image
+        img_with_legend[:, :grid_width, :] = img_rgb
+        
+        # Draw legend bar
+        legend_x_start = grid_width + 5
+        legend_x_end = legend_x_start + 30
+        
+        for i in range(legend_steps):
+            # Map i to grid_height
+            y_start = int(i * grid_height / legend_steps)
+            y_end = int((i + 1) * grid_height / legend_steps)
+            
+            # Intensity from top (max) to bottom (min)
+            intensity_fraction = 1.0 - (i / legend_steps)
+            lumen_val = intensity_fraction * max_lumens
+            color = intensity_to_color(lumen_val, max_lumens)
+            rgb = [int(c * 255) for c in color]
+            
+            img_with_legend[y_start:y_end, legend_x_start:legend_x_end, :] = rgb
+        
+        # Use PIL to add text labels
+        from PIL import ImageDraw, ImageFont
+        img_pil = Image.fromarray(img_with_legend, 'RGB')
+        draw = ImageDraw.Draw(img_pil)
+        
+        # Try to use a default font, fallback to PIL default
+        try:
+            font = ImageFont.truetype("arial.ttf", 10)
+        except:
+            font = ImageFont.load_default()
+        
+        # Add text labels at key points
+        num_labels = 6
+        for i in range(num_labels):
+            fraction = i / (num_labels - 1)
+            y_pos = int((1.0 - fraction) * grid_height)
+            lux_val = fraction * max_lux
+            
+            # Draw tick mark
+            draw.line([(legend_x_end, y_pos), (legend_x_end + 3, y_pos)], fill=(0, 0, 0), width=1)
+            
+            # Draw text
+            text = f"{lux_val:.0f}"
+            draw.text((legend_x_end + 5, y_pos - 5), text, fill=(0, 0, 0), font=font)
+        
+        # Add "lux" label
+        draw.text((legend_x_start, 5), "lux", fill=(0, 0, 0), font=font)
+        
+        # Save image
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"fov_intensity_{timestamp}.png"
+        img_pil.save(filename)
+        
+        print(f"FOV image saved to {filename}")
+        print(f"Image size: {grid_width} x {grid_height} pixels (1 pixel = 1cm²)")
+        print(f"FOV dimensions: {fov_width_cm:.2f} x {fov_height_cm:.2f} cm")
+        print(f"Total lumens in FOV: {fov_grid.sum():.2f} lm")
+        print(f"Max illuminance: {max_lux:.2f} lux")
 
     def intensity_to_color(value, max_val):
         """Convert intensity to inferno-like colormap."""
@@ -814,8 +1085,13 @@ def main():
                         uniformity = float(ray_uniformity_slider.value)
                         n = 1.0 + uniformity * 3.0  # Exponent from 1 to 4
                         
-                        # Cosine power distribution sampling
-                        theta = np.arccos(np.power(1 - u1 * (1 - np.power(np.cos(max_theta), n + 1)), 1.0 / (n + 1)))
+                        # Cosine power distribution sampling with clamping
+                        cos_max = np.cos(max_theta)
+                        base = 1 - u1 * (1 - np.power(cos_max, n + 1))
+                        base = np.clip(base, 0.0, 1.0)
+                        cos_theta_sampled = np.power(base, 1.0 / (n + 1))
+                        cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)
+                        theta = np.arccos(cos_theta_sampled)
                         phi = 2 * np.pi * u2
 
                         z_axis = led.direction
@@ -1043,6 +1319,9 @@ def main():
     
     # Button for manual intensity map update
     update_intensity_button.on_click(lambda _: update_intensity_map())
+    
+    # Button for capturing FOV intensity image
+    capture_fov_btn.on_click(lambda _: capture_camera_fov_image())
 
     # Capture default values so reset restores them
     defaults = {
