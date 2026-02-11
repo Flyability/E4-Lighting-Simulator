@@ -81,11 +81,6 @@ def create_leds(
         y = radius * np.sin(angle_rad)
         z = 0.0
 
-        # Direction: radially outward from circle center (before offset)
-        dir_x = x - circle_center_x
-        dir_y = y
-        dir_z = 0
-
         # Apply Y offset (green axis) based on group type to position only
         # Front groups (i=0, i=1): ±6.5 cm (13 cm apart)
         # Side groups (i=2, i=3): ±11.75 cm (23.5 cm apart)
@@ -94,6 +89,11 @@ def create_leds(
         else:  # Side (i in (2, 3))
             y_offset = 11.75 if i == 2 else -11.75
         y = y + y_offset
+
+        # Direction: radially outward from circle center (after offset)
+        dir_x = x - circle_center_x
+        dir_y = y
+        dir_z = 0
 
         # Build local in-plane axes for arranging rows and LEDs
         z_axis = np.array((dir_x, dir_y, dir_z), dtype=float)
@@ -203,7 +203,7 @@ def main():
             "Side LED angle (°)", min=20, max=80, step=1, initial_value=47
         )
         viewing_angle_slider = server.gui.add_slider(
-            "Viewing angle (°)", min=10, max=130, step=5, initial_value=120
+            "Viewing angle (°) [GWP9LR35: 120°]", min=10, max=130, step=5, initial_value=120
         )
         # Per-group rotation sliders (rotate beam and visual together)
         rot_front_pos = server.gui.add_slider("Rotate front+ (°)", min=-180, max=180, step=1, initial_value=0)
@@ -239,10 +239,10 @@ def main():
             "Show intensity on wall", initial_value=False
         )
         intensity_rays_slider = server.gui.add_slider(
-            "Rays for intensity", min=100, max=5000, step=100, initial_value=500
+            "Rays per pixel (↑quality, ↓speed)", min=10, max=500, step=5, initial_value=50
         )
         ray_uniformity_slider = server.gui.add_slider(
-            "Ray uniformity (0=Lambertian, 1=Focused)", min=0.0, max=1.0, step=0.2, initial_value=0.0
+            "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
         )
         led_lumens_slider = server.gui.add_slider(
             "LED lumens (lm/LED)", min=100, max=1000, step=10, initial_value=100
@@ -251,7 +251,12 @@ def main():
             "Wall grid resolution", min=5, max=100, step=5, initial_value=30
         )
         # Intensity legend shown under the sliders as HTML with color swatches
-        legend_html = server.gui.add_html("")
+        legend_html = server.gui.add_html(
+            "<div style='font-family: sans-serif;'>"
+            "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+            "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click<br>'Update Intensity Map' to populate legend</div>"
+            "</div>"
+        )
         wall_view_size = server.gui.add_slider(
             "Wall view size (cm)", min=100, max=200, step=10, initial_value=100
         )
@@ -266,6 +271,25 @@ def main():
         row3_chk = server.gui.add_checkbox("Row 3 on", initial_value=True)
         row4_chk = server.gui.add_checkbox("Row 4 on", initial_value=False)
         # Absorber controls moved to dedicated folder for clarity
+
+    # Room Mode - Cubic room with 5 walls (no back wall behind LEDs)
+    with server.gui.add_folder("Room Mode"):
+        room_mode_enable = server.gui.add_checkbox("Enable Room Mode", initial_value=False)
+        show_room_walls = server.gui.add_checkbox("Show Room Walls", initial_value=True)
+        show_room_intensity = server.gui.add_checkbox("Show Room Intensity", initial_value=False)
+        room_front_dist = server.gui.add_slider(
+            "Front wall distance (cm)", min=20, max=200, step=10, initial_value=50
+        )
+        room_side_dist = server.gui.add_slider(
+            "Side walls distance (cm)", min=50, max=300, step=10, initial_value=100
+        )
+        room_top_bottom_dist = server.gui.add_slider(
+            "Top/Bottom walls distance (cm)", min=50, max=300, step=10, initial_value=100
+        )
+        room_grid_size = server.gui.add_slider(
+            "Room walls grid resolution", min=10, max=50, step=5, initial_value=20
+        )
+        update_room_button = server.gui.add_button("Update Room Intensity")
 
     # Camera FOV visualization
     with server.gui.add_folder("Camera FOV"):
@@ -286,6 +310,8 @@ def main():
     led_handles = []
     ray_handles = []
     intensity_handles = []
+    room_intensity_handles = []
+    room_wall_handles = []
     absorber_handles = []
 
     # Absorbers folder (separate group for easier access)
@@ -344,6 +370,45 @@ def main():
 
         # Assume uniform luminous flux per LED provided by GUI
         lumens_per_led = float(led_lumens_slider.value) if 'led_lumens_slider' in globals() or True else 100.0
+        
+        # Count active LEDs to calculate rays per LED for target rays per pixel
+        num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
+        if num_active_leds == 0:
+            return grid, wall_size
+        
+        # Calculate rays per LED to achieve target rays per pixel (2 rays per pixel)
+        total_pixels = grid_size * grid_size
+        rays_per_led_calculated = max(1, int((total_pixels * num_rays_per_led) / num_active_leds))
+        
+        # Diagnostic: Print LED positions and approximate distances to wall
+        print(f"\n=== LED GEOMETRY CHECK ===")
+        print(f"Wall at x = {wall_dist:.1f} cm")
+        print(f"\n=== RAY EMISSION MODEL ===")
+        print(f"Each LED emits {lumens_per_led:.1f} lm total")
+        print(f"Distribution: Lambertian I(θ) = I₀ × cos^n(θ)")
+        print(f"Viewing angle: {leds[0].viewing_angle if leds else 120}° (50% intensity)")
+        print(f"Emission cone: 0-90° (full hemisphere)")
+        print(f"Rays per LED: {rays_per_led_calculated}")
+        print(f"Each ray carries: (lm/LED / N_rays) × cos^n(θ) × (n+1)")
+        print(f"This conserves flux: Σ[all rays] = {lumens_per_led:.1f} lm per LED")
+        print(f"==========================")
+        for i, led in enumerate(leds):
+            if hasattr(led, 'enabled') and not led.enabled:
+                continue
+            # Approximate distance from LED to wall along LED direction
+            if led.direction[0] > 0.01:  # LED pointing towards wall
+                t_center = (wall_dist - led.position[0]) / led.direction[0]
+                dist_along_axis = wall_dist - led.position[0]
+                print(f"  LED {i}: pos=({led.position[0]:.1f}, {led.position[1]:.1f}, {led.position[2]:.1f}), "
+                      f"dir=({led.direction[0]:.3f}, {led.direction[1]:.3f}, {led.direction[2]:.3f}), "
+                      f"dist_to_wall={dist_along_axis:.1f}cm, t_center={t_center:.1f}cm")
+            else:
+                print(f"  LED {i}: pos=({led.position[0]:.1f}, {led.position[1]:.1f}, {led.position[2]:.1f}), "
+                      f"dir=({led.direction[0]:.3f}, {led.direction[1]:.3f}, {led.direction[2]:.3f}), "
+                      f"NOT pointing towards wall")
+        print(f"==========================\n")
+        print(f"=== STARTING RAY TRACING ===\n")
+        
         for led_idx, led in enumerate(leds):
             # Skip disabled LEDs (check if attribute exists)
             if hasattr(led, 'enabled') and not led.enabled:
@@ -363,22 +428,61 @@ def main():
             x_axis = x_axis / np.linalg.norm(x_axis)
             y_axis = np.cross(z_axis, x_axis)
 
-            for _ in range(num_rays_per_led):
-                # Cosine power distribution: intensity proportional to cos^n(theta)
-                # uniformity: 0=Lambertian (n=1), 1=Focused (n=4)
+            # IMPORTANT: viewing_angle defines where intensity drops to 50%, NOT the cone edge!
+            # LEDs emit over full hemisphere (0° to 90°)
+            # Calculate exponent n so that intensity drops to 50% at viewing_angle/2
+            # I(θ) = I₀ × cos^n(θ), at θ_half: 0.5 = cos^n(θ_half)
+            # n = ln(0.5) / ln(cos(θ_half))
+            
+            # Maximum emission angle is 90° (hemisphere), not viewing_angle
+            max_theta = np.radians(90.0)  # Full hemisphere
+            
+            # Calculate n from viewing angle
+            theta_half = np.radians(led.viewing_angle / 2.0)
+            cos_half = np.cos(theta_half)
+            
+            # Calculate base exponent for this viewing angle
+            if cos_half > 0.01:  # Avoid division by zero
+                n_base = np.log(0.5) / np.log(cos_half)
+                # Clamp n_base to reasonable range to avoid numerical issues
+                n_base = np.clip(n_base, 0.1, 10.0)
+            else:
+                n_base = 1.0
+            
+            # Apply uniformity factor to make beam more focused if desired
+            uniformity = float(ray_uniformity_slider.value)
+            n = n_base * (1.0 + uniformity * 2.0)  # uniformity=0 -> n=n_base, uniformity=1 -> n=3*n_base
+            n = np.clip(n, 0.1, 30.0)  # Final safety clamp
+            
+            # Calculate normalization factor for uniform solid angle sampling with cos^n(θ) weighting
+            # For hemisphere (0 to 90°): norm_factor = (n+1)
+            # This ensures that Σ[all rays] lumens_per_ray = lumens_per_led when all rays hit
+            # 
+            # PHYSICAL EXPLANATION:
+            # Each LED emits with Lambertian distribution: I(θ) = I₀ × cos^n(θ)
+            # Total flux: Φ = ∫∫ I(θ) dΩ = I₀ × 2π/(n+1)
+            # Therefore: I₀ = Φ × (n+1)/(2π)
+            # For N rays uniformly sampled in solid angle (each covers dΩ = 2π/N):
+            #   lumens_per_ray = I(θ) × dΩ = I₀ × cos^n(θ) × 2π/N
+            #                  = Φ × (n+1)/(2π) × cos^n(θ) × 2π/N
+            #                  = Φ × (n+1) × cos^n(θ) / N
+            # This guarantees: Σ lumens_per_ray = Φ (flux conservation)
+            norm_factor = n + 1.0
+            
+            # Verify flux conservation per LED (diagnostic)
+            led_total_lumens_emitted = 0.0  # Track total lumens from this LED
+            rays_traced = 0
+            rays_hit_wall = 0
+            
+            for _ in range(rays_per_led_calculated):
+                # Uniform sampling in solid angle (physically correct)
                 u1, u2 = np.random.uniform(0, 1, 2)
-                max_theta = np.radians(led.viewing_angle)
                 
-                uniformity = float(ray_uniformity_slider.value)
-                n = 1.0 + uniformity * 3.0  # Exponent from 1 to 4
-                
-                # Cosine power distribution sampling with clamping to avoid numerical issues
+                # Sample uniformly within hemisphere (0 to 90°)
                 cos_max = np.cos(max_theta)
-                base = 1 - u1 * (1 - np.power(cos_max, n + 1))
-                base = np.clip(base, 0.0, 1.0)  # Clamp to valid range
-                cos_theta_sampled = np.power(base, 1.0 / (n + 1))
-                cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)  # Clamp for arccos
-                theta = np.arccos(cos_theta_sampled)
+                cos_theta = 1.0 - u1 * (1.0 - cos_max)  # Uniform in solid angle
+                cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                theta = np.arccos(cos_theta)
                 phi = 2 * np.pi * u2
 
                 local_dir = np.array(
@@ -394,6 +498,17 @@ def main():
                     + local_dir[2] * z_axis
                 )
                 world_dir = world_dir / np.linalg.norm(world_dir)
+                
+                # Calculate lumens carried by this ray (ALWAYS, regardless if it hits wall)
+                # This represents the light emitted in this direction
+                cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+                intensity_coefficient = np.power(cos_theta_clamped, n)
+                lumens_per_ray = (lumens_per_led / max(1, rays_per_led_calculated)) * intensity_coefficient * norm_factor
+                
+                # Track: EVERY ray carries lumens, whether absorbed or hits wall
+                rays_traced += 1
+                led_total_lumens_emitted += lumens_per_ray
+                
                 # Ray-box intersection helper (positions in cm)
                 def ray_box_intersection(pos, direction, box):
                     center = np.array(box['center'], dtype=float)
@@ -440,18 +555,233 @@ def main():
                         grid_z = int((hit_z + half_size) / cell_size)
 
                         if 0 <= grid_y < grid_size and 0 <= grid_z < grid_size:
-                            # Calculate intensity coefficient based on cosine power distribution
-                            # For uniformity > 0, intensity follows cos^n(theta)
-                            # theta is the angle between ray direction and LED central axis
-                            cos_theta = np.cos(theta)  # theta was calculated earlier in sampling
-                            intensity_coefficient = np.power(cos_theta, n)
-                            
-                            # Convert ray count to lumens with intensity modulation
-                            # Each ray represents a fraction of LED lumens, modulated by cos^n(theta)
-                            lumens_per_ray = (lumens_per_led / max(1, num_rays_per_led)) * intensity_coefficient
+                            # Ray hits wall within grid - add its lumens
+                            rays_hit_wall += 1
                             grid[grid_z, grid_y] += lumens_per_ray
+            
+            # Diagnostic: Check flux conservation for this LED
+            conservation_pct = (led_total_lumens_emitted / lumens_per_led * 100) if lumens_per_led > 0 else 0
+            idx = getattr(led, 'led_index', led_idx)
+            if idx == 0 or idx == 10 or idx == 20:  # Print for first LED of each type
+                print(f"LED {idx}: Emitted {led_total_lumens_emitted:.2f} lm on {rays_traced} rays (target: {lumens_per_led:.2f} lm, conservation: {conservation_pct:.1f}%)")
+                print(f"  Rays hit wall: {rays_hit_wall}/{rays_traced} ({rays_hit_wall/rays_traced*100:.1f}%)")
 
         return grid, wall_size
+
+    def compute_room_intensity(
+        leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, absorbers=None
+    ):
+        """Trace rays and compute intensity grids on all 5 room walls."""
+        
+        # Helper function for ray-box intersection
+        def ray_box_intersection(pos, direction, box):
+            center = np.array(box['center'], dtype=float)
+            half = np.array(box['half_sizes'], dtype=float)
+            tmin = -np.inf
+            tmax = np.inf
+            for k in range(3):
+                if abs(direction[k]) < 1e-12:
+                    if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
+                        return None
+                else:
+                    t1 = (center[k] - half[k] - pos[k]) / direction[k]
+                    t2 = (center[k] + half[k] - pos[k]) / direction[k]
+                    t_near = min(t1, t2)
+                    t_far = max(t1, t2)
+                    tmin = max(tmin, t_near)
+                    tmax = min(tmax, t_far)
+                    if tmin > tmax:
+                        return None
+            if tmax < 0:
+                return None
+            return tmin if tmin > 0 else (tmax if tmax > 0 else None)
+        
+        # Helper function for Lambertian exponent calculation
+        def calculate_lambertian_exponent(viewing_angle):
+            theta_half = np.radians(viewing_angle / 2.0)
+            cos_half = np.cos(theta_half)
+            if cos_half > 0.01:
+                n_base = np.log(0.5) / np.log(cos_half)
+                n_base = np.clip(n_base, 0.1, 10.0)
+            else:
+                n_base = 1.0
+            # Apply uniformity factor
+            uniformity = float(ray_uniformity_slider.value) if 'ray_uniformity_slider' in globals() else 0.0
+            n = n_base * (1.0 + uniformity * 2.0)
+            n = np.clip(n, 0.1, 30.0)
+            return n
+        
+        # Initialize grids for each wall
+        grids = {
+            'front': np.zeros((grid_size, grid_size)),  # YZ plane at x=front_dist
+            'left': np.zeros((grid_size, grid_size)),   # XZ plane at y=-side_dist
+            'right': np.zeros((grid_size, grid_size)),  # XZ plane at y=+side_dist
+            'top': np.zeros((grid_size, grid_size)),    # XY plane at z=+top_bottom_dist
+            'bottom': np.zeros((grid_size, grid_size))  # XY plane at z=-top_bottom_dist
+        }
+        
+        # Wall dimensions for grid mapping
+        wall_specs = {
+            'front': {'size': max(2*side_dist, 2*top_bottom_dist), 'dims': ('y', 'z')},
+            'left': {'size': max(front_dist, 2*top_bottom_dist), 'dims': ('x', 'z')},
+            'right': {'size': max(front_dist, 2*top_bottom_dist), 'dims': ('x', 'z')},
+            'top': {'size': max(front_dist, 2*side_dist), 'dims': ('x', 'y')},
+            'bottom': {'size': max(front_dist, 2*side_dist), 'dims': ('x', 'y')}
+        }
+        
+        lumens_per_led = float(led_lumens_slider.value)
+        num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
+        if num_active_leds == 0:
+            return grids, wall_specs
+        
+        print(f"\n=== ROOM MODE ===")
+        print(f"Front wall: x={front_dist}cm, Left: y={-side_dist}cm, Right: y={+side_dist}cm")
+        print(f"Top: z={+top_bottom_dist}cm, Bottom: z={-top_bottom_dist}cm")
+        print(f"Grid resolution: {grid_size}×{grid_size} per wall")
+        
+        # Track ray hits per wall for debugging
+        ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+        total_rays = 0
+        
+        for led_idx, led in enumerate(leds):
+            if hasattr(led, 'enabled') and not led.enabled:
+                continue
+            
+            # Build local coordinate system from LED direction
+            z_axis = led.direction
+            if abs(z_axis[2]) < 0.9:
+                x_axis = np.cross(z_axis, [0, 0, 1])
+            else:
+                x_axis = np.cross(z_axis, [0, 1, 0])
+            x_axis = x_axis / np.linalg.norm(x_axis)
+            y_axis = np.cross(z_axis, x_axis)
+            
+            # Calculate rays per LED
+            rays_traced = num_rays_per_led * grid_size * grid_size
+            
+            for _ in range(rays_traced):
+                total_rays += 1
+                
+                # Sample hemisphere in LED frame using uniform solid angle sampling
+                u1, u2 = np.random.uniform(0, 1, 2)
+                max_theta = np.pi / 2  # Full hemisphere
+                
+                # Uniform in solid angle
+                cos_max = np.cos(max_theta)
+                cos_theta = 1.0 - u1 * (1.0 - cos_max)
+                cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                theta = np.arccos(cos_theta)
+                phi = 2 * np.pi * u2
+                
+                # Local direction in LED frame
+                local_dir = np.array([
+                    np.sin(theta) * np.cos(phi),
+                    np.sin(theta) * np.sin(phi),
+                    np.cos(theta)
+                ])
+                
+                # Transform to world coordinates
+                world_dir = (
+                    local_dir[0] * x_axis
+                    + local_dir[1] * y_axis
+                    + local_dir[2] * z_axis
+                )
+                world_dir = world_dir / np.linalg.norm(world_dir)
+                
+                # Calculate lumens for this ray
+                n = calculate_lambertian_exponent(led.viewing_angle)
+                norm_factor = n + 1.0
+                cos_n_theta = cos_theta ** n
+                lumens_per_ray = (lumens_per_led / rays_traced) * cos_n_theta * norm_factor
+                
+                # Check absorber intersection
+                hit_absorbed = False
+                if absorbers:
+                    for a in absorbers:
+                        t_hit = ray_box_intersection(led.position, world_dir, a)
+                        if t_hit is not None and t_hit > 0:
+                            hit_absorbed = True
+                            break
+                
+                if hit_absorbed:
+                    continue
+                
+                # Calculate intersection with each wall
+                intersections = []
+                
+                # Front wall (x = front_dist)
+                if world_dir[0] > 0:
+                    t = (front_dist - led.position[0]) / world_dir[0]
+                    if t > 0:
+                        y = led.position[1] + world_dir[1] * t
+                        z = led.position[2] + world_dir[2] * t
+                        intersections.append(('front', t, y, z))
+                
+                # Left wall (y = -side_dist)
+                if world_dir[1] < 0:
+                    t = (-side_dist - led.position[1]) / world_dir[1]
+                    if t > 0:
+                        x = led.position[0] + world_dir[0] * t
+                        z = led.position[2] + world_dir[2] * t
+                        intersections.append(('left', t, x, z))
+                
+                # Right wall (y = +side_dist)
+                if world_dir[1] > 0:
+                    t = (side_dist - led.position[1]) / world_dir[1]
+                    if t > 0:
+                        x = led.position[0] + world_dir[0] * t
+                        z = led.position[2] + world_dir[2] * t
+                        intersections.append(('right', t, x, z))
+                
+                # Top wall (z = +top_bottom_dist)
+                if world_dir[2] > 0:
+                    t = (top_bottom_dist - led.position[2]) / world_dir[2]
+                    if t > 0:
+                        x = led.position[0] + world_dir[0] * t
+                        y = led.position[1] + world_dir[1] * t
+                        intersections.append(('top', t, x, y))
+                
+                # Bottom wall (z = -top_bottom_dist)
+                if world_dir[2] < 0:
+                    t = (-top_bottom_dist - led.position[2]) / world_dir[2]
+                    if t > 0:
+                        x = led.position[0] + world_dir[0] * t
+                        y = led.position[1] + world_dir[1] * t
+                        intersections.append(('bottom', t, x, y))
+                
+                # Find closest intersection
+                if not intersections:
+                    continue
+                
+                wall_name, t_min, coord1, coord2 = min(intersections, key=lambda x: x[1])
+                wall_spec = wall_specs[wall_name]
+                wall_size = wall_spec['size']
+                half_size = wall_size / 2
+                cell_size = wall_size / grid_size
+                
+                # Map coordinates to grid indices
+                grid_idx1 = int((coord1 + half_size) / cell_size)
+                grid_idx2 = int((coord2 + half_size) / cell_size)
+                
+                if 0 <= grid_idx1 < grid_size and 0 <= grid_idx2 < grid_size:
+                    grids[wall_name][grid_idx2, grid_idx1] += lumens_per_ray
+                    ray_hits[wall_name] += 1
+        
+        # Print summary
+        total_emitted = num_active_leds * lumens_per_led
+        total_on_walls = sum(grid.sum() for grid in grids.values())
+        conservation_pct = (total_on_walls / total_emitted * 100) if total_emitted > 0 else 0
+        
+        print(f"\nActive LEDs: {num_active_leds}")
+        print(f"Total rays traced: {total_rays}")
+        print(f"Total emitted: {total_emitted:.1f} lm")
+        print(f"Total on walls: {total_on_walls:.1f} lm ({conservation_pct:.1f}%)")
+        for wall_name, grid in grids.items():
+            hits = ray_hits[wall_name]
+            pct = (hits / total_rays * 100) if total_rays > 0 else 0
+            print(f"  {wall_name.capitalize()}: {grid.sum():.1f} lm ({hits} rays, {pct:.1f}%)")
+        
+        return grids, wall_specs
 
     def capture_camera_fov_image():
         """Capture intensity image within camera FOV at 1cm resolution."""
@@ -484,7 +814,6 @@ def main():
         viewing_angle = viewing_angle_slider.value
         radius = radius_slider.value
         circle_center_x = circle_center_slider.value
-        num_rays = int(intensity_rays_slider.value)
         
         rotations = [
             rot_front_pos.value,
@@ -536,9 +865,21 @@ def main():
         
         # Ray tracing for FOV region
         lumens_per_led = float(led_lumens_slider.value)
-        num_rays_per_led = num_rays // 4
+        rays_per_pixel = int(intensity_rays_slider.value)
         
-        print(f"Capturing FOV image: {grid_width}x{grid_height} pixels...")
+        # Count active LEDs
+        num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
+        if num_active_leds == 0:
+            print("No active LEDs")
+            return
+        
+        # Calculate rays per LED to achieve target rays per pixel
+        total_pixels = grid_width * grid_height
+        num_rays_per_led = max(1, int((total_pixels * rays_per_pixel) / num_active_leds))
+        
+        print(f"Capturing FOV image: {grid_width}x{grid_height} pixels ({total_pixels} total)...")
+        print(f"Active LEDs: {num_active_leds}, Rays per LED: {num_rays_per_led}, Total rays: {num_active_leds * num_rays_per_led}")
+        print(f"Target: {rays_per_pixel} rays/pixel, Actual: {(num_active_leds * num_rays_per_led) / total_pixels:.2f} rays/pixel")
         
         for led_idx, led in enumerate(leds):
             if hasattr(led, 'enabled') and not led.enabled:
@@ -555,20 +896,49 @@ def main():
             x_axis = x_axis / np.linalg.norm(x_axis)
             y_axis = np.cross(z_axis, x_axis)
             
+            # IMPORTANT: viewing_angle defines where intensity drops to 50%, NOT the cone edge!
+            # LEDs emit over full hemisphere (0° to 90°)
+            # Calculate exponent n so that intensity drops to 50% at viewing_angle/2
+            # I(θ) = I₀ × cos^n(θ), at θ_half: 0.5 = cos^n(θ_half)
+            # n = ln(0.5) / ln(cos(θ_half))
+            
+            # Maximum emission angle is 90° (hemisphere), not viewing_angle
+            max_theta = np.radians(90.0)  # Full hemisphere
+            
+            # Calculate n from viewing angle
+            theta_half = np.radians(led.viewing_angle / 2.0)
+            cos_half = np.cos(theta_half)
+            
+            # Calculate base exponent for this viewing angle
+            if cos_half > 0.01:
+                n_base = np.log(0.5) / np.log(cos_half)
+                # Clamp n_base to reasonable range to avoid numerical issues
+                n_base = np.clip(n_base, 0.1, 10.0)
+            else:
+                n_base = 1.0
+            
+            # Apply uniformity factor to make beam more focused if desired
+            uniformity = float(ray_uniformity_slider.value)
+            n = n_base * (1.0 + uniformity * 2.0)
+            n = np.clip(n, 0.1, 30.0)  # Final safety clamp
+            
+            # Calculate normalization factor for uniform solid angle sampling with cos^n(θ) weighting
+            # For hemisphere (0 to 90°): norm_factor = (n+1)
+            # PHYSICS: Each ray = I₀ × cos^n(θ) × dΩ where dΩ = 2π/N
+            # With I₀ = Φ×(n+1)/(2π), we get: lumens_per_ray = Φ×(n+1)×cos^n(θ)/N
+            norm_factor = n + 1.0
+            
+            led_total_lumens_emitted = 0.0  # Track for verification
+            
             for _ in range(num_rays_per_led):
+                # Uniform sampling in solid angle (physically correct)
                 u1, u2 = np.random.uniform(0, 1, 2)
-                max_theta = np.radians(led.viewing_angle)
                 
-                uniformity = float(ray_uniformity_slider.value)
-                n = 1.0 + uniformity * 3.0
-                
-                # Cosine power distribution sampling with clamping
+                # Sample uniformly within hemisphere (0 to 90°)
                 cos_max = np.cos(max_theta)
-                base = 1 - u1 * (1 - np.power(cos_max, n + 1))
-                base = np.clip(base, 0.0, 1.0)
-                cos_theta_sampled = np.power(base, 1.0 / (n + 1))
-                cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)
-                theta = np.arccos(cos_theta_sampled)
+                cos_theta = 1.0 - u1 * (1.0 - cos_max)
+                cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                theta = np.arccos(cos_theta)
                 phi = 2 * np.pi * u2
                 
                 local_dir = np.array([
@@ -582,6 +952,12 @@ def main():
                     + local_dir[2] * z_axis
                 )
                 world_dir = world_dir / np.linalg.norm(world_dir)
+                
+                # Calculate lumens carried by this specific ray (emission in this direction)
+                cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+                intensity_coefficient = np.power(cos_theta_clamped, n)
+                lumens_per_ray = (lumens_per_led / max(1, num_rays_per_led)) * intensity_coefficient * norm_factor
+                led_total_lumens_emitted += lumens_per_ray
                 
                 # Check absorber intersection
                 def ray_box_intersection(pos, direction, box):
@@ -632,14 +1008,22 @@ def main():
                             grid_y = int((hit_z + half_h) / cell_size_cm)
                             
                             if 0 <= grid_x < grid_width and 0 <= grid_y < grid_height:
-                                cos_theta = np.cos(theta)
-                                intensity_coefficient = np.power(cos_theta, n)
-                                lumens_per_ray = (lumens_per_led / max(1, num_rays_per_led)) * intensity_coefficient
+                                # Ray hits FOV region - add its lumens (already calculated above)
                                 fov_grid[grid_y, grid_x] += lumens_per_ray
         
-        # Convert to lux and create image
+        # Diagnostic: print first LED's flux conservation
+        print(f"FOV Capture: First LED emitted {led_total_lumens_emitted:.2f} lm total (target: {lumens_per_led:.2f} lm)")
+        
+        # Convert to lux using solid angle formula
+        # lumen = Lux * 2 * π * Area_cell * (1 - cos(viewing_angle/2))
+        # Therefore: Lux = lumen / (2 * π * Area_cell * (1 - cos(viewing_angle/2)))
         cell_area_m2 = (cell_size_cm / 100.0) ** 2
-        lux_grid = fov_grid / cell_area_m2
+        solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
+        lux_grid = fov_grid / (cell_area_m2 * solid_angle_factor)
+        
+        # Clean up any NaN or Inf values
+        fov_grid = np.nan_to_num(fov_grid, nan=0.0, posinf=0.0, neginf=0.0)
+        lux_grid = np.nan_to_num(lux_grid, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Get max intensity for color mapping
         max_lumens = fov_grid.max()
@@ -720,9 +1104,11 @@ def main():
 
     def intensity_to_color(value, max_val):
         """Convert intensity to inferno-like colormap."""
-        if max_val == 0:
+        # Handle invalid values
+        if max_val == 0 or not np.isfinite(value) or not np.isfinite(max_val):
             return (0.0, 0.0, 0.0)
-        t = min(value / max_val, 1.0)
+        
+        t = np.clip(value / max_val, 0.0, 1.0)
         # Simple inferno-like gradient: black -> purple -> red -> orange -> yellow
         if t < 0.25:
             r, g, b = t * 4 * 0.5, 0, t * 4 * 0.5
@@ -736,7 +1122,7 @@ def main():
 
     def update_intensity_map():
         """Update only the intensity map on the wall (expensive operation)."""
-        nonlocal intensity_handles
+        nonlocal intensity_handles, legend_html
         
         # Clear previous intensity handles
         for handle in intensity_handles:
@@ -747,13 +1133,19 @@ def main():
         intensity_handles = []
         
         if not show_intensity_map.value:
+            # Update legend with message when intensity map is disabled
+            legend_html.content = (
+                "<div style='font-family: sans-serif;'>"
+                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click 'Update Intensity Map' to see the legend</div>"
+                "</div>"
+            )
             return
         
         # Get current values
         wall_dist = wall_dist_slider.value
         grid_size = int(intensity_grid_size.value)
         wall_size = int(wall_view_size.value)
-        num_rays = int(intensity_rays_slider.value)
         
         # Get current LEDs configuration
         front_angle = front_angle_slider.value
@@ -823,11 +1215,68 @@ def main():
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
             })
         
-        # Compute intensity
+        # Compute intensity with rays_per_pixel from slider
+        rays_per_pixel = int(intensity_rays_slider.value)
         intensity_grid, actual_wall_size = compute_wall_intensity(
-            leds, wall_dist, num_rays // 4, grid_size, wall_size, absorbers=absorbers
+            leds, wall_dist, rays_per_pixel, grid_size, wall_size, absorbers=absorbers
         )
+        # Clean up any NaN or Inf values in the grid
+        intensity_grid = np.nan_to_num(intensity_grid, nan=0.0, posinf=0.0, neginf=0.0)
         max_intensity = intensity_grid.max()
+        
+        # === DIAGNOSTIC OUTPUT FOR FLUX CONSERVATION ===
+        num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
+        lumens_per_led = float(led_lumens_slider.value)
+        total_emitted_lumens = num_active_leds * lumens_per_led
+        total_wall_lumens = np.sum(intensity_grid)
+        conservation_ratio = (total_wall_lumens / total_emitted_lumens * 100) if total_emitted_lumens > 0 else 0
+        
+        # Calculate 7mm² sensor reading at center - PRECISE METHOD
+        # Sum all cells within 7mm² area centered at (0,0)
+        sensor_area_cm2 = 0.07  # 7mm² = 0.07cm²
+        sensor_radius_cm = np.sqrt(sensor_area_cm2 / np.pi)  # Circular sensor = 0.149cm radius
+        sensor_lumens_precise = 0.0
+        cell_count_in_sensor = 0
+        
+        center_y = 0.0  # cm, center of wall
+        center_z = 0.0  # cm
+        
+        cell_size_per_axis = actual_wall_size / grid_size
+        
+        # PROBLEM: If cell is 3.33cm and sensor radius is 0.149cm, we need MUCH finer resolution!
+        # The sensor is 44x smaller than a cell - we're missing all the detail!
+        
+        for gz in range(grid_size):
+            for gy in range(grid_size):
+                # Cell center position in cm
+                cell_y = -actual_wall_size/2 + (gy + 0.5) * cell_size_per_axis
+                cell_z = -actual_wall_size/2 + (gz + 0.5) * cell_size_per_axis
+                
+                # Distance from wall center
+                dist_from_center = np.sqrt((cell_y - center_y)**2 + (cell_z - center_z)**2)
+                
+                # If cell center is within sensor, count entire cell (crude approximation)
+                if dist_from_center < cell_size_per_axis/2:  # Cell overlaps center
+                    cell_area_cm2 = cell_size_per_axis ** 2
+                    # Scale by sensor/cell ratio
+                    sensor_lumens_precise += intensity_grid[gz, gy] * (sensor_area_cm2 / cell_area_cm2)
+                    cell_count_in_sensor += 1
+        
+        # Alternative: just take center cell and scale
+        center_idx = grid_size // 2
+        center_cell_lumens = intensity_grid[center_idx, center_idx]
+        center_cell_area = cell_size_per_axis ** 2
+        sensor_lumens_from_center_cell = center_cell_lumens * (sensor_area_cm2 / center_cell_area)
+        
+        print(f"\n=== FLUX CONSERVATION CHECK ===")
+        print(f"Active LEDs: {num_active_leds}")
+        print(f"Lumens per LED: {lumens_per_led:.1f} lm")
+        print(f"Total emitted: {total_emitted_lumens:.1f} lm")
+        print(f"Total on wall: {total_wall_lumens:.1f} lm")
+        print(f"Conservation: {conservation_ratio:.1f}%")
+        print(f"Wall distance: {wall_dist:.1f} cm")
+        print(f"7mm² sensor at center: {sensor_lumens_from_center_cell:.4f} lm")
+        print(f"================================\n")
         
         cell_size_cm = actual_wall_size / grid_size
         cell_size_m = cell_size_cm / 100.0
@@ -857,16 +1306,19 @@ def main():
         # Update legend
         legend_steps = 6
         legend_vals = np.linspace(0, max_intensity, legend_steps)
-        # Conversion: Illuminance (lux) = Luminous flux (lumen) / Area (m²)
-        # Each grid cell area = (cell_size_m)²
+        # Conversion using solid angle formula:
+        # lumen = Lux * 2 * π * Area_cell * (1 - cos(viewing_angle/2))
+        # Therefore: Lux = lumen / (2 * π * Area_cell * (1 - cos(viewing_angle/2)))
         cell_area_m2 = cell_size_m * cell_size_m
+        viewing_angle = viewing_angle_slider.value
+        solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
         html_lines = ["<div style='font-family: sans-serif;'>",
                       "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"]
         for val in reversed(legend_vals):
             color = intensity_to_color(val, max_intensity)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            # lux = total lumen hitting the cell / cell area in m²
-            lux_val = val / cell_area_m2 if cell_area_m2 > 0 else 0
+            # Convert lumens to lux using solid angle formula
+            lux_val = val / (cell_area_m2 * solid_angle_factor) if cell_area_m2 > 0 else 0
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
@@ -875,6 +1327,242 @@ def main():
             )
         html_lines.append("</div>")
         legend_html.content = "".join(html_lines)
+    
+    def draw_room_walls():
+        """Draw room walls as wireframe/transparent boxes (no intensity calculation)."""
+        nonlocal room_wall_handles
+        
+        # Clear previous room wall handles
+        for handle in room_wall_handles:
+            try:
+                handle.remove()
+            except KeyError:
+                pass
+        room_wall_handles = []
+        
+        if not room_mode_enable.value or not show_room_walls.value:
+            return
+        
+        # Get room dimensions
+        front_dist = room_front_dist.value
+        side_dist = room_side_dist.value
+        top_bottom_dist = room_top_bottom_dist.value
+        
+        # Wall color (semi-transparent gray)
+        wall_color = (0.3, 0.3, 0.3)
+        wall_opacity = 0.1
+        
+        # Front wall (YZ plane at x=front_dist)
+        front_width = 2 * side_dist / 100.0  # Y direction
+        front_height = 2 * top_bottom_dist / 100.0  # Z direction
+        handle = server.scene.add_box(
+            "/room_walls/front",
+            dimensions=(0.01, front_width, front_height),
+            color=wall_color,
+            position=(front_dist / 100.0, 0, 0),
+            opacity=wall_opacity,
+        )
+        room_wall_handles.append(handle)
+        
+        # Left wall (XZ plane at y=-side_dist)
+        left_width = front_dist / 100.0  # X direction
+        left_height = 2 * top_bottom_dist / 100.0  # Z direction
+        handle = server.scene.add_box(
+            "/room_walls/left",
+            dimensions=(left_width, 0.01, left_height),
+            color=wall_color,
+            position=(left_width / 2, -side_dist / 100.0, 0),
+            opacity=wall_opacity,
+        )
+        room_wall_handles.append(handle)
+        
+        # Right wall (XZ plane at y=+side_dist)
+        handle = server.scene.add_box(
+            "/room_walls/right",
+            dimensions=(left_width, 0.01, left_height),
+            color=wall_color,
+            position=(left_width / 2, side_dist / 100.0, 0),
+            opacity=wall_opacity,
+        )
+        room_wall_handles.append(handle)
+        
+        # Top wall (XY plane at z=+top_bottom_dist)
+        top_width = front_dist / 100.0  # X direction
+        top_depth = 2 * side_dist / 100.0  # Y direction
+        handle = server.scene.add_box(
+            "/room_walls/top",
+            dimensions=(top_width, top_depth, 0.01),
+            color=wall_color,
+            position=(top_width / 2, 0, top_bottom_dist / 100.0),
+            opacity=wall_opacity,
+        )
+        room_wall_handles.append(handle)
+        
+        # Bottom wall (XY plane at z=-top_bottom_dist)
+        handle = server.scene.add_box(
+            "/room_walls/bottom",
+            dimensions=(top_width, top_depth, 0.01),
+            color=wall_color,
+            position=(top_width / 2, 0, -top_bottom_dist / 100.0),
+            opacity=wall_opacity,
+        )
+        room_wall_handles.append(handle)
+    
+    def update_room_intensity_map():
+        """Update intensity map for all 5 room walls."""
+        nonlocal room_intensity_handles
+        
+        # Clear previous room intensity handles
+        for handle in room_intensity_handles:
+            try:
+                handle.remove()
+            except KeyError:
+                pass
+        room_intensity_handles = []
+        
+        if not room_mode_enable.value or not show_room_intensity.value:
+            return
+        
+        # Get room dimensions
+        front_dist = room_front_dist.value
+        side_dist = room_side_dist.value
+        top_bottom_dist = room_top_bottom_dist.value
+        grid_size = int(room_grid_size.value)
+        
+        # Get current LEDs configuration
+        front_angle = front_angle_slider.value
+        side_angle = side_angle_slider.value
+        viewing_angle = viewing_angle_slider.value
+        radius = radius_slider.value
+        circle_center_x = circle_center_slider.value
+        
+        rotations = [
+            rot_front_pos.value,
+            rot_front_neg.value,
+            rot_side_pos.value,
+            rot_side_neg.value,
+        ]
+        
+        leds = create_leds(
+            front_angle,
+            side_angle,
+            viewing_angle,
+            radius,
+            circle_center_x,
+            group_rotations=rotations,
+            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
+            led_states=led_states,
+        )
+        
+        # Build absorbers
+        absorbers = []
+        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
+        for i, angle_deg in enumerate(angles_deg):
+            if i not in (0, 1):
+                continue
+            angle_rad = np.radians(angle_deg)
+            gx = circle_center_x + radius * np.cos(angle_rad)
+            gy = radius * np.sin(angle_rad)
+            y_offset = 6.5 if i == 0 else -6.5
+            gy = gy + y_offset
+            
+            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
+            if np.linalg.norm(radial) == 0:
+                radial_unit = np.array((1.0, 0.0, 0.0))
+            else:
+                radial_unit = radial / np.linalg.norm(radial)
+            
+            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
+            y_base_offset = -4.2 if i == 0 else 4.2
+            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
+            base_abs_cz = 0.0
+            
+            if not absorbers_enable.value:
+                continue
+            if i == 0:
+                abs_cx = base_abs_cx + abs0_off_x.value
+                abs_cy = base_abs_cy + abs0_off_y.value
+                abs_cz = base_abs_cz + abs0_off_z.value
+            else:
+                abs_cx = base_abs_cx + abs1_off_x.value
+                abs_cy = base_abs_cy + abs1_off_y.value
+                abs_cz = base_abs_cz + abs1_off_z.value
+            
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+            })
+        
+        # Compute room intensity
+        rays_per_pixel = int(intensity_rays_slider.value)
+        grids, wall_specs = compute_room_intensity(
+            leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, absorbers=absorbers
+        )
+        
+        # Find max intensity across all walls for color normalization
+        max_intensity = max(grid.max() for grid in grids.values()) if grids else 0.0
+        
+        # Visualize each wall
+        for wall_name, intensity_grid in grids.items():
+            wall_spec = wall_specs[wall_name]
+            wall_size = wall_spec['size']
+            cell_size_cm = wall_size / grid_size
+            cell_size_m = cell_size_cm / 100.0
+            half_size = wall_size / 2
+            
+            for gi in range(grid_size):
+                for gj in range(grid_size):
+                    intensity = intensity_grid[gi, gj]
+                    if intensity > 0:
+                        color = intensity_to_color(intensity, max_intensity)
+                        
+                        # Calculate cell position based on wall orientation
+                        if wall_name == 'front':
+                            # YZ plane at x=front_dist
+                            x_pos = front_dist / 100.0 - 0.005
+                            y_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
+                            z_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
+                            dims = (0.001, cell_size_m * 0.95, cell_size_m * 0.95)
+                        
+                        elif wall_name == 'left':
+                            # XZ plane at y=-side_dist
+                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
+                            y_pos = -side_dist / 100.0 + 0.005
+                            z_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
+                            dims = (cell_size_m * 0.95, 0.001, cell_size_m * 0.95)
+                        
+                        elif wall_name == 'right':
+                            # XZ plane at y=+side_dist
+                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
+                            y_pos = side_dist / 100.0 - 0.005
+                            z_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
+                            dims = (cell_size_m * 0.95, 0.001, cell_size_m * 0.95)
+                        
+                        elif wall_name == 'top':
+                            # XY plane at z=+top_bottom_dist
+                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
+                            y_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
+                            z_pos = top_bottom_dist / 100.0 - 0.005
+                            dims = (cell_size_m * 0.95, cell_size_m * 0.95, 0.001)
+                        
+                        elif wall_name == 'bottom':
+                            # XY plane at z=-top_bottom_dist
+                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
+                            y_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
+                            z_pos = -top_bottom_dist / 100.0 + 0.005
+                            dims = (cell_size_m * 0.95, cell_size_m * 0.95, 0.001)
+                        
+                        handle = server.scene.add_box(
+                            f"/room_intensity/{wall_name}/cell_{gi}_{gj}",
+                            dimensions=dims,
+                            color=color,
+                            position=(x_pos, y_pos, z_pos),
+                        )
+                        room_intensity_handles.append(handle)
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
@@ -1032,10 +1720,9 @@ def main():
                 vis_rays = led.get_visualization_rays(ray_length)
 
                 for j, (pos, direction) in enumerate(vis_rays):
-                    # Calculate end point, clipping at wall
                     # Calculate end point, clipping at absorbers and wall
-                    end = pos + direction * ray_length
-
+                    # Rays have infinite length until they hit something
+                    
                     # Check absorbers first via box intersection
                     t_abs_min = None
                     if absorbers is not None:
@@ -1058,8 +1745,11 @@ def main():
                         if t_clip is None or t_wall < t_clip:
                             t_clip = t_wall
 
+                    # Use intersection point, or very far if no intersection
                     if t_clip is not None:
-                        end = pos + direction * min(t_clip, ray_length)
+                        end = pos + direction * t_clip
+                    else:
+                        end = pos + direction * 1000.0  # 10 meters if no intersection
 
                     # Draw line (positions in meters)
                     points = np.array([pos / 100.0, end / 100.0])
@@ -1116,8 +1806,8 @@ def main():
                         )
                         world_dir = world_dir / np.linalg.norm(world_dir)
 
-                        # Compute nearest intersection with absorbers or wall and clip
-                        end = led.position + world_dir * ray_length
+                        # Compute nearest intersection with absorbers or wall
+                        # Rays have infinite length until they hit something
                         t_abs_min = None
                         if absorbers is not None:
                             for a in absorbers:
@@ -1137,8 +1827,11 @@ def main():
                             if t_clip is None or t_wall < t_clip:
                                 t_clip = t_wall
 
+                        # Use intersection point, or very far if no intersection
                         if t_clip is not None:
-                            end = led.position + world_dir * min(t_clip, ray_length)
+                            end = led.position + world_dir * t_clip
+                        else:
+                            end = led.position + world_dir * 1000.0  # 10 meters if no intersection
 
                         points = np.array([led.position / 100.0, end / 100.0])
                         # Dimmer color for random rays
@@ -1194,11 +1887,12 @@ def main():
 
     # Add static elements
     # Wall (at x = wall_dist)
+    wall_dist_init = wall_dist_slider.value
     wall_handle = server.scene.add_box(
         "/wall",
         dimensions=(0.01, 2.0, 2.0),  # 200cm x 200cm wall, thin
         color=(0.5, 0.5, 0.5),
-        position=(0.5, 0.0, 0.0),  # Will be updated
+        position=(wall_dist_init / 100.0, 0.0, 0.0),
     )
 
     # Grid on XY plane (millimeter resolution)
@@ -1236,8 +1930,22 @@ def main():
 
     # Callback to update wall position
     def update_wall():
-        wall_dist = wall_dist_slider.value
-        wall_handle.position = (wall_dist / 100.0, 0.0, 0.0)
+        nonlocal wall_handle
+        if room_mode_enable.value:
+            # In room mode, don't update main wall
+            return
+        try:
+            wall_dist = wall_dist_slider.value
+            wall_handle.position = (wall_dist / 100.0, 0.0, 0.0)
+        except (AttributeError, KeyError):
+            # Wall handle doesn't exist, recreate it
+            wall_dist = wall_dist_slider.value
+            wall_handle = server.scene.add_box(
+                "/wall",
+                dimensions=(0.01, 2.0, 2.0),
+                color=(0.5, 0.5, 0.5),
+                position=(wall_dist / 100.0, 0.0, 0.0),
+            )
 
     # Register callbacks
     front_angle_slider.on_update(lambda _: update_scene())
@@ -1273,6 +1981,47 @@ def main():
     intensity_rays_slider.on_update(lambda _: None)  # No auto-update for expensive params
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_grid_size.on_update(lambda _: None)  # No auto-update for expensive params
+    
+    # Room mode callback - draw/clear room walls when toggled
+    def on_room_mode_toggle(_):
+        nonlocal wall_handle
+        if room_mode_enable.value:
+            # Hide main wall and show room walls
+            try:
+                wall_handle.remove()
+            except (KeyError, AttributeError):
+                pass
+            draw_room_walls()
+        else:
+            # Clear room intensity handles
+            for handle in room_intensity_handles:
+                try:
+                    handle.remove()
+                except KeyError:
+                    pass
+            room_intensity_handles.clear()
+            # Clear room wall handles
+            for handle in room_wall_handles:
+                try:
+                    handle.remove()
+                except KeyError:
+                    pass
+            room_wall_handles.clear()
+            # Restore main wall
+            wall_dist = wall_dist_slider.value
+            wall_handle = server.scene.add_box(
+                "/wall",
+                dimensions=(0.01, 2.0, 2.0),
+                color=(0.5, 0.5, 0.5),
+                position=(wall_dist / 100.0, 0.0, 0.0),
+            )
+    
+    room_mode_enable.on_update(on_room_mode_toggle)
+    show_room_walls.on_update(lambda _: draw_room_walls())
+    show_room_intensity.on_update(lambda _: update_room_intensity_map() if room_mode_enable.value else None)
+    room_front_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
+    room_side_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
+    room_top_bottom_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     wall_view_size.on_update(lambda _: None)  # No auto-update for expensive params
     wall_dist_slider.on_update(lambda _: (update_wall(), update_scene()))
     
@@ -1322,6 +2071,9 @@ def main():
     
     # Button for capturing FOV intensity image
     capture_fov_btn.on_click(lambda _: capture_camera_fov_image())
+    
+    # Button for room intensity map update
+    update_room_button.on_click(lambda _: update_room_intensity_map())
 
     # Capture default values so reset restores them
     defaults = {
@@ -1350,6 +2102,8 @@ def main():
 
     # Initial draw
     update_scene()
+    if room_mode_enable.value:
+        draw_room_walls()
 
     print("\n" + "=" * 60)
     print("INTERACTIVE LIGHTING DESIGN")
