@@ -7,6 +7,8 @@ import numpy as np
 import viser
 import viser.transforms as tf
 import time
+import multiprocessing
+from functools import partial
 
 
 class LED:
@@ -65,6 +67,7 @@ def create_leds(
     group_rotations=None,
     row_enabled=None,
     led_states=None,
+    group_offsets=None,
 ):
     """Create 4 LED groups; each group contains 3 LEDs spaced by 3 mm."""
     angles_deg = [front_angle_deg, -front_angle_deg, side_angle_deg, -side_angle_deg]
@@ -72,9 +75,14 @@ def create_leds(
 
     if group_rotations is None:
         group_rotations = [0.0, 0.0, 0.0, 0.0]
+    
+    if group_offsets is None:
+        group_offsets = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
 
     leds = []
     led_index = 0  # Track global LED index
+    front_x_positions = {}  # Store X positions of front groups for side groups alignment
+    
     for i, angle_deg in enumerate(angles_deg):
         angle_rad = np.radians(angle_deg)
         x = circle_center_x + radius * np.cos(angle_rad)
@@ -83,12 +91,23 @@ def create_leds(
 
         # Apply Y offset (green axis) based on group type to position only
         # Front groups (i=0, i=1): ±6.5 cm (13 cm apart)
-        # Side groups (i=2, i=3): ±11.75 cm (23.5 cm apart)
+        # Side groups (i=2, i=3): positioned so first LED is 3cm from last LED of front group
+        # Front last LED: 6.5 + 0.8 = 7.3 cm, Side first LED: 7.3 + 3.0 = 10.3 cm, Side center: 10.3 + 0.8 = 11.1 cm
         if i in (0, 1):  # Front
             y_offset = 6.5 if i == 0 else -6.5
+            front_x_positions[i] = x  # Store X for corresponding side group
         else:  # Side (i in (2, 3))
-            y_offset = 11.75 if i == 2 else -11.75
+            y_offset = 11.1 if i == 2 else -11.1
+            # Use same X as corresponding front group (side positive with front positive, side negative with front negative)
+            corresponding_front_idx = 0 if i == 2 else 1
+            x = front_x_positions[corresponding_front_idx]
         y = y + y_offset
+        
+        # Apply group offset (translation)
+        offset_x, offset_y, offset_z = group_offsets[i]
+        x += offset_x
+        y += offset_y
+        z += offset_z
 
         # Direction: radially outward from circle center (after offset)
         dir_x = x - circle_center_x
@@ -109,24 +128,22 @@ def create_leds(
         x_axis = x_axis / np.linalg.norm(x_axis)
         y_axis = np.cross(z_axis, x_axis)
 
-        # Parameters: 3 mm between LEDs in a row, 5 mm between rows
-        led_spacing_cm = 0.3  # 3 mm
-        row_spacing_cm = 0.5  # 5 mm
+        # Parameters: LED squares are 5mm (0.5cm) with 3mm spacing between them
+        # Distance between centers = square_size + spacing = 0.5cm + 0.3cm = 0.8cm
+        led_spacing_cm = 0.8  # Distance between LED centers (5mm square + 3mm gap)
+        # Between rows: 6mm spacing (edge to edge) + 5mm square = 1.1cm center-to-center
+        row_spacing_cm = 1.1  # 11 mm between row centers (5mm square + 6mm gap)
 
         # Four rows with specified in-plane inclinations (degrees)
         inclinations = [90,30, -30,-90]
-        # Row centers offsets along Z-axis (blue axis) so rows are spaced by 5mm vertically
-        row_offsets = [(-1.5 * row_spacing_cm), (-0.5 * row_spacing_cm), (0.5 * row_spacing_cm), (1.5 * row_spacing_cm)]
+        # Row centers offsets along Z-axis (blue axis)
+        # Rows 2 and 3 (central): 1.1 cm apart, rows 1 and 4 (outer): 0.3 cm from central rows
+        row_offsets = [-0.85, -0.55, 0.55, 0.85]  # cm along Z axis
 
         for row_idx, alpha_deg in enumerate(inclinations):
-            # Skip row if disabled, but still increment led_index for proper tracking
-            if row_enabled is not None and not row_enabled[row_idx]:
-                led_index += 3  # Skip 3 LEDs for this row
-                continue
+            # Always create LEDs even if row is disabled (for visualization)
             alpha = np.radians(alpha_deg)
-            # Row direction: along X-axis (which is Y-green in the LED plane coordinate system)
-            row_dir = x_axis
-
+            
             # Center point for this row: distributed along Z axis (blue axis, vertical)
             center_off = row_offsets[row_idx]
             row_center = np.array((x, y, z)) + np.array([0, 0, 1]) * center_off
@@ -147,18 +164,24 @@ def create_leds(
                 sa_r * radial_unit[0] + ca_r * radial_unit[1],
                 0.0,
             ])
+            # Apply same rotation to row direction (for consistent square orientation)
+            rotated_row_dir = np.array([
+                ca_r * x_axis[0] - sa_r * x_axis[1],
+                sa_r * x_axis[0] + ca_r * x_axis[1],
+                x_axis[2],
+            ])
             # Tilt around axis perpendicular to radial in the plane: tilt toward Z by alpha
             z_unit = np.array((0.0, 0.0, 1.0))
             rotated_dir = np.cos(alpha) * rotated_radial + (-np.sin(alpha)) * z_unit
             rotated_dir = rotated_dir / np.linalg.norm(rotated_dir)
 
-            # If row 1 or 4 (indices 0 or 3), move row center 1 cm back toward circle center
+            # If row 1 or 4 (indices 0 or 3), move row center 0.5 cm back toward circle center
             if row_idx in (0, 3):
-                row_center = row_center - radial_unit * 1.0
+                row_center = row_center - radial_unit * 0.5
 
-            # Three LEDs along the row (spaced along green/Y axis direction: row_dir)
+            # Three LEDs along the row (spaced along green/Y axis direction: rotated_row_dir)
             for led_in_row, off in enumerate([-led_spacing_cm, 0.0, led_spacing_cm]):
-                pos = tuple(row_center + row_dir * off)
+                pos = tuple(row_center + rotated_row_dir * off)
                 
                 # Check if this LED should be enabled based on row_enabled and led_states
                 is_row_enabled = row_enabled is None or row_enabled[row_idx]
@@ -172,13 +195,226 @@ def create_leds(
                     direction=tuple(rotated_dir),
                     color=colors[i],
                 )
-                # Add enabled flag to LED object
+                # Add enabled flag and metadata to LED object
                 led.enabled = is_row_enabled and is_led_enabled
                 led.led_index = led_index  # Store the global index
+                led.row_direction = rotated_row_dir.copy()  # Store rotated row direction for consistent square orientation
                 leds.append(led)
                 led_index += 1
 
     return leds
+
+
+# Helper functions for multiprocessing (must be at module level for pickle serialization)
+def _ray_box_intersection(pos, direction, box):
+    """Check ray-box intersection for absorbers."""
+    center = np.array(box['center'], dtype=float)
+    half = np.array(box['half_sizes'], dtype=float)
+    tmin = -np.inf
+    tmax = np.inf
+    for k in range(3):
+        if abs(direction[k]) < 1e-12:
+            if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
+                return None
+        else:
+            t1 = (center[k] - half[k] - pos[k]) / direction[k]
+            t2 = (center[k] + half[k] - pos[k]) / direction[k]
+            t_near = min(t1, t2)
+            t_far = max(t1, t2)
+            tmin = max(tmin, t_near)
+            tmax = min(tmax, t_far)
+            if tmin > tmax:
+                return None
+    if tmax < 0:
+        return None
+    return tmin if tmin > 0 else (tmax if tmax > 0 else None)
+
+def _calculate_lambertian_exponent(viewing_angle, ray_uniformity):
+    """Calculate Lambertian exponent for LED."""
+    theta_half = np.radians(viewing_angle / 2.0)
+    cos_half = np.cos(theta_half)
+    if cos_half > 0.01:
+        n_base = np.log(0.5) / np.log(cos_half)
+        n_base = np.clip(n_base, 0.1, 10.0)
+    else:
+        n_base = 1.0
+    n = n_base * (1.0 + ray_uniformity * 2.0)
+    n = np.clip(n, 0.1, 30.0)
+    return n
+
+def _process_led_worker(args):
+    """Worker function to process rays for a single LED (for multiprocessing)."""
+    led, params = args
+    
+    # Unpack parameters
+    front_dist = params['front_dist']
+    side_dist = params['side_dist']
+    top_bottom_dist = params['top_bottom_dist']
+    num_rays_per_led = params['num_rays_per_led']
+    grid_size = params['grid_size']
+    lumens_per_led = params['lumens_per_led']
+    absorbers = params['absorbers']
+    ray_uniformity = params['ray_uniformity']
+    grid_shapes = params['grid_shapes']
+    wall_specs = params['wall_specs']
+    
+    # Initialize local grids for this LED
+    local_grids = {
+        'front': np.zeros(grid_shapes['front']),
+        'left': np.zeros(grid_shapes['left']),
+        'right': np.zeros(grid_shapes['right']),
+        'top': np.zeros(grid_shapes['top']),
+        'bottom': np.zeros(grid_shapes['bottom'])
+    }
+    local_ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+    local_total_rays = 0
+    
+    # Build local coordinate system from LED direction
+    z_axis = led.direction
+    if abs(z_axis[2]) < 0.9:
+        x_axis = np.cross(z_axis, [0, 0, 1])
+    else:
+        x_axis = np.cross(z_axis, [0, 1, 0])
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    
+    # Calculate rays per LED
+    rays_traced = num_rays_per_led * grid_size * grid_size
+    
+    for _ in range(rays_traced):
+        local_total_rays += 1
+        
+        # Sample hemisphere in LED frame
+        u1, u2 = np.random.uniform(0, 1, 2)
+        max_theta = np.pi / 2
+        cos_max = np.cos(max_theta)
+        cos_theta = 1.0 - u1 * (1.0 - cos_max)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        theta = np.arccos(cos_theta)
+        phi = 2 * np.pi * u2
+        
+        # Local direction in LED frame
+        local_dir = np.array([
+            np.sin(theta) * np.cos(phi),
+            np.sin(theta) * np.sin(phi),
+            np.cos(theta)
+        ])
+        
+        # Transform to world coordinates
+        world_dir = (
+            local_dir[0] * x_axis
+            + local_dir[1] * y_axis
+            + local_dir[2] * z_axis
+        )
+        world_dir = world_dir / np.linalg.norm(world_dir)
+        
+        # Calculate lumens for this ray
+        n = _calculate_lambertian_exponent(led.viewing_angle, ray_uniformity)
+        norm_factor = n + 1.0
+        cos_n_theta = cos_theta ** n
+        lumens_per_ray = (lumens_per_led / rays_traced) * cos_n_theta * norm_factor
+        
+        # Check absorber intersection
+        hit_absorbed = False
+        if absorbers:
+            for a in absorbers:
+                t_hit = _ray_box_intersection(led.position, world_dir, a)
+                if t_hit is not None and t_hit > 0:
+                    hit_absorbed = True
+                    break
+        
+        if hit_absorbed:
+            continue
+        
+        # Calculate intersection with each wall
+        intersections = []
+        
+        # Front wall
+        if world_dir[0] > 0:
+            t = (front_dist - led.position[0]) / world_dir[0]
+            if t > 0:
+                y = led.position[1] + world_dir[1] * t
+                z = led.position[2] + world_dir[2] * t
+                intersections.append(('front', t, y, z))
+        
+        # Left wall
+        if world_dir[1] < 0:
+            t = (-side_dist - led.position[1]) / world_dir[1]
+            if t > 0:
+                x = led.position[0] + world_dir[0] * t
+                z = led.position[2] + world_dir[2] * t
+                intersections.append(('left', t, x, z))
+        
+        # Right wall
+        if world_dir[1] > 0:
+            t = (side_dist - led.position[1]) / world_dir[1]
+            if t > 0:
+                x = led.position[0] + world_dir[0] * t
+                z = led.position[2] + world_dir[2] * t
+                intersections.append(('right', t, x, z))
+        
+        # Top wall
+        if world_dir[2] > 0:
+            t = (top_bottom_dist - led.position[2]) / world_dir[2]
+            if t > 0:
+                x = led.position[0] + world_dir[0] * t
+                y = led.position[1] + world_dir[1] * t
+                intersections.append(('top', t, x, y))
+        
+        # Bottom wall
+        if world_dir[2] < 0:
+            t = (-top_bottom_dist - led.position[2]) / world_dir[2]
+            if t > 0:
+                x = led.position[0] + world_dir[0] * t
+                y = led.position[1] + world_dir[1] * t
+                intersections.append(('bottom', t, x, y))
+        
+        if not intersections:
+            continue
+        
+        wall_name, t_min, coord1, coord2 = min(intersections, key=lambda x: x[1])
+        wall_spec = wall_specs[wall_name]
+        
+        # Map coordinates to grid indices
+        if wall_name == 'front':
+            size_y = wall_spec['size_y']
+            size_z = wall_spec['size_z']
+            grid_size_y = wall_spec['grid_y']
+            grid_size_z = wall_spec['grid_z']
+            y_idx = int((coord1 + size_y/2) / (size_y/grid_size_y))
+            z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
+            grid_i = z_idx
+            grid_j = y_idx
+        elif wall_name in ['left', 'right']:
+            size_x = wall_spec['size_x']
+            size_z = wall_spec['size_z']
+            grid_size_x = wall_spec['grid_x']
+            grid_size_z = wall_spec['grid_z']
+            x_min = wall_spec['x_min']
+            x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
+            z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
+            grid_i = z_idx
+            grid_j = x_idx
+        else:  # top, bottom
+            size_x = wall_spec['size_x']
+            size_y = wall_spec['size_y']
+            grid_size_x = wall_spec['grid_x']
+            grid_size_y = wall_spec['grid_y']
+            x_min = wall_spec['x_min']
+            x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
+            y_idx = int((coord2 + size_y/2) / (size_y/grid_size_y))
+            grid_i = y_idx
+            grid_j = x_idx
+        
+        # Clamp indices to grid bounds
+        grid_shape = local_grids[wall_name].shape
+        grid_i = max(0, min(grid_shape[0] - 1, grid_i))
+        grid_j = max(0, min(grid_shape[1] - 1, grid_j))
+        
+        local_grids[wall_name][grid_i, grid_j] += lumens_per_ray
+        local_ray_hits[wall_name] += 1
+    
+    return local_grids, local_ray_hits, local_total_rays
 
 
 def main():
@@ -196,12 +432,6 @@ def main():
 
     # --- GUI Controls ---
     with server.gui.add_folder("LED Configuration"):
-        front_angle_slider = server.gui.add_slider(
-            "Front LED angle (°)", min=0, max=45, step=1, initial_value=12
-        )
-        side_angle_slider = server.gui.add_slider(
-            "Side LED angle (°)", min=20, max=80, step=1, initial_value=47
-        )
         viewing_angle_slider = server.gui.add_slider(
             "Viewing angle (°) [GWP9LR35: 120°]", min=10, max=130, step=5, initial_value=120
         )
@@ -210,6 +440,29 @@ def main():
         rot_front_neg = server.gui.add_slider("Rotate front- (°)", min=-180, max=180, step=1, initial_value=0)
         rot_side_pos = server.gui.add_slider("Rotate side+ (°)", min=-180, max=180, step=1, initial_value=0)
         rot_side_neg = server.gui.add_slider("Rotate side- (°)", min=-180, max=180, step=1, initial_value=0)
+        
+        # Per-group translation sliders (move entire group along X, Y, Z axes)
+        with server.gui.add_folder("Group Positions"):
+            # Front+ (Red group)
+            with server.gui.add_folder("Front+ (Red)"):
+                offset_front_pos_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
+                offset_front_pos_y = server.gui.add_slider("Offset Y (cm)", min=-30, max=30, step=0.1, initial_value=1.6)
+                offset_front_pos_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
+            # Front- (Green group)
+            with server.gui.add_folder("Front- (Green)"):
+                offset_front_neg_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
+                offset_front_neg_y = server.gui.add_slider("Offset Y (cm)", min=-30, max=30, step=0.1, initial_value=-1.6)
+                offset_front_neg_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
+            # Side+ (Blue group)
+            with server.gui.add_folder("Side+ (Blue)"):
+                offset_side_pos_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=-1.3)
+                offset_side_pos_y = server.gui.add_slider("Offset Y (cm)", min=-40, max=40, step=0.1, initial_value=-33.1)
+                offset_side_pos_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
+            # Side- (Yellow group)
+            with server.gui.add_folder("Side- (Yellow)"):
+                offset_side_neg_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=-1.3)
+                offset_side_neg_y = server.gui.add_slider("Offset Y (cm)", min=-40, max=50, step=0.1, initial_value=33.1)
+                offset_side_neg_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
 
     with server.gui.add_folder("Geometry"):
         radius_slider = server.gui.add_slider(
@@ -281,10 +534,10 @@ def main():
             "Front wall distance (cm)", min=20, max=200, step=10, initial_value=50
         )
         room_side_dist = server.gui.add_slider(
-            "Side walls distance (cm)", min=50, max=300, step=10, initial_value=100
+            "Side walls distance (cm)", min=50, max=300, step=10, initial_value=150
         )
         room_top_bottom_dist = server.gui.add_slider(
-            "Top/Bottom walls distance (cm)", min=50, max=300, step=10, initial_value=100
+            "Top/Bottom walls distance (cm)", min=50, max=300, step=10, initial_value=150
         )
         room_grid_size = server.gui.add_slider(
             "Room walls grid resolution", min=10, max=50, step=5, initial_value=20
@@ -317,11 +570,11 @@ def main():
     # Absorbers folder (separate group for easier access)
     with server.gui.add_folder("Absorbers"):
         absorbers_enable = server.gui.add_checkbox("Enable absorbers", initial_value=True)
-        abs0_off_x = server.gui.add_slider("Abs0 offset X (cm)", min=-50, max=200, step=0.1, initial_value=0.0)
-        abs0_off_y = server.gui.add_slider("Abs0 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+        abs0_off_x = server.gui.add_slider("Abs0 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1)
+        abs0_off_y = server.gui.add_slider("Abs0 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=2.5)
         abs0_off_z = server.gui.add_slider("Abs0 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-        abs1_off_x = server.gui.add_slider("Abs1 offset X (cm)", min=-50, max=200, step=0.1, initial_value=0.0)
-        abs1_off_y = server.gui.add_slider("Abs1 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+        abs1_off_x = server.gui.add_slider("Abs1 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1)
+        abs1_off_y = server.gui.add_slider("Abs1 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=-2.5)
         abs1_off_z = server.gui.add_slider("Abs1 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
 
     # LED Control Matrix (individual LED and row control)
@@ -571,62 +824,56 @@ def main():
     def compute_room_intensity(
         leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, absorbers=None
     ):
-        """Trace rays and compute intensity grids on all 5 room walls."""
+        """Trace rays and compute intensity grids on all 5 room walls using multiprocessing."""
         
-        # Helper function for ray-box intersection
-        def ray_box_intersection(pos, direction, box):
-            center = np.array(box['center'], dtype=float)
-            half = np.array(box['half_sizes'], dtype=float)
-            tmin = -np.inf
-            tmax = np.inf
-            for k in range(3):
-                if abs(direction[k]) < 1e-12:
-                    if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
-                        return None
-                else:
-                    t1 = (center[k] - half[k] - pos[k]) / direction[k]
-                    t2 = (center[k] + half[k] - pos[k]) / direction[k]
-                    t_near = min(t1, t2)
-                    t_far = max(t1, t2)
-                    tmin = max(tmin, t_near)
-                    tmax = min(tmax, t_far)
-                    if tmin > tmax:
-                        return None
-            if tmax < 0:
-                return None
-            return tmin if tmin > 0 else (tmax if tmax > 0 else None)
+        # Calculate physical dimensions of each wall
+        wall_width_x = front_dist + abs(circle_center_slider.value)  # Base depth
+        wall_width_y = 2 * side_dist  # Front wall width, top/bottom wall width
+        wall_height_z = 2 * top_bottom_dist  # Front wall height, left/right wall height
         
-        # Helper function for Lambertian exponent calculation
-        def calculate_lambertian_exponent(viewing_angle):
-            theta_half = np.radians(viewing_angle / 2.0)
-            cos_half = np.cos(theta_half)
-            if cos_half > 0.01:
-                n_base = np.log(0.5) / np.log(cos_half)
-                n_base = np.clip(n_base, 0.1, 10.0)
-            else:
-                n_base = 1.0
-            # Apply uniformity factor
-            uniformity = float(ray_uniformity_slider.value) if 'ray_uniformity_slider' in globals() else 0.0
-            n = n_base * (1.0 + uniformity * 2.0)
-            n = np.clip(n, 0.1, 30.0)
-            return n
+        # Increase depth (X axis) for side/top/bottom walls by at least 2x
+        side_topbottom_depth_x = wall_width_x * 2.5  # 2.5x depth for lateral, top, bottom walls
         
-        # Initialize grids for each wall
+        # Find maximum dimension to establish uniform cell size
+        max_dimension = max(side_topbottom_depth_x, wall_width_y, wall_height_z)
+        cell_size = max_dimension / grid_size  # Physical size of each cell
+        
+        # Calculate grid dimensions for each wall to have uniform cell size
+        # Each wall gets grid dimensions proportional to its physical size
+        front_grid_y = max(2, int(np.ceil(wall_width_y / cell_size)))  # Y direction
+        front_grid_z = max(2, int(np.ceil(wall_height_z / cell_size)))  # Z direction
+        
+        side_grid_x = max(2, int(np.ceil(side_topbottom_depth_x / cell_size)))  # X direction for left/right (increased)
+        side_grid_z = max(2, int(np.ceil(wall_height_z / cell_size)))  # Z direction for left/right
+        
+        topbottom_grid_x = max(2, int(np.ceil(side_topbottom_depth_x / cell_size)))  # X direction for top/bottom (increased)
+        topbottom_grid_y = max(2, int(np.ceil(wall_width_y / cell_size)))  # Y direction for top/bottom
+        
+        # Initialize grids for each wall with appropriate dimensions
+        # Grid indexed as [gi, gj] where gi is first axis (vertical/rows), gj is second axis (horizontal/cols)
         grids = {
-            'front': np.zeros((grid_size, grid_size)),  # YZ plane at x=front_dist
-            'left': np.zeros((grid_size, grid_size)),   # XZ plane at y=-side_dist
-            'right': np.zeros((grid_size, grid_size)),  # XZ plane at y=+side_dist
-            'top': np.zeros((grid_size, grid_size)),    # XY plane at z=+top_bottom_dist
-            'bottom': np.zeros((grid_size, grid_size))  # XY plane at z=-top_bottom_dist
+            'front': np.zeros((front_grid_z, front_grid_y)),  # YZ plane: [Z, Y]
+            'left': np.zeros((side_grid_z, side_grid_x)),   # XZ plane: [Z, X]
+            'right': np.zeros((side_grid_z, side_grid_x)),  # XZ plane: [Z, X]
+            'top': np.zeros((topbottom_grid_y, topbottom_grid_x)),    # XY plane: [Y, X]
+            'bottom': np.zeros((topbottom_grid_y, topbottom_grid_x))  # XY plane: [Y, X]
         }
         
-        # Wall dimensions for grid mapping
+        # Wall dimensions for grid mapping (each wall needs proper size and range)
+        # For extended side/top/bottom walls: x_min is the back edge (front_dist - depth)
+        extended_x_min = front_dist - side_topbottom_depth_x  # Back edge of extended walls
+        
         wall_specs = {
-            'front': {'size': max(2*side_dist, 2*top_bottom_dist), 'dims': ('y', 'z')},
-            'left': {'size': max(front_dist, 2*top_bottom_dist), 'dims': ('x', 'z')},
-            'right': {'size': max(front_dist, 2*top_bottom_dist), 'dims': ('x', 'z')},
-            'top': {'size': max(front_dist, 2*side_dist), 'dims': ('x', 'y')},
-            'bottom': {'size': max(front_dist, 2*side_dist), 'dims': ('x', 'y')}
+            'front': {'size_y': wall_width_y, 'size_z': wall_height_z, 'dims': ('y', 'z'), 
+                     'grid_y': front_grid_y, 'grid_z': front_grid_z, 'cell_size': cell_size},
+            'left': {'size_x': side_topbottom_depth_x, 'size_z': wall_height_z, 'dims': ('x', 'z'), 'x_min': extended_x_min,
+                    'grid_x': side_grid_x, 'grid_z': side_grid_z, 'cell_size': cell_size},
+            'right': {'size_x': side_topbottom_depth_x, 'size_z': wall_height_z, 'dims': ('x', 'z'), 'x_min': extended_x_min,
+                     'grid_x': side_grid_x, 'grid_z': side_grid_z, 'cell_size': cell_size},
+            'top': {'size_x': side_topbottom_depth_x, 'size_y': wall_width_y, 'dims': ('x', 'y'), 'x_min': extended_x_min,
+                   'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y, 'cell_size': cell_size},
+            'bottom': {'size_x': side_topbottom_depth_x, 'size_y': wall_width_y, 'dims': ('x', 'y'), 'x_min': extended_x_min,
+                      'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y, 'cell_size': cell_size}
         }
         
         lumens_per_led = float(led_lumens_slider.value)
@@ -637,135 +884,61 @@ def main():
         print(f"\n=== ROOM MODE ===")
         print(f"Front wall: x={front_dist}cm, Left: y={-side_dist}cm, Right: y={+side_dist}cm")
         print(f"Top: z={+top_bottom_dist}cm, Bottom: z={-top_bottom_dist}cm")
-        print(f"Grid resolution: {grid_size}×{grid_size} per wall")
+        print(f"Uniform cell size: {cell_size:.2f}cm")
+        print(f"Grid resolutions: Front {front_grid_y}×{front_grid_z}, Side {side_grid_x}×{side_grid_z}, Top/Bottom {topbottom_grid_x}×{topbottom_grid_y}")
         
         # Track ray hits per wall for debugging
         ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
         total_rays = 0
         
-        for led_idx, led in enumerate(leds):
-            if hasattr(led, 'enabled') and not led.enabled:
-                continue
-            
-            # Build local coordinate system from LED direction
-            z_axis = led.direction
-            if abs(z_axis[2]) < 0.9:
-                x_axis = np.cross(z_axis, [0, 0, 1])
-            else:
-                x_axis = np.cross(z_axis, [0, 1, 0])
-            x_axis = x_axis / np.linalg.norm(x_axis)
-            y_axis = np.cross(z_axis, x_axis)
-            
-            # Calculate rays per LED
-            rays_traced = num_rays_per_led * grid_size * grid_size
-            
-            for _ in range(rays_traced):
-                total_rays += 1
-                
-                # Sample hemisphere in LED frame using uniform solid angle sampling
-                u1, u2 = np.random.uniform(0, 1, 2)
-                max_theta = np.pi / 2  # Full hemisphere
-                
-                # Uniform in solid angle
-                cos_max = np.cos(max_theta)
-                cos_theta = 1.0 - u1 * (1.0 - cos_max)
-                cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                theta = np.arccos(cos_theta)
-                phi = 2 * np.pi * u2
-                
-                # Local direction in LED frame
-                local_dir = np.array([
-                    np.sin(theta) * np.cos(phi),
-                    np.sin(theta) * np.sin(phi),
-                    np.cos(theta)
-                ])
-                
-                # Transform to world coordinates
-                world_dir = (
-                    local_dir[0] * x_axis
-                    + local_dir[1] * y_axis
-                    + local_dir[2] * z_axis
-                )
-                world_dir = world_dir / np.linalg.norm(world_dir)
-                
-                # Calculate lumens for this ray
-                n = calculate_lambertian_exponent(led.viewing_angle)
-                norm_factor = n + 1.0
-                cos_n_theta = cos_theta ** n
-                lumens_per_ray = (lumens_per_led / rays_traced) * cos_n_theta * norm_factor
-                
-                # Check absorber intersection
-                hit_absorbed = False
-                if absorbers:
-                    for a in absorbers:
-                        t_hit = ray_box_intersection(led.position, world_dir, a)
-                        if t_hit is not None and t_hit > 0:
-                            hit_absorbed = True
-                            break
-                
-                if hit_absorbed:
-                    continue
-                
-                # Calculate intersection with each wall
-                intersections = []
-                
-                # Front wall (x = front_dist)
-                if world_dir[0] > 0:
-                    t = (front_dist - led.position[0]) / world_dir[0]
-                    if t > 0:
-                        y = led.position[1] + world_dir[1] * t
-                        z = led.position[2] + world_dir[2] * t
-                        intersections.append(('front', t, y, z))
-                
-                # Left wall (y = -side_dist)
-                if world_dir[1] < 0:
-                    t = (-side_dist - led.position[1]) / world_dir[1]
-                    if t > 0:
-                        x = led.position[0] + world_dir[0] * t
-                        z = led.position[2] + world_dir[2] * t
-                        intersections.append(('left', t, x, z))
-                
-                # Right wall (y = +side_dist)
-                if world_dir[1] > 0:
-                    t = (side_dist - led.position[1]) / world_dir[1]
-                    if t > 0:
-                        x = led.position[0] + world_dir[0] * t
-                        z = led.position[2] + world_dir[2] * t
-                        intersections.append(('right', t, x, z))
-                
-                # Top wall (z = +top_bottom_dist)
-                if world_dir[2] > 0:
-                    t = (top_bottom_dist - led.position[2]) / world_dir[2]
-                    if t > 0:
-                        x = led.position[0] + world_dir[0] * t
-                        y = led.position[1] + world_dir[1] * t
-                        intersections.append(('top', t, x, y))
-                
-                # Bottom wall (z = -top_bottom_dist)
-                if world_dir[2] < 0:
-                    t = (-top_bottom_dist - led.position[2]) / world_dir[2]
-                    if t > 0:
-                        x = led.position[0] + world_dir[0] * t
-                        y = led.position[1] + world_dir[1] * t
-                        intersections.append(('bottom', t, x, y))
-                
-                # Find closest intersection
-                if not intersections:
-                    continue
-                
-                wall_name, t_min, coord1, coord2 = min(intersections, key=lambda x: x[1])
-                wall_spec = wall_specs[wall_name]
-                wall_size = wall_spec['size']
-                half_size = wall_size / 2
-                cell_size = wall_size / grid_size
-                
-                # Map coordinates to grid indices
-                grid_idx1 = int((coord1 + half_size) / cell_size)
-                grid_idx2 = int((coord2 + half_size) / cell_size)
-                
-                if 0 <= grid_idx1 < grid_size and 0 <= grid_idx2 < grid_size:
-                    grids[wall_name][grid_idx2, grid_idx1] += lumens_per_ray
-                    ray_hits[wall_name] += 1
+        # MULTIPROCESSING: Prepare parameters for worker processes
+        active_leds = [led for led in leds if not (hasattr(led, 'enabled') and not led.enabled)]
+        
+        if len(active_leds) == 0:
+            return grids, wall_specs
+        
+        # Get ray uniformity from slider
+        ray_uniformity = float(ray_uniformity_slider.value) if 'ray_uniformity_slider' in globals() else 0.0
+        
+        # Prepare grid shapes for workers
+        grid_shapes = {
+            'front': grids['front'].shape,
+            'left': grids['left'].shape,
+            'right': grids['right'].shape,
+            'top': grids['top'].shape,
+            'bottom': grids['bottom'].shape
+        }
+        
+        # Package parameters for workers
+        worker_params = {
+            'front_dist': front_dist,
+            'side_dist': side_dist,
+            'top_bottom_dist': top_bottom_dist,
+            'num_rays_per_led': num_rays_per_led,
+            'grid_size': grid_size,
+            'lumens_per_led': lumens_per_led,
+            'absorbers': absorbers,
+            'ray_uniformity': ray_uniformity,
+            'grid_shapes': grid_shapes,
+            'wall_specs': wall_specs
+        }
+        
+        # Prepare arguments for each LED
+        led_args = [(led, worker_params) for led in active_leds]
+        
+        # Use multiprocessing to parallelize LED processing
+        num_processes = min(multiprocessing.cpu_count(), len(active_leds))
+        print(f"Using {num_processes} CPU cores for parallel ray tracing...")
+        
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = pool.map(_process_led_worker, led_args)
+        
+        # Combine results from all workers
+        for led_grids, led_ray_hits, led_total_rays in results:
+            for wall_name in grids.keys():
+                grids[wall_name] += led_grids[wall_name]
+                ray_hits[wall_name] += led_ray_hits[wall_name]
+            total_rays += led_total_rays
         
         # Print summary
         total_emitted = num_active_leds * lumens_per_led
@@ -789,7 +962,12 @@ def main():
         from PIL import Image
         
         # Get current camera and wall settings
-        wall_dist = wall_dist_slider.value
+        # Use correct wall distance based on mode
+        if room_mode_enable.value:
+            wall_dist = room_front_dist.value
+        else:
+            wall_dist = wall_dist_slider.value
+        
         cam_x = camera_pos_x.value
         fov_h_deg = camera_fov_h.value
         fov_v_deg = camera_fov_v.value
@@ -808,9 +986,9 @@ def main():
         # Create grid for FOV region
         fov_grid = np.zeros((grid_height, grid_width))
         
-        # Get LEDs configuration
-        front_angle = front_angle_slider.value
-        side_angle = side_angle_slider.value
+        # Get LEDs configuration (fixed angles: front=0°, side=90°)
+        front_angle = 0.0  # Fixed front angle
+        side_angle = 90.0  # Fixed side angle
         viewing_angle = viewing_angle_slider.value
         radius = radius_slider.value
         circle_center_x = circle_center_slider.value
@@ -822,6 +1000,13 @@ def main():
             rot_side_neg.value,
         ]
         
+        offsets = [
+            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
+            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
+            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
+            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
+        ]
+        
         leds = create_leds(
             front_angle,
             side_angle,
@@ -831,6 +1016,7 @@ def main():
             group_rotations=rotations,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
+            group_offsets=offsets,
         )
         
         # Build absorbers
@@ -1147,9 +1333,9 @@ def main():
         grid_size = int(intensity_grid_size.value)
         wall_size = int(wall_view_size.value)
         
-        # Get current LEDs configuration
-        front_angle = front_angle_slider.value
-        side_angle = side_angle_slider.value
+        # Get current LEDs configuration (fixed angles: front=0°, side=90°)
+        front_angle = 0.0  # Fixed front angle
+        side_angle = 90.0  # Fixed side angle
         viewing_angle = viewing_angle_slider.value
         radius = radius_slider.value
         circle_center_x = circle_center_slider.value
@@ -1161,6 +1347,13 @@ def main():
             rot_side_neg.value,
         ]
         
+        offsets = [
+            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
+            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
+            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
+            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
+        ]
+        
         leds = create_leds(
             front_angle,
             side_angle,
@@ -1170,6 +1363,7 @@ def main():
             group_rotations=rotations,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
+            group_offsets=offsets,
         )
         
         # Build absorbers
@@ -1309,6 +1503,7 @@ def main():
         # Conversion using solid angle formula:
         # lumen = Lux * 2 * π * Area_cell * (1 - cos(viewing_angle/2))
         # Therefore: Lux = lumen / (2 * π * Area_cell * (1 - cos(viewing_angle/2)))
+        # candela = lumen / solid_angle_steradian
         cell_area_m2 = cell_size_m * cell_size_m
         viewing_angle = viewing_angle_slider.value
         solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
@@ -1319,11 +1514,13 @@ def main():
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
             # Convert lumens to lux using solid angle formula
             lux_val = val / (cell_area_m2 * solid_angle_factor) if cell_area_m2 > 0 else 0
+            # Convert lumens to candela (luminous intensity)
+            cd_val = val / solid_angle_factor if solid_angle_factor > 0 else 0
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
                 f"<div style='min-width:70px;'>{val:.1f} lm</div>"
-                f"<div style='color:#888;font-size:11px;'>({lux_val:.0f} lx)</div></div>"
+                f"<div style='color:#888;font-size:11px;'>({lux_val:.0f} lx, {cd_val:.2f} cd)</div></div>"
             )
         html_lines.append("</div>")
         legend_html.content = "".join(html_lines)
@@ -1348,9 +1545,11 @@ def main():
         side_dist = room_side_dist.value
         top_bottom_dist = room_top_bottom_dist.value
         
-        # Wall color (semi-transparent gray)
-        wall_color = (0.3, 0.3, 0.3)
-        wall_opacity = 0.1
+        # Get LED position range (LEDs are at negative X)
+        led_x_min = circle_center_slider.value  # Typically -35 cm
+        
+        # Wall color (solid gray like front wall)
+        wall_color = (0.5, 0.5, 0.5)
         
         # Front wall (YZ plane at x=front_dist)
         front_width = 2 * side_dist / 100.0  # Y direction
@@ -1360,57 +1559,56 @@ def main():
             dimensions=(0.01, front_width, front_height),
             color=wall_color,
             position=(front_dist / 100.0, 0, 0),
-            opacity=wall_opacity,
         )
         room_wall_handles.append(handle)
         
-        # Left wall (XZ plane at y=-side_dist)
-        left_width = front_dist / 100.0  # X direction
+        # Left wall (XZ plane at y=-side_dist) - starts from front wall, extends backward
+        left_width = (front_dist - led_x_min) / 100.0 * 2.5  # X direction: 2.5x depth
         left_height = 2 * top_bottom_dist / 100.0  # Z direction
+        # Center: front wall is at front_dist, extend backward by left_width
+        left_center_x = (front_dist - left_width * 100.0 / 2) / 100.0
         handle = server.scene.add_box(
             "/room_walls/left",
             dimensions=(left_width, 0.01, left_height),
             color=wall_color,
-            position=(left_width / 2, -side_dist / 100.0, 0),
-            opacity=wall_opacity,
+            position=(left_center_x, -side_dist / 100.0, 0),
         )
         room_wall_handles.append(handle)
         
-        # Right wall (XZ plane at y=+side_dist)
+        # Right wall (XZ plane at y=+side_dist) - starts from front wall, extends backward
         handle = server.scene.add_box(
             "/room_walls/right",
             dimensions=(left_width, 0.01, left_height),
             color=wall_color,
-            position=(left_width / 2, side_dist / 100.0, 0),
-            opacity=wall_opacity,
+            position=(left_center_x, side_dist / 100.0, 0),
         )
         room_wall_handles.append(handle)
         
-        # Top wall (XY plane at z=+top_bottom_dist)
-        top_width = front_dist / 100.0  # X direction
+        # Top wall (XY plane at z=+top_bottom_dist) - starts from front wall, extends backward
+        top_width = (front_dist - led_x_min) / 100.0 * 2.5  # X direction: 2.5x depth
         top_depth = 2 * side_dist / 100.0  # Y direction
+        # Center: front wall is at front_dist, extend backward by top_width
+        top_center_x = (front_dist - top_width * 100.0 / 2) / 100.0
         handle = server.scene.add_box(
             "/room_walls/top",
             dimensions=(top_width, top_depth, 0.01),
             color=wall_color,
-            position=(top_width / 2, 0, top_bottom_dist / 100.0),
-            opacity=wall_opacity,
+            position=(top_center_x, 0, top_bottom_dist / 100.0),
         )
         room_wall_handles.append(handle)
         
-        # Bottom wall (XY plane at z=-top_bottom_dist)
+        # Bottom wall (XY plane at z=-top_bottom_dist) - starts from front wall, extends backward
         handle = server.scene.add_box(
             "/room_walls/bottom",
             dimensions=(top_width, top_depth, 0.01),
             color=wall_color,
-            position=(top_width / 2, 0, -top_bottom_dist / 100.0),
-            opacity=wall_opacity,
+            position=(top_center_x, 0, -top_bottom_dist / 100.0),
         )
         room_wall_handles.append(handle)
     
     def update_room_intensity_map():
         """Update intensity map for all 5 room walls."""
-        nonlocal room_intensity_handles
+        nonlocal room_intensity_handles, room_wall_handles
         
         # Clear previous room intensity handles
         for handle in room_intensity_handles:
@@ -1423,15 +1621,23 @@ def main():
         if not room_mode_enable.value or not show_room_intensity.value:
             return
         
+        # Hide room walls when showing intensity (they would cover the intensity cells)
+        for handle in room_wall_handles:
+            try:
+                handle.remove()
+            except KeyError:
+                pass
+        room_wall_handles = []
+        
         # Get room dimensions
         front_dist = room_front_dist.value
         side_dist = room_side_dist.value
         top_bottom_dist = room_top_bottom_dist.value
         grid_size = int(room_grid_size.value)
         
-        # Get current LEDs configuration
-        front_angle = front_angle_slider.value
-        side_angle = side_angle_slider.value
+        # Get current LEDs configuration (fixed angles: front=0°, side=90°)
+        front_angle = 0.0  # Fixed front angle
+        side_angle = 90.0  # Fixed side angle
         viewing_angle = viewing_angle_slider.value
         radius = radius_slider.value
         circle_center_x = circle_center_slider.value
@@ -1443,6 +1649,13 @@ def main():
             rot_side_neg.value,
         ]
         
+        offsets = [
+            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
+            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
+            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
+            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
+        ]
+        
         leds = create_leds(
             front_angle,
             side_angle,
@@ -1452,6 +1665,7 @@ def main():
             group_rotations=rotations,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
+            group_offsets=offsets,
         )
         
         # Build absorbers
@@ -1506,55 +1720,94 @@ def main():
         # Find max intensity across all walls for color normalization
         max_intensity = max(grid.max() for grid in grids.values()) if grids else 0.0
         
+        print(f"\n=== ROOM INTENSITY VISUALIZATION ===")
+        print(f"Max intensity across all walls: {max_intensity:.4f} lm")
+        for wall_name, grid in grids.items():
+            cells_with_intensity = np.count_nonzero(grid > 0)
+            print(f"  {wall_name.capitalize()}: {cells_with_intensity} cells with intensity (total: {grid.sum():.1f} lm)")
+        
         # Visualize each wall
+        cells_created = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
         for wall_name, intensity_grid in grids.items():
             wall_spec = wall_specs[wall_name]
-            wall_size = wall_spec['size']
-            cell_size_cm = wall_size / grid_size
-            cell_size_m = cell_size_cm / 100.0
-            half_size = wall_size / 2
+            grid_shape = intensity_grid.shape  # Get actual grid dimensions for this wall
             
-            for gi in range(grid_size):
-                for gj in range(grid_size):
+            for gi in range(grid_shape[0]):
+                for gj in range(grid_shape[1]):
                     intensity = intensity_grid[gi, gj]
                     if intensity > 0:
                         color = intensity_to_color(intensity, max_intensity)
                         
                         # Calculate cell position based on wall orientation
+                        # Position cells exactly on wall surfaces (same as gray walls)
                         if wall_name == 'front':
                             # YZ plane at x=front_dist
-                            x_pos = front_dist / 100.0 - 0.005
-                            y_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
-                            z_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
-                            dims = (0.001, cell_size_m * 0.95, cell_size_m * 0.95)
+                            size_y = wall_spec['size_y']
+                            size_z = wall_spec['size_z']
+                            grid_y = wall_spec['grid_y']
+                            grid_z = wall_spec['grid_z']
+                            cell_size_y = size_y / grid_y
+                            cell_size_z = size_z / grid_z
+                            x_pos = front_dist / 100.0
+                            y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
+                            z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                            dims = (0.01, cell_size_y / 100.0 * 0.98, cell_size_z / 100.0 * 0.98)
                         
                         elif wall_name == 'left':
                             # XZ plane at y=-side_dist
-                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
-                            y_pos = -side_dist / 100.0 + 0.005
-                            z_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
-                            dims = (cell_size_m * 0.95, 0.001, cell_size_m * 0.95)
+                            size_x = wall_spec['size_x']
+                            size_z = wall_spec['size_z']
+                            grid_x = wall_spec['grid_x']
+                            grid_z = wall_spec['grid_z']
+                            x_min = wall_spec['x_min']
+                            cell_size_x = size_x / grid_x
+                            cell_size_z = size_z / grid_z
+                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                            y_pos = -side_dist / 100.0
+                            z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                            dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
                         
                         elif wall_name == 'right':
                             # XZ plane at y=+side_dist
-                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
-                            y_pos = side_dist / 100.0 - 0.005
-                            z_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
-                            dims = (cell_size_m * 0.95, 0.001, cell_size_m * 0.95)
+                            size_x = wall_spec['size_x']
+                            size_z = wall_spec['size_z']
+                            grid_x = wall_spec['grid_x']
+                            grid_z = wall_spec['grid_z']
+                            x_min = wall_spec['x_min']
+                            cell_size_x = size_x / grid_x
+                            cell_size_z = size_z / grid_z
+                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                            y_pos = side_dist / 100.0
+                            z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                            dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
                         
                         elif wall_name == 'top':
                             # XY plane at z=+top_bottom_dist
-                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
-                            y_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
-                            z_pos = top_bottom_dist / 100.0 - 0.005
-                            dims = (cell_size_m * 0.95, cell_size_m * 0.95, 0.001)
+                            size_x = wall_spec['size_x']
+                            size_y = wall_spec['size_y']
+                            grid_x = wall_spec['grid_x']
+                            grid_y = wall_spec['grid_y']
+                            x_min = wall_spec['x_min']
+                            cell_size_x = size_x / grid_x
+                            cell_size_y = size_y / grid_y
+                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                            y_pos = (-size_y/2 + (grid_shape[0] - 1 - gi) * cell_size_y + cell_size_y / 2) / 100.0
+                            z_pos = top_bottom_dist / 100.0
+                            dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
                         
                         elif wall_name == 'bottom':
                             # XY plane at z=-top_bottom_dist
-                            x_pos = (-half_size + gj * cell_size_cm + cell_size_cm / 2) / 100.0
-                            y_pos = (-half_size + gi * cell_size_cm + cell_size_cm / 2) / 100.0
-                            z_pos = -top_bottom_dist / 100.0 + 0.005
-                            dims = (cell_size_m * 0.95, cell_size_m * 0.95, 0.001)
+                            size_x = wall_spec['size_x']
+                            size_y = wall_spec['size_y']
+                            grid_x = wall_spec['grid_x']
+                            grid_y = wall_spec['grid_y']
+                            x_min = wall_spec['x_min']
+                            cell_size_x = size_x / grid_x
+                            cell_size_y = size_y / grid_y
+                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                            y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
+                            z_pos = -top_bottom_dist / 100.0
+                            dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
                         
                         handle = server.scene.add_box(
                             f"/room_intensity/{wall_name}/cell_{gi}_{gj}",
@@ -1563,6 +1816,46 @@ def main():
                             position=(x_pos, y_pos, z_pos),
                         )
                         room_intensity_handles.append(handle)
+                        cells_created[wall_name] += 1
+        
+        print(f"Cells visualized:")
+        for wall_name, count in cells_created.items():
+            print(f"  {wall_name.capitalize()}: {count} cells created")
+        print(f"===================================\n")
+        
+        # Update legend
+        legend_steps = 6
+        legend_vals = np.linspace(0, max_intensity, legend_steps)
+        # Calculate cell size for lux conversion (use max dimension approach)
+        # Cell size is uniform across all walls based on max dimension / grid_size
+        led_width = wall_specs['front']['size_y']  # Use front wall width as reference
+        led_height = wall_specs['front']['size_z']  # Use front wall height as reference
+        led_x_min = min(ws['x_min'] for ws in wall_specs.values() if 'x_min' in ws)
+        led_x_max = front_dist
+        led_depth = led_x_max - led_x_min
+        max_dimension = max(led_width, led_height, led_depth)
+        cell_size_cm = max_dimension / grid_size
+        cell_size_m = cell_size_cm / 100.0
+        cell_area_m2 = cell_size_m * cell_size_m
+        viewing_angle = viewing_angle_slider.value
+        solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
+        html_lines = ["<div style='font-family: sans-serif;'>",
+                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"]
+        for val in reversed(legend_vals):
+            color = intensity_to_color(val, max_intensity)
+            hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
+            # Convert lumens to lux using solid angle formula
+            lux_val = val / (cell_area_m2 * solid_angle_factor) if cell_area_m2 > 0 else 0
+            # Convert lumens to candela (luminous intensity)
+            cd_val = val / solid_angle_factor if solid_angle_factor > 0 else 0
+            html_lines.append(
+                f"<div style='display:flex;align-items:center;margin:2px 0;'>"
+                f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
+                f"<div style='min-width:70px;'>{val:.1f} lm</div>"
+                f"<div style='color:#888;font-size:11px;'>({lux_val:.0f} lx, {cd_val:.2f} cd)</div></div>"
+            )
+        html_lines.append("</div>")
+        legend_html.content = "".join(html_lines)
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
@@ -1602,9 +1895,9 @@ def main():
         absorber_handles = []
         camera_fov_handles = []
 
-        # Get current values
-        front_angle = front_angle_slider.value
-        side_angle = side_angle_slider.value
+        # Get current values (fixed angles: front=0°, side=90°)
+        front_angle = 0.0  # Fixed front angle
+        side_angle = 90.0  # Fixed side angle
         viewing_angle = viewing_angle_slider.value
         radius = radius_slider.value
         wall_dist = wall_dist_slider.value
@@ -1619,6 +1912,13 @@ def main():
             rot_side_pos.value,
             rot_side_neg.value,
         ]
+        
+        offsets = [
+            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
+            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
+            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
+            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
+        ]
 
         leds = create_leds(
             front_angle,
@@ -1629,6 +1929,7 @@ def main():
             group_rotations=rotations,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
+            group_offsets=offsets,
         )
 
         # Build absorbers for front groups (one per front group)
@@ -1698,19 +1999,105 @@ def main():
             )
             absorber_handles.append(handle)
 
-        # Draw LEDs as spheres (if enabled)
+        # Draw LEDs as squares with center source (if enabled)
         if show_led_markers.value:
             for i, led in enumerate(leds):
-                if hasattr(led, 'enabled') and not led.enabled:
-                    continue
                 led_idx = getattr(led, 'led_index', i)
-                handle = server.scene.add_icosphere(
-                    f"/leds/led_{led_idx}",
-                    radius=0.5,
-                    color=led.color,
+                led_enabled = not (hasattr(led, 'enabled') and not led.enabled)
+                
+                # Build local coordinate system for LED
+                # z_axis = LED direction (normal to square)
+                z_axis = led.direction / np.linalg.norm(led.direction)
+                
+                # Use row_direction as reference for consistent square orientation across all rows
+                row_dir = getattr(led, 'row_direction', None)
+                if row_dir is not None:
+                    # y_axis aligned with row direction (direction along the row of LEDs)
+                    y_axis = row_dir / np.linalg.norm(row_dir)
+                    # Make y_axis perpendicular to z_axis (Gram-Schmidt)
+                    y_axis = y_axis - z_axis * np.dot(y_axis, z_axis)
+                    if np.linalg.norm(y_axis) < 0.01:  # Nearly parallel, use fallback
+                        if abs(z_axis[2]) < 0.9:
+                            x_axis = np.cross(z_axis, [0, 0, 1])
+                        else:
+                            x_axis = np.cross(z_axis, [0, 1, 0])
+                        x_axis = x_axis / np.linalg.norm(x_axis)
+                        y_axis = np.cross(z_axis, x_axis)
+                    else:
+                        y_axis = y_axis / np.linalg.norm(y_axis)
+                        x_axis = np.cross(y_axis, z_axis)
+                else:
+                    # Fallback for backwards compatibility
+                    if abs(z_axis[2]) < 0.9:
+                        x_axis = np.cross(z_axis, [0, 0, 1])
+                    else:
+                        x_axis = np.cross(z_axis, [0, 1, 0])
+                    x_axis = x_axis / np.linalg.norm(x_axis)
+                    y_axis = np.cross(z_axis, x_axis)
+                
+                # Create rotation matrix from local axes to world axes
+                # Square default orientation: thin in X, extends in Y and Z
+                # We want: thin along z_axis (LED direction), extends along x_axis and y_axis
+                # Rotation matrix: columns are the target axes in world coordinates
+                rot_matrix = np.column_stack([z_axis, x_axis, y_axis])
+                
+                # Convert rotation matrix to quaternion (wxyz format)
+                # Using Shepperd's method for numerical stability
+                trace = rot_matrix[0, 0] + rot_matrix[1, 1] + rot_matrix[2, 2]
+                if trace > 0:
+                    s = 0.5 / np.sqrt(trace + 1.0)
+                    w = 0.25 / s
+                    x = (rot_matrix[2, 1] - rot_matrix[1, 2]) * s
+                    y = (rot_matrix[0, 2] - rot_matrix[2, 0]) * s
+                    z = (rot_matrix[1, 0] - rot_matrix[0, 1]) * s
+                else:
+                    if rot_matrix[0, 0] > rot_matrix[1, 1] and rot_matrix[0, 0] > rot_matrix[2, 2]:
+                        s = 2.0 * np.sqrt(1.0 + rot_matrix[0, 0] - rot_matrix[1, 1] - rot_matrix[2, 2])
+                        w = (rot_matrix[2, 1] - rot_matrix[1, 2]) / s
+                        x = 0.25 * s
+                        y = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
+                        z = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
+                    elif rot_matrix[1, 1] > rot_matrix[2, 2]:
+                        s = 2.0 * np.sqrt(1.0 + rot_matrix[1, 1] - rot_matrix[0, 0] - rot_matrix[2, 2])
+                        w = (rot_matrix[0, 2] - rot_matrix[2, 0]) / s
+                        x = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
+                        y = 0.25 * s
+                        z = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
+                    else:
+                        s = 2.0 * np.sqrt(1.0 + rot_matrix[2, 2] - rot_matrix[0, 0] - rot_matrix[1, 1])
+                        w = (rot_matrix[1, 0] - rot_matrix[0, 1]) / s
+                        x = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
+                        y = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
+                        z = 0.25 * s
+                quat_wxyz = np.array([w, x, y, z])
+                
+                # Square base: 0.5cm = 0.005m, thin in direction of emission
+                square_size = 0.005  # 0.5cm
+                square_thickness = 0.0002  # Very thin (0.2mm)
+                dims = (square_thickness, square_size, square_size)
+                
+                # White color: bright if enabled, dim if disabled
+                square_color = (1.0, 1.0, 1.0) if led_enabled else (0.3, 0.3, 0.3)
+                
+                # Draw square base with rotation
+                handle = server.scene.add_box(
+                    f"/leds/led_{led_idx}_base",
+                    dimensions=dims,
+                    color=square_color,
                     position=tuple(led.position / 100.0),  # Convert cm to m for viser
+                    wxyz=tuple(quat_wxyz),
                 )
                 led_handles.append(handle)
+                
+                # Draw small center source sphere (only if enabled)
+                if led_enabled:
+                    handle = server.scene.add_icosphere(
+                        f"/leds/led_{led_idx}_source",
+                        radius=0.001,  # Very small 1mm source
+                        color=led.color,
+                        position=tuple(led.position / 100.0),
+                    )
+                    led_handles.append(handle)
 
         # Draw rays (toggleable)
         if show_rays_output.value:
@@ -1732,10 +2119,47 @@ def main():
                                 if t_abs_min is None or t_hit < t_abs_min:
                                     t_abs_min = t_hit
 
-                    # Clip at wall (compute t_wall as distance along direction, not fraction)
+                    # Clip at wall(s) - if room mode, check all 5 walls
                     t_wall = None
-                    if direction[0] != 0:
-                        t_wall = (wall_dist - pos[0]) / direction[0]
+                    if room_mode_enable.value:
+                        # Check all 5 room walls
+                        front_dist = room_front_dist.value
+                        side_dist = room_side_dist.value
+                        top_bottom_dist = room_top_bottom_dist.value
+                        
+                        wall_intersections = []
+                        # Front wall
+                        if direction[0] != 0:
+                            t = (front_dist - pos[0]) / direction[0]
+                            if t > 0:
+                                wall_intersections.append(t)
+                        # Left wall
+                        if direction[1] != 0:
+                            t = (-side_dist - pos[1]) / direction[1]
+                            if t > 0:
+                                wall_intersections.append(t)
+                        # Right wall
+                        if direction[1] != 0:
+                            t = (side_dist - pos[1]) / direction[1]
+                            if t > 0:
+                                wall_intersections.append(t)
+                        # Top wall
+                        if direction[2] != 0:
+                            t = (top_bottom_dist - pos[2]) / direction[2]
+                            if t > 0:
+                                wall_intersections.append(t)
+                        # Bottom wall
+                        if direction[2] != 0:
+                            t = (-top_bottom_dist - pos[2]) / direction[2]
+                            if t > 0:
+                                wall_intersections.append(t)
+                        
+                        if wall_intersections:
+                            t_wall = min(wall_intersections)
+                    else:
+                        # Single front wall only
+                        if direction[0] != 0:
+                            t_wall = (wall_dist - pos[0]) / direction[0]
 
                     # Choose nearest positive intersection (absorber before wall)
                     t_clip = None
@@ -1817,8 +2241,45 @@ def main():
                                         t_abs_min = t_hit
 
                         t_wall = None
-                        if world_dir[0] != 0:
-                            t_wall = (wall_dist - led.position[0]) / world_dir[0]
+                        if room_mode_enable.value:
+                            # Check all 5 room walls
+                            front_dist = room_front_dist.value
+                            side_dist = room_side_dist.value
+                            top_bottom_dist = room_top_bottom_dist.value
+                            
+                            wall_intersections = []
+                            # Front wall
+                            if world_dir[0] != 0:
+                                t = (front_dist - led.position[0]) / world_dir[0]
+                                if t > 0:
+                                    wall_intersections.append(t)
+                            # Left wall
+                            if world_dir[1] != 0:
+                                t = (-side_dist - led.position[1]) / world_dir[1]
+                                if t > 0:
+                                    wall_intersections.append(t)
+                            # Right wall
+                            if world_dir[1] != 0:
+                                t = (side_dist - led.position[1]) / world_dir[1]
+                                if t > 0:
+                                    wall_intersections.append(t)
+                            # Top wall
+                            if world_dir[2] != 0:
+                                t = (top_bottom_dist - led.position[2]) / world_dir[2]
+                                if t > 0:
+                                    wall_intersections.append(t)
+                            # Bottom wall
+                            if world_dir[2] != 0:
+                                t = (-top_bottom_dist - led.position[2]) / world_dir[2]
+                                if t > 0:
+                                    wall_intersections.append(t)
+                            
+                            if wall_intersections:
+                                t_wall = min(wall_intersections)
+                        else:
+                            # Single front wall only
+                            if world_dir[0] != 0:
+                                t_wall = (wall_dist - led.position[0]) / world_dir[0]
 
                         t_clip = None
                         if t_abs_min is not None and t_abs_min > 0:
@@ -1850,7 +2311,12 @@ def main():
 
         # Draw camera FOV rectangle on wall
         if show_camera_fov.value:
-            wall_dist = wall_dist_slider.value
+            # Use correct wall distance based on mode
+            if room_mode_enable.value:
+                wall_dist = room_front_dist.value
+            else:
+                wall_dist = wall_dist_slider.value
+            
             cam_x = camera_pos_x.value
             fov_h_deg = camera_fov_h.value
             fov_v_deg = camera_fov_v.value
@@ -1948,13 +2414,24 @@ def main():
             )
 
     # Register callbacks
-    front_angle_slider.on_update(lambda _: update_scene())
-    side_angle_slider.on_update(lambda _: update_scene())
     viewing_angle_slider.on_update(lambda _: update_scene())
     rot_front_pos.on_update(lambda _: update_scene())
     rot_front_neg.on_update(lambda _: update_scene())
     rot_side_pos.on_update(lambda _: update_scene())
     rot_side_neg.on_update(lambda _: update_scene())
+    # Group position offset callbacks
+    offset_front_pos_x.on_update(lambda _: update_scene())
+    offset_front_pos_y.on_update(lambda _: update_scene())
+    offset_front_pos_z.on_update(lambda _: update_scene())
+    offset_front_neg_x.on_update(lambda _: update_scene())
+    offset_front_neg_y.on_update(lambda _: update_scene())
+    offset_front_neg_z.on_update(lambda _: update_scene())
+    offset_side_pos_x.on_update(lambda _: update_scene())
+    offset_side_pos_y.on_update(lambda _: update_scene())
+    offset_side_pos_z.on_update(lambda _: update_scene())
+    offset_side_neg_x.on_update(lambda _: update_scene())
+    offset_side_neg_y.on_update(lambda _: update_scene())
+    offset_side_neg_z.on_update(lambda _: update_scene())
     radius_slider.on_update(lambda _: update_scene())
     circle_center_slider.on_update(lambda _: update_scene())
     ray_length_slider.on_update(lambda _: update_scene())
@@ -1978,7 +2455,7 @@ def main():
     abs1_off_x.on_update(lambda _: update_scene())
     abs1_off_y.on_update(lambda _: update_scene())
     abs1_off_z.on_update(lambda _: update_scene())
-    intensity_rays_slider.on_update(lambda _: None)  # No auto-update for expensive params
+    intensity_rays_slider.on_update(lambda _: update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else None)
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_grid_size.on_update(lambda _: None)  # No auto-update for expensive params
     
@@ -2018,7 +2495,7 @@ def main():
     
     room_mode_enable.on_update(on_room_mode_toggle)
     show_room_walls.on_update(lambda _: draw_room_walls())
-    show_room_intensity.on_update(lambda _: update_room_intensity_map() if room_mode_enable.value else None)
+    show_room_intensity.on_update(lambda _: (update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else draw_room_walls()) if room_mode_enable.value else None)
     room_front_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     room_side_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     room_top_bottom_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
@@ -2077,8 +2554,6 @@ def main():
 
     # Capture default values so reset restores them
     defaults = {
-        "front_angle": front_angle_slider.value,
-        "side_angle": side_angle_slider.value,
         "viewing_angle": viewing_angle_slider.value,
         "rot_front_pos": rot_front_pos.value,
         "rot_front_neg": rot_front_neg.value,
@@ -2119,8 +2594,6 @@ def main():
             try:
                 if getattr(reset_button, "value", False):
                     # Restore default slider values
-                    front_angle_slider.value = defaults["front_angle"]
-                    side_angle_slider.value = defaults["side_angle"]
                     viewing_angle_slider.value = defaults["viewing_angle"]
                     rot_front_pos.value = defaults["rot_front_pos"]
                     rot_front_neg.value = defaults["rot_front_neg"]
