@@ -2170,7 +2170,7 @@ def main():
             base_abs_cz = 0.0
 
             # Apply user offsets (sliders) if available
-            if 'absorbers_enable' in globals() and not absorbers_enable.value:
+            if not absorbers_enable.value:
                 continue
             if i == 0:
                 abs_cx = base_abs_cx + abs0_off_x.value
