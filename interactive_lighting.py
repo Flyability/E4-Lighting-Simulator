@@ -207,9 +207,31 @@ def create_leds(
 
 # Helper functions for multiprocessing (must be at module level for pickle serialization)
 def _ray_box_intersection(pos, direction, box):
-    """Check ray-box intersection for absorbers."""
+    """Check ray-box intersection for absorbers (supports rotation via quaternion)."""
     center = np.array(box['center'], dtype=float)
     half = np.array(box['half_sizes'], dtype=float)
+    rotation = box.get('rotation', None)
+    
+    # If box has rotation, transform ray to box's local space
+    if rotation is not None:
+        qw, qx, qy, qz = rotation
+        # Convert quaternion to rotation matrix
+        # Rotation matrix from quaternion (w, x, y, z)
+        R = np.array([
+            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
+            [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
+            [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
+        ])
+        # Transform ray to local space (inverse rotation)
+        R_inv = R.T  # Orthogonal matrix, inverse = transpose
+        local_pos = R_inv @ (pos - center)
+        local_dir = R_inv @ direction
+        # Now test in local axis-aligned box space
+        pos = local_pos
+        direction = local_dir
+        center = np.array([0.0, 0.0, 0.0])  # Center is at origin in local space
+    
+    # Standard axis-aligned box intersection test
     tmin = -np.inf
     tmax = np.inf
     for k in range(3):
@@ -436,10 +458,10 @@ def main():
             "Viewing angle (°) [GWP9LR35: 120°]", min=10, max=130, step=5, initial_value=120
         )
         # Per-group rotation sliders (rotate beam and visual together)
-        rot_front_pos = server.gui.add_slider("Rotate front+ (°)", min=-180, max=180, step=1, initial_value=0)
-        rot_front_neg = server.gui.add_slider("Rotate front- (°)", min=-180, max=180, step=1, initial_value=0)
-        rot_side_pos = server.gui.add_slider("Rotate side+ (°)", min=-180, max=180, step=1, initial_value=24)
-        rot_side_neg = server.gui.add_slider("Rotate side- (°)", min=-180, max=180, step=1, initial_value=-24)
+        rot_front_pos = server.gui.add_slider("Rotate front+ (°)", min=-180, max=180, step=1, initial_value=0.7)
+        rot_front_neg = server.gui.add_slider("Rotate front- (°)", min=-180, max=180, step=1, initial_value=-0.7)
+        rot_side_pos = server.gui.add_slider("Rotate side+ (°)", min=-180, max=180, step=1, initial_value=18)
+        rot_side_neg = server.gui.add_slider("Rotate side- (°)", min=-180, max=180, step=1, initial_value=-18)
         
         # Per-group translation sliders (move entire group along X, Y, Z axes)
         with server.gui.add_folder("Group Positions"):
@@ -576,6 +598,14 @@ def main():
         abs1_off_x = server.gui.add_slider("Abs1 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1)
         abs1_off_y = server.gui.add_slider("Abs1 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=-2.5)
         abs1_off_z = server.gui.add_slider("Abs1 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+        abs2_off_x = server.gui.add_slider("Abs2 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1.8)
+        abs2_off_y = server.gui.add_slider("Abs2 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=-10.5)
+        abs2_off_z = server.gui.add_slider("Abs2 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+        abs2_rot_z = server.gui.add_slider("Abs2 rotation Z (deg)", min=-180, max=180, step=1, initial_value=-14)
+        abs3_off_x = server.gui.add_slider("Abs3 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1.8)
+        abs3_off_y = server.gui.add_slider("Abs3 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=10.5)
+        abs3_off_z = server.gui.add_slider("Abs3 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+        abs3_rot_z = server.gui.add_slider("Abs3 rotation Z (deg)", min=-180, max=180, step=1, initial_value=14)
 
     # LED Control Matrix (individual LED and row control)
     group_names = ["Front+", "Front-", "Side+", "Side-"]
@@ -766,6 +796,25 @@ def main():
                 def ray_box_intersection(pos, direction, box):
                     center = np.array(box['center'], dtype=float)
                     half = np.array(box['half_sizes'], dtype=float)
+                    rotation = box.get('rotation', None)
+                    
+                    # If box has rotation, transform ray to box's local space
+                    if rotation is not None:
+                        qw, qx, qy, qz = rotation
+                        # Convert quaternion to rotation matrix
+                        R = np.array([
+                            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
+                            [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
+                            [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
+                        ])
+                        # Transform ray to local space (inverse rotation)
+                        R_inv = R.T
+                        local_pos = R_inv @ (pos - center)
+                        local_dir = R_inv @ direction
+                        pos = local_pos
+                        direction = local_dir
+                        center = np.array([0.0, 0.0, 0.0])
+                    
                     tmin = -np.inf
                     tmax = np.inf
                     for k in range(3):
@@ -1049,6 +1098,46 @@ def main():
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
             })
         
+        # Add abs2 and abs3 at origin with offsets (if absorbers enabled)
+        if absorbers_enable.value:
+            # Abs2 with rotation
+            abs_cx = 0.0 + abs2_off_x.value
+            abs_cy = 0.0 + abs2_off_y.value
+            abs_cz = 0.0 + abs2_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs2_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
+            })
+            
+            # Abs3 with rotation
+            abs_cx = 0.0 + abs3_off_x.value
+            abs_cy = 0.0 + abs3_off_y.value
+            abs_cz = 0.0 + abs3_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs3_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
+            })
+        
         # Ray tracing for FOV region
         lumens_per_led = float(led_lumens_slider.value)
         rays_per_pixel = int(intensity_rays_slider.value)
@@ -1149,6 +1238,25 @@ def main():
                 def ray_box_intersection(pos, direction, box):
                     center = np.array(box['center'], dtype=float)
                     half = np.array(box['half_sizes'], dtype=float)
+                    rotation = box.get('rotation', None)
+                    
+                    # If box has rotation, transform ray to box's local space
+                    if rotation is not None:
+                        qw, qx, qy, qz = rotation
+                        # Convert quaternion to rotation matrix
+                        R = np.array([
+                            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
+                            [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
+                            [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
+                        ])
+                        # Transform ray to local space (inverse rotation)
+                        R_inv = R.T
+                        local_pos = R_inv @ (pos - center)
+                        local_dir = R_inv @ direction
+                        pos = local_pos
+                        direction = local_dir
+                        center = np.array([0.0, 0.0, 0.0])
+                    
                     tmin = -np.inf
                     tmax = np.inf
                     for k in range(3):
@@ -1407,6 +1515,47 @@ def main():
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': None,
+            })
+        
+        # Add abs2 and abs3 at origin with offsets
+        if absorbers_enable.value:
+            # Abs2 with rotation
+            abs_cx = 0.0 + abs2_off_x.value
+            abs_cy = 0.0 + abs2_off_y.value
+            abs_cz = 0.0 + abs2_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs2_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
+            })
+            
+            # Abs3 with rotation
+            abs_cx = 0.0 + abs3_off_x.value
+            abs_cy = 0.0 + abs3_off_y.value
+            abs_cz = 0.0 + abs3_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs3_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
             })
         
         # Compute intensity with rays_per_pixel from slider
@@ -1709,6 +1858,47 @@ def main():
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': None,
+            })
+        
+        # Add abs2 and abs3 at origin with offsets
+        if absorbers_enable.value:
+            # Abs2 with rotation
+            abs_cx = 0.0 + abs2_off_x.value
+            abs_cy = 0.0 + abs2_off_y.value
+            abs_cz = 0.0 + abs2_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs2_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
+            })
+            
+            # Abs3 with rotation
+            abs_cx = 0.0 + abs3_off_x.value
+            abs_cy = 0.0 + abs3_off_y.value
+            abs_cz = 0.0 + abs3_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs3_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
             })
         
         # Compute room intensity
@@ -1865,6 +2055,25 @@ def main():
         def ray_box_intersection(pos, direction, box):
             center = np.array(box['center'], dtype=float)
             half = np.array(box['half_sizes'], dtype=float)
+            rotation = box.get('rotation', None)
+            
+            # If box has rotation, transform ray to box's local space
+            if rotation is not None:
+                qw, qx, qy, qz = rotation
+                # Convert quaternion to rotation matrix
+                R = np.array([
+                    [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
+                    [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
+                    [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
+                ])
+                # Transform ray to local space (inverse rotation)
+                R_inv = R.T
+                local_pos = R_inv @ (pos - center)
+                local_dir = R_inv @ direction
+                pos = local_pos
+                direction = local_dir
+                center = np.array([0.0, 0.0, 0.0])
+            
             tmin = -np.inf
             tmax = np.inf
             for k in range(3):
@@ -1982,21 +2191,72 @@ def main():
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': None,
+            })
+        
+        # Add abs2 and abs3 at origin with offsets
+        if absorbers_enable.value:
+            # Abs2 with rotation
+            abs_cx = 0.0 + abs2_off_x.value
+            abs_cy = 0.0 + abs2_off_y.value
+            abs_cz = 0.0 + abs2_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs2_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
+            })
+            
+            # Abs3 with rotation
+            abs_cx = 0.0 + abs3_off_x.value
+            abs_cy = 0.0 + abs3_off_y.value
+            abs_cz = 0.0 + abs3_off_z.value
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
+            # Convert rotation angle to quaternion (rotation around Z axis)
+            angle_rad = np.radians(abs3_rot_z.value)
+            qw = np.cos(angle_rad / 2)
+            qx = 0.0
+            qy = 0.0
+            qz = np.sin(angle_rad / 2)
+            absorbers.append({
+                'center': (abs_cx, abs_cy, abs_cz),
+                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': (qw, qx, qy, qz),
             })
 
         # Draw absorber boxes (red) in the scene
         for idx, a in enumerate(absorbers):
             cx, cy, cz = a['center']
             hx, hy, hz = a['half_sizes']
+            rot = a.get('rotation', None)
             # Viser add_box dimensions are in meters (x,y,z)
             dims = ((hx * 2) / 100.0, (hy * 2) / 100.0, (hz * 2) / 100.0)
             pos_m = (cx / 100.0, cy / 100.0, cz / 100.0)
-            handle = server.scene.add_box(
-                f"/absorbers/abs_{idx}",
-                dimensions=dims,
-                color=(1.0, 0.0, 0.0),
-                position=pos_m,
-            )
+            if rot is not None:
+                handle = server.scene.add_box(
+                    f"/absorbers/abs_{idx}",
+                    dimensions=dims,
+                    color=(1.0, 0.0, 0.0),
+                    position=pos_m,
+                    wxyz=rot,
+                )
+            else:
+                handle = server.scene.add_box(
+                    f"/absorbers/abs_{idx}",
+                    dimensions=dims,
+                    color=(1.0, 0.0, 0.0),
+                    position=pos_m,
+                )
             absorber_handles.append(handle)
 
         # Draw LEDs as squares with center source (if enabled)
@@ -2455,6 +2715,14 @@ def main():
     abs1_off_x.on_update(lambda _: update_scene())
     abs1_off_y.on_update(lambda _: update_scene())
     abs1_off_z.on_update(lambda _: update_scene())
+    abs2_off_x.on_update(lambda _: update_scene())
+    abs2_off_y.on_update(lambda _: update_scene())
+    abs2_off_z.on_update(lambda _: update_scene())
+    abs2_rot_z.on_update(lambda _: update_scene())
+    abs3_off_x.on_update(lambda _: update_scene())
+    abs3_off_y.on_update(lambda _: update_scene())
+    abs3_off_z.on_update(lambda _: update_scene())
+    abs3_rot_z.on_update(lambda _: update_scene())
     intensity_rays_slider.on_update(lambda _: update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else None)
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_grid_size.on_update(lambda _: None)  # No auto-update for expensive params
