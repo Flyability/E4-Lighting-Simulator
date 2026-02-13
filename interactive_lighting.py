@@ -65,19 +65,28 @@ def create_leds(
     radius,
     circle_center_x,
     group_rotations=None,
+    group_rotations_y=None,
     row_enabled=None,
     led_states=None,
     group_offsets=None,
+    custom_groups_configs=None,
 ):
-    """Create 4 LED groups; each group contains 3 LEDs spaced by 3 mm."""
+    """Create 4 LED groups; each group contains 3 LEDs spaced by 3 mm.
+    Optionally add multiple custom groups at specified positions."""
     angles_deg = [front_angle_deg, -front_angle_deg, side_angle_deg, -side_angle_deg]
     colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.2, 1.0), (1.0, 1.0, 0.2)]
 
     if group_rotations is None:
         group_rotations = [0.0, 0.0, 0.0, 0.0]
     
+    if group_rotations_y is None:
+        group_rotations_y = [0.0, 0.0, 0.0, 0.0]
+    
     if group_offsets is None:
         group_offsets = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    
+    if custom_groups_configs is None:
+        custom_groups_configs = []
 
     leds = []
     led_index = 0  # Track global LED index
@@ -155,29 +164,65 @@ def create_leds(
                 radial_unit = np.array((1.0, 0.0, 0.0))
             else:
                 radial_unit = radial / np.linalg.norm(radial)
-            # Apply group azimuth rotation (rotate radial_unit around Z)
+            
+            # Calculate local tangent axis (Y local): perpendicular to radial in XY plane
+            # For radial = (rx, ry, 0), tangent = (-ry, rx, 0) normalized
+            tangent_axis = np.array([-radial_unit[1], radial_unit[0], 0.0])
+            
+            # First apply group rotation around LOCAL Y axis (tangent axis - tilts forward/backward)
+            rot_y_deg = float(group_rotations_y[i])
+            rot_y_rad = np.radians(rot_y_deg)
+            c = np.cos(rot_y_rad)
+            s = np.sin(rot_y_rad)
+            t = 1.0 - c
+            # Rodrigues rotation matrix around tangent_axis
+            ux, uy, uz = tangent_axis[0], tangent_axis[1], tangent_axis[2]
+            rot_y_matrix = np.array([
+                [t*ux*ux + c,    t*ux*uy - s*uz, t*ux*uz + s*uy],
+                [t*ux*uy + s*uz, t*uy*uy + c,    t*uy*uz - s*ux],
+                [t*ux*uz - s*uy, t*uy*uz + s*ux, t*uz*uz + c   ]
+            ])
+            
+            # Apply rotation to directions and positions (entire block rotates together)
+            rotated_radial = rot_y_matrix @ radial_unit
+            rotated_row_dir = rot_y_matrix @ x_axis
+            # Rotate row_center position around group center
+            row_center_rel = row_center - np.array([x, y, z])
+            row_center_rotated = rot_y_matrix @ row_center_rel
+            row_center = np.array([x, y, z]) + row_center_rotated
+            
+            # Then apply group azimuth rotation Z (rotate around Z axis - blue axis)
             rot_deg = float(group_rotations[i])
             rot_rad = np.radians(rot_deg)
             ca_r, sa_r = np.cos(rot_rad), np.sin(rot_rad)
             rotated_radial = np.array([
-                ca_r * radial_unit[0] - sa_r * radial_unit[1],
-                sa_r * radial_unit[0] + ca_r * radial_unit[1],
-                0.0,
+                ca_r * rotated_radial[0] - sa_r * rotated_radial[1],
+                sa_r * rotated_radial[0] + ca_r * rotated_radial[1],
+                rotated_radial[2],
             ])
-            # Apply same rotation to row direction (for consistent square orientation)
+            # Apply rotation Z to row direction
             rotated_row_dir = np.array([
-                ca_r * x_axis[0] - sa_r * x_axis[1],
-                sa_r * x_axis[0] + ca_r * x_axis[1],
-                x_axis[2],
+                ca_r * rotated_row_dir[0] - sa_r * rotated_row_dir[1],
+                sa_r * rotated_row_dir[0] + ca_r * rotated_row_dir[1],
+                rotated_row_dir[2],
             ])
-            # Tilt around axis perpendicular to radial in the plane: tilt toward Z by alpha
+            
+            # Tilt around axis perpendicular to radial: apply to rotated Z axis so rows follow group rotation
             z_unit = np.array((0.0, 0.0, 1.0))
-            rotated_dir = np.cos(alpha) * rotated_radial + (-np.sin(alpha)) * z_unit
+            # Apply Y local rotation to Z axis as well
+            rotated_z = rot_y_matrix @ z_unit
+            # Apply Z rotation to rotated Z axis
+            rotated_z = np.array([
+                ca_r * rotated_z[0] - sa_r * rotated_z[1],
+                sa_r * rotated_z[0] + ca_r * rotated_z[1],
+                rotated_z[2],
+            ])
+            rotated_dir = np.cos(alpha) * rotated_radial + (-np.sin(alpha)) * rotated_z
             rotated_dir = rotated_dir / np.linalg.norm(rotated_dir)
 
-            # If row 1 or 4 (indices 0 or 3), move row center 0.5 cm back toward circle center
+            # If row 1 or 4 (indices 0 or 3), move row center 0.5 cm back along rotated radial direction
             if row_idx in (0, 3):
-                row_center = row_center - radial_unit * 0.5
+                row_center = row_center - rotated_radial * 0.5
 
             # Three LEDs along the row (spaced along green/Y axis direction: rotated_row_dir)
             for led_in_row, off in enumerate([-led_spacing_cm, 0.0, led_spacing_cm]):
@@ -199,6 +244,132 @@ def create_leds(
                 led.enabled = is_row_enabled and is_led_enabled
                 led.led_index = led_index  # Store the global index
                 led.row_direction = rotated_row_dir.copy()  # Store rotated row direction for consistent square orientation
+                leds.append(led)
+                led_index += 1
+
+    # Add custom groups if any are enabled
+    for custom_group_config in custom_groups_configs:
+        if not custom_group_config.get('enabled', False):
+            continue
+            
+        custom_pos = custom_group_config.get('position', (0.0, 0.0, 0.0))
+        custom_rot_y_deg = custom_group_config.get('rotation_y', 0.0)
+        custom_rot_z_deg = custom_group_config.get('rotation_z', 0.0)
+        custom_led_states_array = custom_group_config.get('led_states', [True] * 12)
+        custom_row_enabled = custom_group_config.get('row_enabled', [True] * 4)
+        
+        # Custom group positioned at specified location with Front+ characteristics (angle 0°)
+        x, y, z = custom_pos
+        
+        # Direction: radially outward from (0, 0, 0) for angle 0° (Front+ style)
+        dir_x = 1.0  # Points along +X axis (like Front+)
+        dir_y = 0.0
+        dir_z = 0.0
+
+        # Build local in-plane axes
+        z_axis = np.array((dir_x, dir_y, dir_z), dtype=float)
+        z_axis = z_axis / np.linalg.norm(z_axis)
+
+        if abs(z_axis[2]) < 0.9:
+            x_axis = np.cross(z_axis, [0, 0, 1])
+        else:
+            x_axis = np.cross(z_axis, [0, 1, 0])
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+
+        # LED spacing parameters
+        led_spacing_cm = 0.8
+        row_spacing_cm = 1.1
+        inclinations = [90, 30, -30, -90]
+        row_offsets = [-0.85, -0.55, 0.55, 0.85]
+
+        custom_color = (1.0, 0.0, 1.0)  # Magenta for custom group
+
+        for row_idx, alpha_deg in enumerate(inclinations):
+            alpha = np.radians(alpha_deg)
+            center_off = row_offsets[row_idx]
+            row_center = np.array((x, y, z)) + np.array([0, 0, 1]) * center_off
+
+            # Compute rotated LED direction for this row
+            radial_unit = np.array([1.0, 0.0, 0.0])  # Points along +X
+            
+            # Calculate local tangent axis (Y local): perpendicular to radial in XY plane
+            # For radial = (1, 0, 0), tangent = (0, 1, 0)
+            tangent_axis = np.array([-radial_unit[1], radial_unit[0], 0.0])
+            
+            # Apply custom group rotation around LOCAL Y axis (tangent axis - tilts forward/backward)
+            rot_y_rad = np.radians(custom_rot_y_deg)
+            c = np.cos(rot_y_rad)
+            s = np.sin(rot_y_rad)
+            t = 1.0 - c
+            # Rodrigues rotation matrix around tangent_axis
+            ux, uy, uz = tangent_axis[0], tangent_axis[1], tangent_axis[2]
+            rot_y_matrix = np.array([
+                [t*ux*ux + c,    t*ux*uy - s*uz, t*ux*uz + s*uy],
+                [t*ux*uy + s*uz, t*uy*uy + c,    t*uy*uz - s*ux],
+                [t*ux*uz - s*uy, t*uy*uz + s*ux, t*uz*uz + c   ]
+            ])
+            
+            # Apply rotation to directions and positions (entire block rotates together)
+            rotated_radial = rot_y_matrix @ radial_unit
+            rotated_x_axis = rot_y_matrix @ x_axis
+            # Rotate row_center position around group center
+            row_center_rel = row_center - np.array([x, y, z])
+            row_center_rotated = rot_y_matrix @ row_center_rel
+            row_center = np.array([x, y, z]) + row_center_rotated
+            
+            # Then apply custom group rotation Z (rotate around Z axis - blue axis)
+            rot_z_rad = np.radians(custom_rot_z_deg)
+            cz, sz = np.cos(rot_z_rad), np.sin(rot_z_rad)
+            # Rotation matrix Z applied to already Y-rotated radial
+            rotated_radial = np.array([
+                cz * rotated_radial[0] - sz * rotated_radial[1],
+                sz * rotated_radial[0] + cz * rotated_radial[1],
+                rotated_radial[2],
+            ])
+            # Apply rotation Z to row direction
+            rotated_row_dir = np.array([
+                cz * rotated_x_axis[0] - sz * rotated_x_axis[1],
+                sz * rotated_x_axis[0] + cz * rotated_x_axis[1],
+                rotated_x_axis[2],
+            ])
+            
+            # Tilt around axis perpendicular to radial: apply to rotated Z axis so rows follow group rotation
+            z_unit = np.array((0.0, 0.0, 1.0))
+            # Apply Y local rotation to Z axis as well
+            rotated_z = rot_y_matrix @ z_unit
+            # Apply Z rotation to rotated Z axis
+            rotated_z = np.array([
+                cz * rotated_z[0] - sz * rotated_z[1],
+                sz * rotated_z[0] + cz * rotated_z[1],
+                rotated_z[2],
+            ])
+            rotated_dir = np.cos(alpha) * rotated_radial + (-np.sin(alpha)) * rotated_z
+            rotated_dir = rotated_dir / np.linalg.norm(rotated_dir)
+
+            # If row 1 or 4, move row center 0.5 cm back
+            if row_idx in (0, 3):
+                row_center = row_center - rotated_radial * 0.5
+
+            # Three LEDs along the row
+            for led_in_row, off in enumerate([-led_spacing_cm, 0.0, led_spacing_cm]):
+                pos = tuple(row_center + rotated_row_dir * off)
+                
+                custom_led_idx = row_idx * 3 + led_in_row
+                is_row_enabled = custom_row_enabled[row_idx]
+                is_led_enabled = custom_led_states_array[custom_led_idx]
+                
+                led = LED(
+                    width=1.0,
+                    viewing_angle=viewing_angle,
+                    position=pos,
+                    direction=tuple(rotated_dir),
+                    color=custom_color,
+                )
+                led.enabled = is_row_enabled and is_led_enabled
+                led.led_index = led_index
+                led.row_direction = rotated_row_dir.copy()
+                led.is_custom = True  # Mark as custom group LED
                 leds.append(led)
                 led_index += 1
 
@@ -447,6 +618,10 @@ def main():
     # LED state array: 4 groups × 4 rows × 3 LEDs = 48 LEDs total
     led_states = [True] * 48  # All LEDs initially on
     
+    # Custom groups - list of dictionaries, each containing group configuration
+    custom_groups = []  # Each group: {id, enable, pos_x, pos_y, pos_z, rot, led_states, buttons, folder}
+    next_custom_group_id = [0]  # Counter for unique IDs (use list to allow modification in nested functions)
+    
     # Store button handles for LED control
     led_buttons = {}
     row_buttons = {}
@@ -457,11 +632,17 @@ def main():
         viewing_angle_slider = server.gui.add_slider(
             "Viewing angle (°) [GWP9LR35: 120°]", min=10, max=130, step=5, initial_value=120
         )
-        # Per-group rotation sliders (rotate beam and visual together)
-        rot_front_pos = server.gui.add_slider("Rotate front+ (°)", min=-180, max=180, step=1, initial_value=0.7)
-        rot_front_neg = server.gui.add_slider("Rotate front- (°)", min=-180, max=180, step=1, initial_value=-0.7)
-        rot_side_pos = server.gui.add_slider("Rotate side+ (°)", min=-180, max=180, step=1, initial_value=18)
-        rot_side_neg = server.gui.add_slider("Rotate side- (°)", min=-180, max=180, step=1, initial_value=-18)
+        # Per-group rotation sliders Z axis (rotate beam and visual together)
+        rot_front_pos = server.gui.add_slider("Rotate front+ Z (°)", min=-180, max=180, step=1, initial_value=0.7)
+        rot_front_neg = server.gui.add_slider("Rotate front- Z (°)", min=-180, max=180, step=1, initial_value=-0.7)
+        rot_side_pos = server.gui.add_slider("Rotate side+ Z (°)", min=-180, max=180, step=1, initial_value=18)
+        rot_side_neg = server.gui.add_slider("Rotate side- Z (°)", min=-180, max=180, step=1, initial_value=-18)
+        
+        # Per-group rotation sliders Y axis (local tangent axis - tilts forward/backward)
+        rot_y_front_pos = server.gui.add_slider("Rotate front+ local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
+        rot_y_front_neg = server.gui.add_slider("Rotate front- local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
+        rot_y_side_pos = server.gui.add_slider("Rotate side+ local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
+        rot_y_side_neg = server.gui.add_slider("Rotate side- local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
         
         # Per-group translation sliders (move entire group along X, Y, Z axes)
         with server.gui.add_folder("Group Positions"):
@@ -514,7 +695,7 @@ def main():
             "Show intensity on wall", initial_value=False
         )
         intensity_rays_slider = server.gui.add_slider(
-            "Rays per pixel (↑quality, ↓speed)", min=10, max=500, step=5, initial_value=50
+            "Rays per pixel (↑quality, ↓speed)", min=10, max=5000,step=5, initial_value=50
         )
         ray_uniformity_slider = server.gui.add_slider(
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
@@ -607,6 +788,127 @@ def main():
         abs3_off_z = server.gui.add_slider("Abs3 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
         abs3_rot_z = server.gui.add_slider("Abs3 rotation Z (deg)", min=-180, max=180, step=1, initial_value=14)
 
+    # Custom LED Groups folder (dynamic groups)
+    custom_groups_folder = server.gui.add_folder("Custom LED Groups")
+    
+    def create_custom_group():
+        """Create a new custom LED group with all controls."""
+        group_id = next_custom_group_id[0]
+        next_custom_group_id[0] += 1
+        
+        # Create LED state array for this group
+        led_states = [True] * 12
+        
+        # Create group folder with controls
+        with custom_groups_folder:
+            group_folder = server.gui.add_folder(f"Custom Group {group_id}")
+        
+        with group_folder:
+            enable_chk = server.gui.add_checkbox("Enable", initial_value=True)
+            pos_x = server.gui.add_slider("Position X (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
+            pos_y = server.gui.add_slider("Position Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            pos_z = server.gui.add_slider("Position Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            rot_y = server.gui.add_slider("Rotation local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
+            rot_z = server.gui.add_slider("Rotation Z - Blue axis (°)", min=-180, max=180, step=1, initial_value=0)
+            remove_btn = server.gui.add_button("Remove Group", color="red")
+            
+            server.gui.add_html("<hr style='margin:4px 0;'><b>LED Controls:</b>")
+            
+            # Group ALL button
+            all_btn = server.gui.add_button("ALL LEDs", color="#FF00FF")
+            
+            server.gui.add_html("<hr style='margin:4px 0;'>")
+            
+            # Row and LED buttons
+            row_buttons = {}
+            led_buttons = {}
+            
+            for row_idx in range(4):
+                html_content = f"""
+                <div style='margin:6px 0 2px 0;'>
+                    <span style='font-weight:600;font-size:11px;'>Row {row_idx + 1}:</span>
+                </div>
+                """
+                server.gui.add_html(html_content)
+                
+                row_btn = server.gui.add_button(f"Row {row_idx + 1}", color="#666666")
+                row_buttons[row_idx] = row_btn
+                
+                for led_in_row_idx in range(3):
+                    led_idx = row_idx * 3 + led_in_row_idx
+                    led_btn = server.gui.add_button(f"L{led_in_row_idx+1}", color="#FF00FF")
+                    led_buttons[led_idx] = led_btn
+        
+        # Store group data
+        group_data = {
+            'id': group_id,
+            'folder': group_folder,
+            'enable': enable_chk,
+            'pos_x': pos_x,
+            'pos_y': pos_y,
+            'pos_z': pos_z,
+            'rot_y': rot_y,
+            'rot_z': rot_z,
+            'remove_btn': remove_btn,
+            'led_states': led_states,
+            'all_btn': all_btn,
+            'row_buttons': row_buttons,
+            'led_buttons': led_buttons,
+        }
+        
+        # Setup callbacks for this group
+        def on_all_click(_):
+            all_on = all(led_states)
+            new_state = not all_on
+            for i in range(12):
+                led_states[i] = new_state
+            update_scene()
+        
+        def make_row_handler(r_idx):
+            def handler(_):
+                start = r_idx * 3
+                all_on = all(led_states[start:start+3])
+                new_state = not all_on
+                for i in range(start, start + 3):
+                    led_states[i] = new_state
+                update_scene()
+            return handler
+        
+        def make_led_handler(l_idx):
+            def handler(_):
+                led_states[l_idx] = not led_states[l_idx]
+                update_scene()
+            return handler
+        
+        def on_remove(_):
+            """Remove this group."""
+            custom_groups.remove(group_data)
+            group_folder.remove()
+            update_scene()
+        
+        all_btn.on_click(on_all_click)
+        for r_idx in range(4):
+            row_buttons[r_idx].on_click(make_row_handler(r_idx))
+        for l_idx in range(12):
+            led_buttons[l_idx].on_click(make_led_handler(l_idx))
+        remove_btn.on_click(on_remove)
+        
+        # Register slider callbacks
+        enable_chk.on_update(lambda _: update_scene())
+        pos_x.on_update(lambda _: update_scene())
+        pos_y.on_update(lambda _: update_scene())
+        pos_z.on_update(lambda _: update_scene())
+        rot_y.on_update(lambda _: update_scene())
+        rot_z.on_update(lambda _: update_scene())
+        
+        custom_groups.append(group_data)
+        update_scene()
+        
+        return group_data
+    
+    with custom_groups_folder:
+        add_custom_group_btn = server.gui.add_button("➕ Add Custom Group", color="green")
+
     # LED Control Matrix (individual LED and row control)
     group_names = ["Front+", "Front-", "Side+", "Side-"]
     group_colors_hex = ["#FF3333", "#33FF33", "#3333FF", "#FFFF33"]
@@ -638,7 +940,6 @@ def main():
                 for led_in_row_idx in range(3):
                     led_global_idx = group_idx * 12 + row_idx * 3 + led_in_row_idx
                     led_btn = server.gui.add_button(f"L{led_in_row_idx+1}", color=color_hex)
-                    led_buttons[led_global_idx] = led_btn
                     led_buttons[led_global_idx] = led_btn
 
 
@@ -1049,12 +1350,32 @@ def main():
             rot_side_neg.value,
         ]
         
+        rotations_y = [
+            rot_y_front_pos.value,
+            rot_y_front_neg.value,
+            rot_y_side_pos.value,
+            rot_y_side_neg.value,
+        ]
+        
         offsets = [
             (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
             (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
             (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
             (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
         ]
+        
+        # Build custom groups configs list
+        custom_groups_configs = []
+        for group in custom_groups:
+            config = {
+                'enabled': group['enable'].value,
+                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
+                'rotation_y': group['rot_y'].value,
+                'rotation_z': group['rot_z'].value,
+                'led_states': group['led_states'],
+                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
+            }
+            custom_groups_configs.append(config)
         
         leds = create_leds(
             front_angle,
@@ -1063,9 +1384,11 @@ def main():
             radius,
             circle_center_x,
             group_rotations=rotations,
+            group_rotations_y=rotations_y,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
             group_offsets=offsets,
+            custom_groups_configs=custom_groups_configs,
         )
         
         # Build absorbers
@@ -1086,16 +1409,30 @@ def main():
             else:
                 radial_unit = radial / np.linalg.norm(radial)
             
-            abs_cx = gx - radial_unit[0] * 1.0
-            abs_cy = gy - radial_unit[1] * 1.0
-            abs_cz = 0.0
-            half_length_x = 0.35
-            half_width_y = 1.0
-            half_thickness_z = 1.5
+            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
+            y_base_offset = -4.2 if i == 0 else 4.2
+            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
+            base_abs_cz = 0.0
+            
+            if not absorbers_enable.value:
+                continue
+            if i == 0:
+                abs_cx = base_abs_cx + abs0_off_x.value
+                abs_cy = base_abs_cy + abs0_off_y.value
+                abs_cz = base_abs_cz + abs0_off_z.value
+            else:
+                abs_cx = base_abs_cx + abs1_off_x.value
+                abs_cy = base_abs_cy + abs1_off_y.value
+                abs_cz = base_abs_cz + abs1_off_z.value
+            
+            half_length_x = 5.0 / 2.0
+            half_width_y = 1.5 / 2.0
+            half_thickness_z = 3.0 / 2.0
             
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
+                'rotation': None,
             })
         
         # Add abs2 and abs3 at origin with offsets (if absorbers enabled)
@@ -1455,12 +1792,32 @@ def main():
             rot_side_neg.value,
         ]
         
+        rotations_y = [
+            rot_y_front_pos.value,
+            rot_y_front_neg.value,
+            rot_y_side_pos.value,
+            rot_y_side_neg.value,
+        ]
+        
         offsets = [
             (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
             (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
             (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
             (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
         ]
+        
+        # Build custom groups configs list
+        custom_groups_configs = []
+        for group in custom_groups:
+            config = {
+                'enabled': group['enable'].value,
+                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
+                'rotation_y': group['rot_y'].value,
+                'rotation_z': group['rot_z'].value,
+                'led_states': group['led_states'],
+                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
+            }
+            custom_groups_configs.append(config)
         
         leds = create_leds(
             front_angle,
@@ -1469,9 +1826,11 @@ def main():
             radius,
             circle_center_x,
             group_rotations=rotations,
+            group_rotations_y=rotations_y,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
             group_offsets=offsets,
+            custom_groups_configs=custom_groups_configs,
         )
         
         # Build absorbers
@@ -1798,12 +2157,32 @@ def main():
             rot_side_neg.value,
         ]
         
+        rotations_y = [
+            rot_y_front_pos.value,
+            rot_y_front_neg.value,
+            rot_y_side_pos.value,
+            rot_y_side_neg.value,
+        ]
+        
         offsets = [
             (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
             (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
             (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
             (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
         ]
+        
+        # Build custom groups configs list
+        custom_groups_configs = []
+        for group in custom_groups:
+            config = {
+                'enabled': group['enable'].value,
+                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
+                'rotation_y': group['rot_y'].value,
+                'rotation_z': group['rot_z'].value,
+                'led_states': group['led_states'],
+                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
+            }
+            custom_groups_configs.append(config)
         
         leds = create_leds(
             front_angle,
@@ -1812,9 +2191,11 @@ def main():
             radius,
             circle_center_x,
             group_rotations=rotations,
+            group_rotations_y=rotations_y,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
             group_offsets=offsets,
+            custom_groups_configs=custom_groups_configs,
         )
         
         # Build absorbers
@@ -2122,6 +2503,13 @@ def main():
             rot_side_neg.value,
         ]
         
+        rotations_y = [
+            rot_y_front_pos.value,
+            rot_y_front_neg.value,
+            rot_y_side_pos.value,
+            rot_y_side_neg.value,
+        ]
+        
         offsets = [
             (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
             (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
@@ -2129,6 +2517,19 @@ def main():
             (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
         ]
 
+        # Build custom groups configs list
+        custom_groups_configs = []
+        for group in custom_groups:
+            config = {
+                'enabled': group['enable'].value,
+                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
+                'rotation_y': group['rot_y'].value,
+                'rotation_z': group['rot_z'].value,
+                'led_states': group['led_states'],
+                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
+            }
+            custom_groups_configs.append(config)
+        
         leds = create_leds(
             front_angle,
             side_angle,
@@ -2136,14 +2537,15 @@ def main():
             radius,
             circle_center_x,
             group_rotations=rotations,
+            group_rotations_y=rotations_y,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             led_states=led_states,
             group_offsets=offsets,
+            custom_groups_configs=custom_groups_configs,
         )
-
-        # Build absorbers for front groups (one per front group)
+        
+        # Build absorbers
         absorbers = []
-        # angles matching create_leds
         angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
         for i, angle_deg in enumerate(angles_deg):
             if i not in (0, 1):
@@ -2151,25 +2553,20 @@ def main():
             angle_rad = np.radians(angle_deg)
             gx = circle_center_x + radius * np.cos(angle_rad)
             gy = radius * np.sin(angle_rad)
-            # Y offset same logic used earlier (front groups ±6.5 cm)
             y_offset = 6.5 if i == 0 else -6.5
             gy = gy + y_offset
-
-            # Radial unit (from circle center to LED position), used to shift toward center
+            
             radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
             if np.linalg.norm(radial) == 0:
                 radial_unit = np.array((1.0, 0.0, 0.0))
             else:
                 radial_unit = radial / np.linalg.norm(radial)
-
-            # Center of absorber base position: 5.0 cm toward the wall from LED position
-            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0  # -5 cm offset along X
-            # Y offset: -4.2 cm for left/front+ (i==0), +4.2 cm for right/front- (i==1)
+            
+            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
             y_base_offset = -4.2 if i == 0 else 4.2
             base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
             base_abs_cz = 0.0
-
-            # Apply user offsets (sliders) if available
+            
             if not absorbers_enable.value:
                 continue
             if i == 0:
@@ -2180,14 +2577,11 @@ def main():
                 abs_cx = base_abs_cx + abs1_off_x.value
                 abs_cy = base_abs_cy + abs1_off_y.value
                 abs_cz = base_abs_cz + abs1_off_z.value
-
-            # Absorber half-sizes in cm: length along X = 5.0 cm, width along Y = 1.5 cm,
-            # small thickness along Z (we use 0.05 cm)
-            half_length_x =5.0 / 2.0
+            
+            half_length_x = 5.0 / 2.0
             half_width_y = 1.5 / 2.0
             half_thickness_z = 3.0 / 2.0
-
-            # Here we set box half_sizes as (hx, hy, hz) corresponding to (X, Y, Z)
+            
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
@@ -2673,12 +3067,19 @@ def main():
                 position=(wall_dist / 100.0, 0.0, 0.0),
             )
 
+    # Register handler for adding custom groups
+    add_custom_group_btn.on_click(lambda _: create_custom_group())
+
     # Register callbacks
     viewing_angle_slider.on_update(lambda _: update_scene())
     rot_front_pos.on_update(lambda _: update_scene())
     rot_front_neg.on_update(lambda _: update_scene())
     rot_side_pos.on_update(lambda _: update_scene())
     rot_side_neg.on_update(lambda _: update_scene())
+    rot_y_front_pos.on_update(lambda _: update_scene())
+    rot_y_front_neg.on_update(lambda _: update_scene())
+    rot_y_side_pos.on_update(lambda _: update_scene())
+    rot_y_side_neg.on_update(lambda _: update_scene())
     # Group position offset callbacks
     offset_front_pos_x.on_update(lambda _: update_scene())
     offset_front_pos_y.on_update(lambda _: update_scene())
