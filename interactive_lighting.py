@@ -23,7 +23,7 @@ class LED:
         color=(1.0, 0.0, 0.0),
     ):
         self.width = width
-        self.viewing_angle = viewing_angle  # half-angle in degrees
+        self.viewing_angle = viewing_angle  # total cone angle in degrees (e.g., 120°)
         self.position = np.array(position)
         self.direction = np.array(direction) / np.linalg.norm(direction)
         self.color = color
@@ -44,8 +44,8 @@ class LED:
         # Chief ray
         rays.append((self.position.copy(), self.direction.copy()))
 
-        # Marginal rays at viewing angle edges
-        theta = np.radians(self.viewing_angle)
+        # Marginal rays at viewing angle edges (half-angle from center)
+        theta = np.radians(self.viewing_angle / 2.0)  # Convert total angle to half-angle
         s, c = np.sin(theta), np.cos(theta)
 
         for local_dir in [(s, 0, c), (-s, 0, c), (0, s, c), (0, -s, c)]:
@@ -435,6 +435,101 @@ def _calculate_lambertian_exponent(viewing_angle, ray_uniformity):
     n = np.clip(n, 0.1, 30.0)
     return n
 
+def _process_led_wall_worker(args):
+    """Worker function for single wall ray tracing (multiprocessing)."""
+    led, params = args
+    
+    # Unpack parameters
+    wall_dist = params['wall_dist']
+    rays_per_led = params['rays_per_led']
+    grid_size = params['grid_size']
+    wall_size = params['wall_size']
+    lumens_per_led = params['lumens_per_led']
+    absorbers = params['absorbers']
+    ray_uniformity = params['ray_uniformity']
+    led_idx = params['led_idx']
+    
+    # Initialize local grid (stores lux = lm/m²)
+    local_grid = np.zeros((grid_size, grid_size))
+    cell_size = wall_size / grid_size  # cm
+    cell_area_cm2 = cell_size * cell_size
+    cell_area_m2 = cell_area_cm2 / 10000.0  # Convert cm² to m²
+    half_size = wall_size / 2
+    
+    # Set seed for reproducibility
+    np.random.seed((42 + led_idx) % (2**32))
+    
+    # Build local coordinate system
+    z_axis = led.direction
+    if abs(z_axis[2]) < 0.9:
+        x_axis = np.cross(z_axis, [0, 0, 1])
+    else:
+        x_axis = np.cross(z_axis, [0, 1, 0])
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    
+    # Calculate emission parameters
+    max_theta = np.radians(led.viewing_angle / 2.0)
+    n = _calculate_lambertian_exponent(led.viewing_angle, ray_uniformity)
+    norm_factor = n + 1.0
+    
+    # Trace rays
+    for _ in range(rays_per_led):
+        # Sample direction
+        u1, u2 = np.random.uniform(0, 1, 2)
+        cos_max = np.cos(max_theta)
+        cos_theta = 1.0 - u1 * (1.0 - cos_max)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        theta = np.arccos(cos_theta)
+        phi = 2 * np.pi * u2
+        
+        local_dir = np.array([
+            np.sin(theta) * np.cos(phi),
+            np.sin(theta) * np.sin(phi),
+            np.cos(theta)
+        ])
+        
+        world_dir = (
+            local_dir[0] * x_axis +
+            local_dir[1] * y_axis +
+            local_dir[2] * z_axis
+        )
+        world_dir = world_dir / np.linalg.norm(world_dir)
+        
+        # Calculate lumens for this ray
+        cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+        intensity_coefficient = np.power(cos_theta_clamped, n)
+        lumens_per_ray = (lumens_per_led / rays_per_led) * intensity_coefficient * norm_factor
+        
+        # Check absorber intersection
+        hit_absorbed = False
+        if absorbers:
+            for a in absorbers:
+                t_hit = _ray_box_intersection(led.position, world_dir, a)
+                if t_hit is not None and t_hit > 0:
+                    hit_absorbed = True
+                    break
+        
+        if hit_absorbed:
+            continue
+        
+        # Check wall intersection
+        if world_dir[0] > 0:
+            t = (wall_dist - led.position[0]) / world_dir[0]
+            if t > 0:
+                hit_y = led.position[1] + world_dir[1] * t
+                hit_z = led.position[2] + world_dir[2] * t
+                
+                grid_y = int((hit_y + half_size) / cell_size)
+                grid_z = int((hit_z + half_size) / cell_size)
+                
+                if 0 <= grid_y < grid_size and 0 <= grid_z < grid_size:
+                    # Convert lumens to lux (lm/m²)
+                    lux_contribution = lumens_per_ray / cell_area_m2
+                    local_grid[grid_z, grid_y] += lux_contribution
+    
+    return local_grid
+
 def _process_led_worker(args):
     """Worker function to process rays for a single LED (for multiprocessing)."""
     led, params = args
@@ -451,7 +546,7 @@ def _process_led_worker(args):
     grid_shapes = params['grid_shapes']
     wall_specs = params['wall_specs']
     
-    # Initialize local grids for this LED
+    # Initialize local grids for this LED (stores lux = lm/m²)
     local_grids = {
         'front': np.zeros(grid_shapes['front']),
         'left': np.zeros(grid_shapes['left']),
@@ -461,6 +556,21 @@ def _process_led_worker(args):
     }
     local_ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
     local_total_rays = 0
+    
+    # Calculate cell areas for each wall (in m²)
+    cell_areas_m2 = {}
+    for wall_name, spec in wall_specs.items():
+        if wall_name == 'front':
+            cell_width_cm = spec['size_y'] / spec['grid_y']
+            cell_height_cm = spec['size_z'] / spec['grid_z']
+        elif wall_name in ['left', 'right']:
+            cell_width_cm = spec['size_x'] / spec['grid_x']
+            cell_height_cm = spec['size_z'] / spec['grid_z']
+        else:  # top, bottom
+            cell_width_cm = spec['size_x'] / spec['grid_x']
+            cell_height_cm = spec['size_y'] / spec['grid_y']
+        cell_area_cm2 = cell_width_cm * cell_height_cm
+        cell_areas_m2[wall_name] = cell_area_cm2 / 10000.0  # Convert cm² to m²
     
     # Build local coordinate system from LED direction
     z_axis = led.direction
@@ -477,9 +587,9 @@ def _process_led_worker(args):
     for _ in range(rays_traced):
         local_total_rays += 1
         
-        # Sample hemisphere in LED frame
+        # Sample rays within viewing angle cone in LED frame
         u1, u2 = np.random.uniform(0, 1, 2)
-        max_theta = np.pi / 2
+        max_theta = np.radians(led.viewing_angle / 2.0)  # Use full viewing angle
         cos_max = np.cos(max_theta)
         cos_theta = 1.0 - u1 * (1.0 - cos_max)
         cos_theta = np.clip(cos_theta, -1.0, 1.0)
@@ -604,7 +714,9 @@ def _process_led_worker(args):
         grid_i = max(0, min(grid_shape[0] - 1, grid_i))
         grid_j = max(0, min(grid_shape[1] - 1, grid_j))
         
-        local_grids[wall_name][grid_i, grid_j] += lumens_per_ray
+        # Convert lumens to lux (lm/m²)
+        lux_contribution = lumens_per_ray / cell_areas_m2[wall_name]
+        local_grids[wall_name][grid_i, grid_j] += lux_contribution
         local_ray_hits[wall_name] += 1
     
     return local_grids, local_ray_hits, local_total_rays
@@ -695,7 +807,7 @@ def main():
             "Show intensity on wall", initial_value=False
         )
         intensity_rays_slider = server.gui.add_slider(
-            "Rays per pixel (↑quality, ↓speed)", min=10, max=5000,step=5, initial_value=50
+            "Rays per pixel (↑quality, ↓speed)", min=10, max=50000, step=10, initial_value=50
         )
         ray_uniformity_slider = server.gui.add_slider(
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
@@ -703,8 +815,17 @@ def main():
         led_lumens_slider = server.gui.add_slider(
             "LED lumens (lm/LED)", min=100, max=1000, step=10, initial_value=100
         )
+        calibration_factor_slider = server.gui.add_slider(
+            "Calibration factor", min=0.5, max=1.5, step=0.001, initial_value=0.873
+        )
         intensity_grid_size = server.gui.add_slider(
             "Wall grid resolution", min=5, max=100, step=5, initial_value=30
+        )
+        # Cell area info (updated dynamically)
+        cell_area_html = server.gui.add_html(
+            "<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
+            "Cell area: calculating..."
+            "</div>"
         )
         # Intensity legend shown under the sliders as HTML with color swatches
         legend_html = server.gui.add_html(
@@ -953,7 +1074,7 @@ def main():
         half_size = wall_size / 2
 
         # Assume uniform luminous flux per LED provided by GUI
-        lumens_per_led = float(led_lumens_slider.value) if 'led_lumens_slider' in globals() or True else 100.0
+        lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value) if 'led_lumens_slider' in globals() or True else 100.0
         
         # Count active LEDs to calculate rays per LED for target rays per pixel
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
@@ -965,7 +1086,10 @@ def main():
         rays_per_led_calculated = max(1, int((total_pixels * num_rays_per_led) / num_active_leds))
         
         # Diagnostic: Print LED positions and approximate distances to wall
-        print(f"\n=== LED GEOMETRY CHECK ===")
+        num_cores = multiprocessing.cpu_count()
+        print(f"\n=== SYSTEM INFO ===")
+        print(f"CPU cores available: {num_cores}")
+        print(f"=== LED GEOMETRY CHECK ===")
         print(f"Wall at x = {wall_dist:.1f} cm")
         print(f"\n=== RAY EMISSION MODEL ===")
         print(f"Each LED emits {lumens_per_led:.1f} lm total")
@@ -993,181 +1117,46 @@ def main():
         print(f"==========================\n")
         print(f"=== STARTING RAY TRACING ===\n")
         
+        # Prepare active LEDs with their indices
+        active_leds = []
         for led_idx, led in enumerate(leds):
-            # Skip disabled LEDs (check if attribute exists)
             if hasattr(led, 'enabled') and not led.enabled:
                 continue
-            
-            # Set deterministic seed for this LED to get reproducible results
-            # Use led.led_index if available, otherwise use enumerate index
             idx = getattr(led, 'led_index', led_idx)
-            np.random.seed((42 + idx) % (2**32))  # Keep seed within valid range
-            
-            # Generate random rays
-            z_axis = led.direction
-            if abs(z_axis[2]) < 0.9:
-                x_axis = np.cross(z_axis, [0, 0, 1])
-            else:
-                x_axis = np.cross(z_axis, [0, 1, 0])
-            x_axis = x_axis / np.linalg.norm(x_axis)
-            y_axis = np.cross(z_axis, x_axis)
-
-            # IMPORTANT: viewing_angle defines where intensity drops to 50%, NOT the cone edge!
-            # LEDs emit over full hemisphere (0° to 90°)
-            # Calculate exponent n so that intensity drops to 50% at viewing_angle/2
-            # I(θ) = I₀ × cos^n(θ), at θ_half: 0.5 = cos^n(θ_half)
-            # n = ln(0.5) / ln(cos(θ_half))
-            
-            # Maximum emission angle is 90° (hemisphere), not viewing_angle
-            max_theta = np.radians(90.0)  # Full hemisphere
-            
-            # Calculate n from viewing angle
-            theta_half = np.radians(led.viewing_angle / 2.0)
-            cos_half = np.cos(theta_half)
-            
-            # Calculate base exponent for this viewing angle
-            if cos_half > 0.01:  # Avoid division by zero
-                n_base = np.log(0.5) / np.log(cos_half)
-                # Clamp n_base to reasonable range to avoid numerical issues
-                n_base = np.clip(n_base, 0.1, 10.0)
-            else:
-                n_base = 1.0
-            
-            # Apply uniformity factor to make beam more focused if desired
-            uniformity = float(ray_uniformity_slider.value)
-            n = n_base * (1.0 + uniformity * 2.0)  # uniformity=0 -> n=n_base, uniformity=1 -> n=3*n_base
-            n = np.clip(n, 0.1, 30.0)  # Final safety clamp
-            
-            # Calculate normalization factor for uniform solid angle sampling with cos^n(θ) weighting
-            # For hemisphere (0 to 90°): norm_factor = (n+1)
-            # This ensures that Σ[all rays] lumens_per_ray = lumens_per_led when all rays hit
-            # 
-            # PHYSICAL EXPLANATION:
-            # Each LED emits with Lambertian distribution: I(θ) = I₀ × cos^n(θ)
-            # Total flux: Φ = ∫∫ I(θ) dΩ = I₀ × 2π/(n+1)
-            # Therefore: I₀ = Φ × (n+1)/(2π)
-            # For N rays uniformly sampled in solid angle (each covers dΩ = 2π/N):
-            #   lumens_per_ray = I(θ) × dΩ = I₀ × cos^n(θ) × 2π/N
-            #                  = Φ × (n+1)/(2π) × cos^n(θ) × 2π/N
-            #                  = Φ × (n+1) × cos^n(θ) / N
-            # This guarantees: Σ lumens_per_ray = Φ (flux conservation)
-            norm_factor = n + 1.0
-            
-            # Verify flux conservation per LED (diagnostic)
-            led_total_lumens_emitted = 0.0  # Track total lumens from this LED
-            rays_traced = 0
-            rays_hit_wall = 0
-            
-            for _ in range(rays_per_led_calculated):
-                # Uniform sampling in solid angle (physically correct)
-                u1, u2 = np.random.uniform(0, 1, 2)
-                
-                # Sample uniformly within hemisphere (0 to 90°)
-                cos_max = np.cos(max_theta)
-                cos_theta = 1.0 - u1 * (1.0 - cos_max)  # Uniform in solid angle
-                cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                theta = np.arccos(cos_theta)
-                phi = 2 * np.pi * u2
-
-                local_dir = np.array(
-                    [
-                        np.sin(theta) * np.cos(phi),
-                        np.sin(theta) * np.sin(phi),
-                        np.cos(theta),
-                    ]
-                )
-                world_dir = (
-                    local_dir[0] * x_axis
-                    + local_dir[1] * y_axis
-                    + local_dir[2] * z_axis
-                )
-                world_dir = world_dir / np.linalg.norm(world_dir)
-                
-                # Calculate lumens carried by this ray (ALWAYS, regardless if it hits wall)
-                # This represents the light emitted in this direction
-                cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
-                intensity_coefficient = np.power(cos_theta_clamped, n)
-                lumens_per_ray = (lumens_per_led / max(1, rays_per_led_calculated)) * intensity_coefficient * norm_factor
-                
-                # Track: EVERY ray carries lumens, whether absorbed or hits wall
-                rays_traced += 1
-                led_total_lumens_emitted += lumens_per_ray
-                
-                # Ray-box intersection helper (positions in cm)
-                def ray_box_intersection(pos, direction, box):
-                    center = np.array(box['center'], dtype=float)
-                    half = np.array(box['half_sizes'], dtype=float)
-                    rotation = box.get('rotation', None)
-                    
-                    # If box has rotation, transform ray to box's local space
-                    if rotation is not None:
-                        qw, qx, qy, qz = rotation
-                        # Convert quaternion to rotation matrix
-                        R = np.array([
-                            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
-                            [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
-                            [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
-                        ])
-                        # Transform ray to local space (inverse rotation)
-                        R_inv = R.T
-                        local_pos = R_inv @ (pos - center)
-                        local_dir = R_inv @ direction
-                        pos = local_pos
-                        direction = local_dir
-                        center = np.array([0.0, 0.0, 0.0])
-                    
-                    tmin = -np.inf
-                    tmax = np.inf
-                    for k in range(3):
-                        if abs(direction[k]) < 1e-12:
-                            if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
-                                return None
-                        else:
-                            t1 = (center[k] - half[k] - pos[k]) / direction[k]
-                            t2 = (center[k] + half[k] - pos[k]) / direction[k]
-                            t_near = min(t1, t2)
-                            t_far = max(t1, t2)
-                            tmin = max(tmin, t_near)
-                            tmax = min(tmax, t_far)
-                            if tmin > tmax:
-                                return None
-                    if tmax < 0:
-                        return None
-                    return tmin if tmin > 0 else (tmax if tmax > 0 else None)
-
-                # Check absorbers intersection
-                hit_absorbed = False
-                if absorbers is not None:
-                    for a in absorbers:
-                        t_hit = ray_box_intersection(led.position, world_dir, a)
-                        if t_hit is not None and t_hit > 0:
-                            hit_absorbed = True
-                            break
-
-                if hit_absorbed:
-                    continue
-
-                if world_dir[0] > 0:  # Ray going towards wall
-                    t = (wall_dist - led.position[0]) / world_dir[0]
-                    if t > 0:
-                        hit_y = led.position[1] + world_dir[1] * t
-                        hit_z = led.position[2] + world_dir[2] * t
-
-                        # Convert to grid indices (centered at 0,0)
-                        grid_y = int((hit_y + half_size) / cell_size)
-                        grid_z = int((hit_z + half_size) / cell_size)
-
-                        if 0 <= grid_y < grid_size and 0 <= grid_z < grid_size:
-                            # Ray hits wall within grid - add its lumens
-                            rays_hit_wall += 1
-                            grid[grid_z, grid_y] += lumens_per_ray
-            
-            # Diagnostic: Check flux conservation for this LED
-            conservation_pct = (led_total_lumens_emitted / lumens_per_led * 100) if lumens_per_led > 0 else 0
-            idx = getattr(led, 'led_index', led_idx)
-            if idx == 0 or idx == 10 or idx == 20:  # Print for first LED of each type
-                print(f"LED {idx}: Emitted {led_total_lumens_emitted:.2f} lm on {rays_traced} rays (target: {lumens_per_led:.2f} lm, conservation: {conservation_pct:.1f}%)")
-                print(f"  Rays hit wall: {rays_hit_wall}/{rays_traced} ({rays_hit_wall/rays_traced*100:.1f}%)")
+            active_leds.append((led, idx))
+        
+        if not active_leds:
+            return grid, wall_size
+        
+        # Prepare parameters for worker processes
+        ray_uniformity = float(ray_uniformity_slider.value) if 'ray_uniformity_slider' in globals() or True else 0.0
+        
+        worker_args = []
+        for led, led_idx in active_leds:
+            params = {
+                'wall_dist': wall_dist,
+                'rays_per_led': rays_per_led_calculated,
+                'grid_size': grid_size,
+                'wall_size': wall_size,
+                'lumens_per_led': lumens_per_led,
+                'absorbers': absorbers,
+                'ray_uniformity': ray_uniformity,
+                'led_idx': led_idx,
+            }
+            worker_args.append((led, params))
+        
+        # Use multiprocessing to parallelize LED processing
+        num_processes = min(multiprocessing.cpu_count(), len(active_leds))
+        print(f"Using {num_processes} CPU cores to process {len(active_leds)} LEDs in parallel...")
+        
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = pool.map(_process_led_wall_worker, worker_args)
+        
+        # Aggregate results from all workers
+        for local_grid in results:
+            grid += local_grid
+        
+        print(f"Ray tracing complete!\n")
 
         return grid, wall_size
 
@@ -1226,7 +1215,7 @@ def main():
                       'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y, 'cell_size': cell_size}
         }
         
-        lumens_per_led = float(led_lumens_slider.value)
+        lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
         if num_active_leds == 0:
             return grids, wall_specs
@@ -1476,7 +1465,7 @@ def main():
             })
         
         # Ray tracing for FOV region
-        lumens_per_led = float(led_lumens_slider.value)
+        lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
         rays_per_pixel = int(intensity_rays_slider.value)
         
         # Count active LEDs
@@ -1508,14 +1497,14 @@ def main():
             x_axis = x_axis / np.linalg.norm(x_axis)
             y_axis = np.cross(z_axis, x_axis)
             
-            # IMPORTANT: viewing_angle defines where intensity drops to 50%, NOT the cone edge!
-            # LEDs emit over full hemisphere (0° to 90°)
+            # IMPORTANT: viewing_angle defines the full emission cone angle
+            # LEDs emit rays within the full viewing_angle cone
             # Calculate exponent n so that intensity drops to 50% at viewing_angle/2
             # I(θ) = I₀ × cos^n(θ), at θ_half: 0.5 = cos^n(θ_half)
             # n = ln(0.5) / ln(cos(θ_half))
             
-            # Maximum emission angle is 90° (hemisphere), not viewing_angle
-            max_theta = np.radians(90.0)  # Full hemisphere
+            # Maximum emission angle is viewing_angle/2 (half-angle from center)
+            max_theta = np.radians(led.viewing_angle / 2.0)  # Use full viewing angle
             
             # Calculate n from viewing angle
             theta_half = np.radians(led.viewing_angle / 2.0)
@@ -1645,27 +1634,23 @@ def main():
         # Diagnostic: print first LED's flux conservation
         print(f"FOV Capture: First LED emitted {led_total_lumens_emitted:.2f} lm total (target: {lumens_per_led:.2f} lm)")
         
-        # Convert to lux using solid angle formula
-        # lumen = Lux * 2 * π * Area_cell * (1 - cos(viewing_angle/2))
-        # Therefore: Lux = lumen / (2 * π * Area_cell * (1 - cos(viewing_angle/2)))
+        # Convert to lux: Lux = Lumen / Area_m²
         cell_area_m2 = (cell_size_cm / 100.0) ** 2
-        solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
-        lux_grid = fov_grid / (cell_area_m2 * solid_angle_factor)
+        lux_grid = fov_grid / cell_area_m2
         
         # Clean up any NaN or Inf values
         fov_grid = np.nan_to_num(fov_grid, nan=0.0, posinf=0.0, neginf=0.0)
         lux_grid = np.nan_to_num(lux_grid, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Get max intensity for color mapping
-        max_lumens = fov_grid.max()
+        # Get max lux for color mapping
         max_lux = lux_grid.max()
         
         # Create image using same colormap as render (intensity_to_color)
         img_rgb = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
         for i in range(grid_height):
             for j in range(grid_width):
-                lumen_val = fov_grid[i, j]
-                color = intensity_to_color(lumen_val, max_lumens)
+                lux_val = lux_grid[i, j]
+                color = intensity_to_color(lux_val, max_lux)
                 img_rgb[i, j] = [int(c * 255) for c in color]
         
         # Add legend to the right (50 pixels wide)
@@ -1688,8 +1673,8 @@ def main():
             
             # Intensity from top (max) to bottom (min)
             intensity_fraction = 1.0 - (i / legend_steps)
-            lumen_val = intensity_fraction * max_lumens
-            color = intensity_to_color(lumen_val, max_lumens)
+            lux_val = intensity_fraction * max_lux
+            color = intensity_to_color(lux_val, max_lux)
             rgb = [int(c * 255) for c in color]
             
             img_with_legend[y_start:y_end, legend_x_start:legend_x_end, :] = rgb
@@ -1924,51 +1909,35 @@ def main():
         )
         # Clean up any NaN or Inf values in the grid
         intensity_grid = np.nan_to_num(intensity_grid, nan=0.0, posinf=0.0, neginf=0.0)
-        max_intensity = intensity_grid.max()
+        max_lux = intensity_grid.max()  # Grid now contains lux (lm/m²)
+        
+        # Calculate cell area for lux to lumen conversion
+        cell_size_cm = actual_wall_size / grid_size
+        cell_area_cm2 = cell_size_cm * cell_size_cm
+        cell_area_m2 = cell_area_cm2 / 10000.0  # Convert cm² to m²
         
         # === DIAGNOSTIC OUTPUT FOR FLUX CONSERVATION ===
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
-        lumens_per_led = float(led_lumens_slider.value)
+        lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
         total_emitted_lumens = num_active_leds * lumens_per_led
-        total_wall_lumens = np.sum(intensity_grid)
+        # Convert lux to lumen: multiply each cell by its area and sum
+        total_wall_lumens = np.sum(intensity_grid * cell_area_m2)
         conservation_ratio = (total_wall_lumens / total_emitted_lumens * 100) if total_emitted_lumens > 0 else 0
         
-        # Calculate 7mm² sensor reading at center - PRECISE METHOD
-        # Sum all cells within 7mm² area centered at (0,0)
+        # Calculate 7mm² sensor reading at center
+        # Grid contains lux (lm/m²), convert to lumens for sensor area
         sensor_area_cm2 = 0.07  # 7mm² = 0.07cm²
-        sensor_radius_cm = np.sqrt(sensor_area_cm2 / np.pi)  # Circular sensor = 0.149cm radius
-        sensor_lumens_precise = 0.0
-        cell_count_in_sensor = 0
+        sensor_area_m2 = sensor_area_cm2 / 10000.0
         
-        center_y = 0.0  # cm, center of wall
-        center_z = 0.0  # cm
-        
-        cell_size_per_axis = actual_wall_size / grid_size
-        
-        # PROBLEM: If cell is 3.33cm and sensor radius is 0.149cm, we need MUCH finer resolution!
-        # The sensor is 44x smaller than a cell - we're missing all the detail!
-        
-        for gz in range(grid_size):
-            for gy in range(grid_size):
-                # Cell center position in cm
-                cell_y = -actual_wall_size/2 + (gy + 0.5) * cell_size_per_axis
-                cell_z = -actual_wall_size/2 + (gz + 0.5) * cell_size_per_axis
-                
-                # Distance from wall center
-                dist_from_center = np.sqrt((cell_y - center_y)**2 + (cell_z - center_z)**2)
-                
-                # If cell center is within sensor, count entire cell (crude approximation)
-                if dist_from_center < cell_size_per_axis/2:  # Cell overlaps center
-                    cell_area_cm2 = cell_size_per_axis ** 2
-                    # Scale by sensor/cell ratio
-                    sensor_lumens_precise += intensity_grid[gz, gy] * (sensor_area_cm2 / cell_area_cm2)
-                    cell_count_in_sensor += 1
-        
-        # Alternative: just take center cell and scale
+        # Grid now stores lux (lm/m²), convert to lumens for sensor
         center_idx = grid_size // 2
-        center_cell_lumens = intensity_grid[center_idx, center_idx]
-        center_cell_area = cell_size_per_axis ** 2
-        sensor_lumens_from_center_cell = center_cell_lumens * (sensor_area_cm2 / center_cell_area)
+        center_cell_lux = intensity_grid[center_idx, center_idx]
+        
+        # Convert sensor area to m²
+        sensor_area_m2 = sensor_area_cm2 / 10000.0
+        
+        # Calculate lumens on sensor: Lumen = Lux × Area
+        sensor_lumens_from_center_cell = center_cell_lux * sensor_area_m2
         
         print(f"\n=== FLUX CONSERVATION CHECK ===")
         print(f"Active LEDs: {num_active_leds}")
@@ -1988,7 +1957,7 @@ def main():
             for gy in range(grid_size):
                 intensity = intensity_grid[gz, gy]
                 if intensity > 0:
-                    color = intensity_to_color(intensity, max_intensity)
+                    color = intensity_to_color(intensity, max_lux)
                     y_pos = (
                         -half_size + gy * cell_size_cm + cell_size_cm / 2
                     ) / 100.0
@@ -2005,30 +1974,21 @@ def main():
                     )
                     intensity_handles.append(handle)
         
-        # Update legend
+        # Update legend (grid now stores lux = lm/m²)
         legend_steps = 6
-        legend_vals = np.linspace(0, max_intensity, legend_steps)
-        # Conversion using solid angle formula:
-        # lumen = Lux * 2 * π * Area_cell * (1 - cos(viewing_angle/2))
-        # Therefore: Lux = lumen / (2 * π * Area_cell * (1 - cos(viewing_angle/2)))
-        # candela = lumen / solid_angle_steradian
-        cell_area_m2 = cell_size_m * cell_size_m
-        viewing_angle = viewing_angle_slider.value
-        solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
+        legend_vals_lux = np.linspace(0, max_lux, legend_steps)
         html_lines = ["<div style='font-family: sans-serif;'>",
-                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"]
-        for val in reversed(legend_vals):
-            color = intensity_to_color(val, max_intensity)
+                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend (lux)</div>"]
+        for lux_val in reversed(legend_vals_lux):
+            color = intensity_to_color(lux_val, max_lux)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            # Convert lumens to lux using solid angle formula
-            lux_val = val / (cell_area_m2 * solid_angle_factor) if cell_area_m2 > 0 else 0
-            # Convert lumens to candela (luminous intensity)
-            cd_val = val / solid_angle_factor if solid_angle_factor > 0 else 0
+            # Convert lux to lumens for this cell: Lumen = Lux × Area
+            lumen_val = lux_val * cell_area_m2
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{val:.1f} lm</div>"
-                f"<div style='color:#888;font-size:11px;'>({lux_val:.0f} lx, {cd_val:.2f} cd)</div></div>"
+                f"<div style='min-width:70px;'>{lux_val:.1f} lx</div>"
+                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
             )
         html_lines.append("</div>")
         legend_html.content = "".join(html_lines)
@@ -2288,14 +2248,24 @@ def main():
             leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, absorbers=absorbers
         )
         
-        # Find max intensity across all walls for color normalization
-        max_intensity = max(grid.max() for grid in grids.values()) if grids else 0.0
+        # Find max lux across all walls for color normalization
+        max_lux = max(grid.max() for grid in grids.values()) if grids else 0.0
         
         print(f"\n=== ROOM INTENSITY VISUALIZATION ===")
-        print(f"Max intensity across all walls: {max_intensity:.4f} lm")
+        print(f"Max illuminance across all walls: {max_lux:.4f} lux")
         for wall_name, grid in grids.items():
             cells_with_intensity = np.count_nonzero(grid > 0)
-            print(f"  {wall_name.capitalize()}: {cells_with_intensity} cells with intensity (total: {grid.sum():.1f} lm)")
+            # Convert lux to lumens: multiply by cell area for that wall
+            wall_spec = wall_specs[wall_name]
+            if wall_name == 'front':
+                cell_area_cm2 = (wall_spec['size_y']/wall_spec['grid_y']) * (wall_spec['size_z']/wall_spec['grid_z'])
+            elif wall_name in ('left', 'right'):
+                cell_area_cm2 = (wall_spec['size_x']/wall_spec['grid_x']) * (wall_spec['size_z']/wall_spec['grid_z'])
+            else:  # top/bottom
+                cell_area_cm2 = (wall_spec['size_x']/wall_spec['grid_x']) * (wall_spec['size_y']/wall_spec['grid_y'])
+            cell_area_m2 = cell_area_cm2 / 10000.0
+            total_lumen = np.sum(grid) * cell_area_m2
+            print(f"  {wall_name.capitalize()}: {cells_with_intensity} cells with intensity (total: {total_lumen:.1f} lm)")
         
         # Visualize each wall
         cells_created = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
@@ -2307,7 +2277,7 @@ def main():
                 for gj in range(grid_shape[1]):
                     intensity = intensity_grid[gi, gj]
                     if intensity > 0:
-                        color = intensity_to_color(intensity, max_intensity)
+                        color = intensity_to_color(intensity, max_lux)
                         
                         # Calculate cell position based on wall orientation
                         # Position cells exactly on wall surfaces (same as gray walls)
@@ -2394,10 +2364,10 @@ def main():
             print(f"  {wall_name.capitalize()}: {count} cells created")
         print(f"===================================\n")
         
-        # Update legend
+        # Update legend (grid stores lux)
         legend_steps = 6
-        legend_vals = np.linspace(0, max_intensity, legend_steps)
-        # Calculate cell size for lux conversion (use max dimension approach)
+        legend_vals_lux = np.linspace(0, max_lux, legend_steps)
+        # Calculate cell size for lux to lumen conversion (use max dimension approach)
         # Cell size is uniform across all walls based on max dimension / grid_size
         led_width = wall_specs['front']['size_y']  # Use front wall width as reference
         led_height = wall_specs['front']['size_z']  # Use front wall height as reference
@@ -2408,22 +2378,18 @@ def main():
         cell_size_cm = max_dimension / grid_size
         cell_size_m = cell_size_cm / 100.0
         cell_area_m2 = cell_size_m * cell_size_m
-        viewing_angle = viewing_angle_slider.value
-        solid_angle_factor = 2 * np.pi * (1 - np.cos(np.radians(viewing_angle / 2)))
         html_lines = ["<div style='font-family: sans-serif;'>",
-                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"]
-        for val in reversed(legend_vals):
-            color = intensity_to_color(val, max_intensity)
+                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend (lux)</div>"]
+        for lux_val in reversed(legend_vals_lux):
+            color = intensity_to_color(lux_val, max_lux)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            # Convert lumens to lux using solid angle formula
-            lux_val = val / (cell_area_m2 * solid_angle_factor) if cell_area_m2 > 0 else 0
-            # Convert lumens to candela (luminous intensity)
-            cd_val = val / solid_angle_factor if solid_angle_factor > 0 else 0
+            # Convert lux to lumens for this cell: Lumen = Lux × Area
+            lumen_val = lux_val * cell_area_m2
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{val:.1f} lm</div>"
-                f"<div style='color:#888;font-size:11px;'>({lux_val:.0f} lx, {cd_val:.2f} cd)</div></div>"
+                f"<div style='min-width:70px;'>{lux_val:.1f} lx</div>"
+                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
             )
         html_lines.append("</div>")
         legend_html.content = "".join(html_lines)
@@ -2848,7 +2814,7 @@ def main():
                     for k in range(num_random_rays):
                         # Random direction within viewing cone using cosine power distribution
                         u1, u2 = np.random.uniform(0, 1, 2)
-                        max_theta = np.radians(viewing_angle)
+                        max_theta = np.radians(viewing_angle / 2.0)  # Half-angle for proper cone
                         
                         uniformity = float(ray_uniformity_slider.value)
                         n = 1.0 + uniformity * 3.0  # Exponent from 1 to 4
@@ -3070,6 +3036,23 @@ def main():
     # Register handler for adding custom groups
     add_custom_group_btn.on_click(lambda _: create_custom_group())
 
+    # Function to update cell area info
+    def update_cell_area_info():
+        grid_size = int(intensity_grid_size.value)
+        wall_size_cm = int(wall_view_size.value)
+        cell_size_cm = wall_size_cm / grid_size
+        cell_area_cm2 = cell_size_cm * cell_size_cm
+        cell_area_m2 = cell_area_cm2 / 10000.0  # Convert cm² to m²
+        
+        cell_area_html.content = (
+            f"<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
+            f"Cell: {cell_size_cm:.2f} cm × {cell_size_cm:.2f} cm = {cell_area_cm2:.2f} cm² ({cell_area_m2:.6f} m²)"
+            "</div>"
+        )
+    
+    # Initial cell area update
+    update_cell_area_info()
+
     # Register callbacks
     viewing_angle_slider.on_update(lambda _: update_scene())
     rot_front_pos.on_update(lambda _: update_scene())
@@ -3126,7 +3109,8 @@ def main():
     abs3_rot_z.on_update(lambda _: update_scene())
     intensity_rays_slider.on_update(lambda _: update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else None)
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
-    intensity_grid_size.on_update(lambda _: None)  # No auto-update for expensive params
+    intensity_grid_size.on_update(lambda _: update_cell_area_info())  # Update cell area when resolution changes
+    wall_view_size.on_update(lambda _: update_cell_area_info())  # Update cell area when wall size changes
     
     # Room mode callback - draw/clear room walls when toggled
     def on_room_mode_toggle(_):
