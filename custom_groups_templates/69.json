@@ -1,0 +1,124 @@
+{
+    "name": "69",
+    "groups": [
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                -14.2,
+                0.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true,
+                true,
+                true,
+                true
+            ],
+            "is_dynamic": true,
+            "num_leds": 4,
+            "led_positions": [
+                [
+                    0.0,
+                    0.0,
+                    0.7
+                ],
+                [
+                    0.0,
+                    4.1,
+                    0.0
+                ],
+                [
+                    0.0,
+                    -2.7,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    -1.6
+                ]
+            ],
+            "led_rotations": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    0,
+                    0,
+                    0
+                ]
+            ],
+            "led_sizes": [
+                0.5,
+                0.5,
+                0.5,
+                0.5
+            ],
+            "led_rows": [
+                [
+                    0
+                ],
+                [
+                    1,
+                    2
+                ],
+                [
+                    3
+                ]
+            ]
+        },
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ]
+        }
+    ],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5
+        }
+    ]
+}

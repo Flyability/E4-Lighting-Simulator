@@ -1,0 +1,26 @@
+{
+    "name": "prova34",
+    "groups": [],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": -28.0,
+            "rot_x": 0,
+            "rot_y": -18,
+            "rot_z": 0,
+            "size": 0.5
+        },
+        {
+            "enabled": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5
+        }
+    ]
+}

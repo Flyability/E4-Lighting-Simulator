@@ -1,0 +1,50 @@
+{
+    "name": "77",
+    "groups": [],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 4.1,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": -2.7,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": -1.6,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": 0.7,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5
+        }
+    ]
+}
