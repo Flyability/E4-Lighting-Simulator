@@ -279,6 +279,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "pvtrace" },
+    { name = "trimesh" },
     { name = "viser" },
 ]
 
@@ -288,6 +289,7 @@ requires-dist = [
     { name = "numpy", specifier = "<2.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pvtrace", specifier = ">=2.1.6" },
+    { name = "trimesh", specifier = ">=4.0.0" },
     { name = "viser", specifier = ">=0.2.0" },
 ]
 

@@ -95,7 +95,7 @@
     "custom_groups": [],
     "individual_leds": [],
     "absorbers": {
-        "enabled": true,
+        "enabled": false,
         "abs0": {
             "x": -1.0,
             "y": 2.5,
@@ -119,23 +119,5 @@
             "rot_z": 14
         }
     },
-    "stl_model": {
-        "file_path": "C:\\Users\\gianmatteo.marietti_\\Downloads\\109045 E3 CAGE ASSEMBLY_Coarse.STL",
-        "absorber_enable": true,
-        "visible": true,
-        "scale": 0.1,
-        "position": [
-            -22,
-            0,
-            0
-        ],
-        "rotation": [
-            0,
-            0,
-            -150
-        ],
-        "opacity": 0.8,
-        "wireframe": false
-    },
-    "name": "elios3"
+    "name": "elios3vero"
 }

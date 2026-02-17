@@ -1,0 +1,43 @@
+{
+    "name": "45",
+    "groups": [
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ]
+        }
+    ],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.7,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": -18,
+            "rot_z": 0,
+            "size": 0.5
+        }
+    ]
+}

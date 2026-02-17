@@ -10,4 +10,5 @@ dependencies = [
     "pillow>=10.0.0",
     "pvtrace>=2.1.6",
     "viser>=0.2.0",
+    "trimesh>=4.0.0",
 ]

@@ -11,6 +11,7 @@ import multiprocessing
 import json
 import os
 from functools import partial
+import trimesh
 
 
 class LED:
@@ -514,6 +515,92 @@ def create_leds(
 
 
 # Helper functions for multiprocessing (must be at module level for pickle serialization)
+def _ray_triangle_intersection(ray_origin, ray_direction, v0, v1, v2):
+    """
+    Möller–Trumbore ray-triangle intersection algorithm.
+    Returns distance t if intersection exists, None otherwise.
+    """
+    epsilon = 1e-8
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+    h = np.cross(ray_direction, edge2)
+    a = np.dot(edge1, h)
+    
+    if abs(a) < epsilon:
+        return None  # Ray is parallel to triangle
+    
+    f = 1.0 / a
+    s = ray_origin - v0
+    u = f * np.dot(s, h)
+    
+    if u < 0.0 or u > 1.0:
+        return None
+    
+    q = np.cross(s, edge1)
+    v = f * np.dot(ray_direction, q)
+    
+    if v < 0.0 or u + v > 1.0:
+        return None
+    
+    t = f * np.dot(edge2, q)
+    
+    if t > epsilon:
+        return t
+    
+    return None
+
+def _ray_mesh_intersection(ray_origin, ray_direction, mesh_data):
+    """
+    Check if ray intersects with STL mesh using trimesh's optimized BVH ray tracing.
+    Returns minimum distance if intersection exists, None otherwise.
+    mesh_data: dict with 'vertices', 'faces', 'transform' (4x4 matrix)
+    """
+    if mesh_data is None:
+        return None
+    
+    # Check if we have a cached trimesh object, otherwise create one
+    if 'trimesh_obj' not in mesh_data:
+        # Create trimesh object with BVH acceleration structure
+        import trimesh
+        mesh_data['trimesh_obj'] = trimesh.Trimesh(
+            vertices=mesh_data['vertices'],
+            faces=mesh_data['faces'],
+            process=False  # Don't validate/repair mesh (faster)
+        )
+    
+    mesh = mesh_data['trimesh_obj']
+    transform = mesh_data.get('transform', np.eye(4))
+    
+    # Apply transformation to ray origin and direction (inverse transform)
+    # Instead of transforming mesh vertices, transform ray to mesh's local space
+    try:
+        inv_transform = np.linalg.inv(transform)
+    except np.linalg.LinAlgError:
+        # Singular matrix, use identity
+        inv_transform = np.eye(4)
+    
+    # Transform ray to mesh local coordinates
+    ray_origin_local = (inv_transform @ np.append(ray_origin, 1))[:3]
+    ray_direction_local = (inv_transform[:3, :3] @ ray_direction)
+    ray_direction_local = ray_direction_local / np.linalg.norm(ray_direction_local)
+    
+    # Use trimesh's optimized ray intersection (uses BVH internally)
+    locations, index_ray, index_tri = mesh.ray.intersects_location(
+        ray_origins=[ray_origin_local],
+        ray_directions=[ray_direction_local],
+        multiple_hits=False  # Only need closest hit
+    )
+    
+    if len(locations) == 0:
+        return None
+    
+    # Calculate distance in world space
+    hit_point_local = locations[0]
+    hit_point_world = (transform @ np.append(hit_point_local, 1))[:3]
+    distance = np.linalg.norm(hit_point_world - ray_origin)
+    
+    return distance
+
 def _ray_box_intersection(pos, direction, box):
     """Check ray-box intersection for absorbers (supports rotation via quaternion)."""
     center = np.array(box['center'], dtype=float)
@@ -647,6 +734,12 @@ def _process_led_wall_worker(args):
                     hit_absorbed = True
                     break
         
+        # Check STL mesh intersection
+        if not hit_absorbed and params.get('stl_mesh_data') is not None:
+            t_hit = _ray_mesh_intersection(led.position, world_dir, params['stl_mesh_data'])
+            if t_hit is not None and t_hit > 0:
+                hit_absorbed = True
+        
         if hit_absorbed:
             continue
         
@@ -679,6 +772,7 @@ def _process_led_worker(args):
     grid_size = params['grid_size']
     lumens_per_led = params['lumens_per_led']
     absorbers = params['absorbers']
+    stl_mesh_data = params.get('stl_mesh_data')
     ray_uniformity = params['ray_uniformity']
     grid_shapes = params['grid_shapes']
     wall_specs = params['wall_specs']
@@ -762,6 +856,12 @@ def _process_led_worker(args):
                 if t_hit is not None and t_hit > 0:
                     hit_absorbed = True
                     break
+        
+        # Check STL mesh intersection
+        if not hit_absorbed and stl_mesh_data is not None:
+            t_hit = _ray_mesh_intersection(led.position, world_dir, stl_mesh_data)
+            if t_hit is not None and t_hit > 0:
+                hit_absorbed = True
         
         if hit_absorbed:
             continue
@@ -943,7 +1043,10 @@ def main():
                 'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
                 'rotation_y': group['rot_y'].value,
                 'rotation_z': group['rot_z'].value,
-                'led_states': group['led_states'][:]
+                'led_states': group['led_states'][:],
+                'template_name': group.get('template_name'),  # Save template association
+                'initial_pos': group.get('initial_pos', [0.0, 0.0, 0.0]),  # Save initial position
+                'initial_rot': group.get('initial_rot', [0, 0, 0]),  # Save initial rotation
             }
             # Save dynamic group properties if present
             if group.get('is_dynamic', False):
@@ -1002,7 +1105,17 @@ def main():
                 "abs1": {"x": abs1_off_x.value, "y": abs1_off_y.value, "z": abs1_off_z.value},
                 "abs2": {"x": abs2_off_x.value, "y": abs2_off_y.value, "z": abs2_off_z.value, "rot_z": abs2_rot_z.value},
                 "abs3": {"x": abs3_off_x.value, "y": abs3_off_y.value, "z": abs3_off_z.value, "rot_z": abs3_rot_z.value}
-            }
+            },
+            "stl_model": {
+                "file_path": stl_file_path.value,
+                "absorber_enable": stl_absorber_enable.value,
+                "visible": stl_visible.value,
+                "scale": stl_scale.value,
+                "position": [stl_pos_x.value, stl_pos_y.value, stl_pos_z.value],
+                "rotation": [stl_rot_x.value, stl_rot_y.value, stl_rot_z.value],
+                "opacity": stl_opacity.value,
+                "wireframe": stl_wireframe.value
+            } if stl_mesh_data[0] is not None else None
         }
 
     def clear_all_custom_groups():
@@ -1106,7 +1219,21 @@ def main():
         custom_groups_data = cfg.get("custom_groups", [])
         if len(custom_groups_data) > 0:
             print(f"Recreating {len(custom_groups_data)} custom group(s)...")
+        
+        # Group by template_name to recreate master folders
+        groups_by_template = {}
+        standalone_groups = []
         for group_cfg in custom_groups_data:
+            template_name = group_cfg.get('template_name')
+            if template_name:
+                if template_name not in groups_by_template:
+                    groups_by_template[template_name] = []
+                groups_by_template[template_name].append(group_cfg)
+            else:
+                standalone_groups.append(group_cfg)
+        
+        # Create standalone groups (no template)
+        for group_cfg in standalone_groups:
             # Check if this is a dynamic group
             if group_cfg.get('is_dynamic', False):
                 # Create dynamic group with saved properties
@@ -1146,6 +1273,288 @@ def main():
             
             # Enable the group AFTER all parameters are loaded
             group_data['enable'].value = group_cfg.get('enabled', True)
+        
+        # Recreate template folders with master controls
+        for template_name, template_groups_cfg in groups_by_template.items():
+            if len(template_groups_cfg) == 0:
+                continue
+            
+            print(f"Recreating template folder: {template_name} with {len(template_groups_cfg)} group(s)")
+            
+            # Create master folder
+            template_folder = server.gui.add_folder(f"Template: {template_name}")
+            
+            with template_folder:
+                master_enable = server.gui.add_checkbox("Enable All", initial_value=True)
+                master_pos_x = server.gui.add_slider("Master Position X (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
+                master_pos_y = server.gui.add_slider("Master Position Y (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
+                master_pos_z = server.gui.add_slider("Master Position Z (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
+                master_rot_x = server.gui.add_slider("Master Rotation X (°)", min=-180, max=180, step=1, initial_value=0)
+                master_rot_y = server.gui.add_slider("Master Rotation Y (°)", min=-180, max=180, step=1, initial_value=0)
+                master_rot_z = server.gui.add_slider("Master Rotation Z (°)", min=-180, max=180, step=1, initial_value=0)
+                server.gui.add_html("<hr style='margin:8px 0;'>")
+                remove_template_btn = server.gui.add_button(f"Remove All ({len(template_groups_cfg)} groups)", color="red")
+            
+            # Create all groups from this template
+            created_groups = []
+            for group_cfg in template_groups_cfg:
+                # Check if this is a dynamic group
+                if group_cfg.get('is_dynamic', False):
+                    # Create dynamic group with saved properties
+                    group_data = create_custom_group(
+                        skip_update_scene=True,
+                        num_leds=group_cfg.get('num_leds', 12),
+                        led_rows=group_cfg.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
+                    )
+                    # Store dynamic group properties
+                    group_data['is_dynamic'] = True
+                    group_data['led_positions'] = group_cfg.get('led_positions', [])
+                    group_data['led_rotations'] = group_cfg.get('led_rotations', [])
+                    group_data['led_sizes'] = group_cfg.get('led_sizes', [])
+                else:
+                    # Standard 12-LED group
+                    group_data = create_custom_group(skip_update_scene=True)
+                
+                # Apply saved position and rotation values
+                pos = group_cfg.get('position', [0, 0, 0])
+                group_data['pos_x'].value = pos[0]
+                group_data['pos_y'].value = pos[1]
+                group_data['pos_z'].value = pos[2]
+                if 'rot_x' in group_data:
+                    group_data['rot_x'].value = group_cfg.get('rotation_x', 0)
+                group_data['rot_y'].value = group_cfg.get('rotation_y', 0)
+                group_data['rot_z'].value = group_cfg.get('rotation_z', 0)
+                
+                # Load LED states
+                led_states_cfg = group_cfg.get('led_states', [])
+                for i, state in enumerate(led_states_cfg):
+                    if i < len(group_data['led_states']):
+                        group_data['led_states'][i] = state
+                
+                # Update button colors
+                if 'update_button_colors' in group_data and group_data['update_button_colors']:
+                    group_data['update_button_colors']()
+                
+                # Enable the group
+                group_data['enable'].value = group_cfg.get('enabled', True)
+                
+                # Store template association and initial offsets
+                group_data['template_name'] = template_name
+                group_data['initial_pos'] = group_cfg.get('initial_pos', [0.0, 0.0, 0.0])
+                group_data['initial_rot'] = group_cfg.get('initial_rot', [0, 0, 0])
+                
+                # Hide individual group folder - LED controls will be in master folder
+                group_data['folder'].visible = False
+                
+                created_groups.append(group_data)
+            
+            # Add LED controls in master folder for each group
+            with template_folder:
+                server.gui.add_html("<hr style='margin:8px 0;'><b>LED Controls:</b>")
+                
+                # Store button references for dynamic color updates
+                master_led_buttons = []  # List of dicts with button references per group
+                
+                for group_idx, group in enumerate(created_groups):
+                    with server.gui.add_folder(f"Group {group_idx + 1} LEDs"):
+                        # Store button references for this group
+                        group_buttons = {
+                            'all_btn': None,
+                            'row_btns': {},
+                            'led_btns': {}
+                        }
+                        
+                        # ALL button for this group
+                        group_all_btn = server.gui.add_button("ALL LEDs", color="#666666")
+                        group_buttons['all_btn'] = group_all_btn
+                        
+                        server.gui.add_html("<hr style='margin:4px 0;'>")
+                        
+                        # Row buttons
+                        led_rows = group.get('led_rows', [[0,1,2], [3,4,5], [6,7,8], [9,10,11]])
+                        for row_idx, led_indices in enumerate(led_rows):
+                            row_btn = server.gui.add_button(f"Row {row_idx + 1}", color="#666666")
+                            group_buttons['row_btns'][row_idx] = row_btn
+                            
+                            # Create row handler
+                            def make_row_click_handler(grp, r_idx, leds_in_row, update_colors_fn):
+                                def handler(_):
+                                    # Toggle all LEDs in this row
+                                    all_on = all(grp['led_states'][i] for i in leds_in_row if i < len(grp['led_states']))
+                                    for led_i in leds_in_row:
+                                        if led_i < len(grp['led_states']):
+                                            grp['led_states'][led_i] = not all_on
+                                    # Update both standard and master button colors
+                                    if grp.get('update_button_colors'):
+                                        grp['update_button_colors']()
+                                    update_colors_fn()
+                                    update_scene()
+                                return handler
+                            
+                            # Will set handler after update function is defined
+                        
+                        server.gui.add_html("<hr style='margin:4px 0;'>")
+                        
+                        # Individual LED buttons
+                        num_leds = group.get('num_leds', 12)
+                        for led_idx in range(num_leds):
+                            initial_color = "#FF00FF" if group['led_states'][led_idx] else "#444444"
+                            led_btn = server.gui.add_button(f"LED {led_idx + 1}", color=initial_color)
+                            group_buttons['led_btns'][led_idx] = led_btn
+                            
+                            # Create LED handler
+                            def make_led_click_handler(grp, l_idx, update_colors_fn):
+                                def handler(_):
+                                    if l_idx < len(grp['led_states']):
+                                        grp['led_states'][l_idx] = not grp['led_states'][l_idx]
+                                    # Update both standard and master button colors
+                                    if grp.get('update_button_colors'):
+                                        grp['update_button_colors']()
+                                    update_colors_fn()
+                                    update_scene()
+                                return handler
+                            
+                            # Will set handler after update function is defined
+                        
+                        # ALL button handler
+                        def make_all_click_handler(grp, update_colors_fn):
+                            def handler(_):
+                                # Toggle all LEDs in this group
+                                all_on = all(grp['led_states'])
+                                for i in range(len(grp['led_states'])):
+                                    grp['led_states'][i] = not all_on
+                                # Update both standard and master button colors
+                                if grp.get('update_button_colors'):
+                                    grp['update_button_colors']()
+                                update_colors_fn()
+                                update_scene()
+                            return handler
+                        
+                        # Will set handler after update function is defined
+                        
+                        master_led_buttons.append({
+                            'group': group,
+                            'buttons': group_buttons,
+                            'led_rows': led_rows
+                        })
+                
+                # Create function to update all master button colors
+                def update_master_led_button_colors():
+                    """Update colors of all LED control buttons in master folder."""
+                    for group_data in master_led_buttons:
+                        grp = group_data['group']
+                        btns = group_data['buttons']
+                        led_rows = group_data['led_rows']
+                        
+                        # Update individual LED buttons
+                        for led_idx, led_btn in btns['led_btns'].items():
+                            if led_idx < len(grp['led_states']):
+                                color = "#FF00FF" if grp['led_states'][led_idx] else "#444444"
+                                led_btn.color = color
+                        
+                        # Update row buttons
+                        for row_idx, led_indices in enumerate(led_rows):
+                            if row_idx in btns['row_btns']:
+                                any_on = any(grp['led_states'][i] for i in led_indices if i < len(grp['led_states']))
+                                btns['row_btns'][row_idx].color = "#FF00FF" if any_on else "#666666"
+                        
+                        # Update ALL button
+                        if btns['all_btn']:
+                            any_on = any(grp['led_states'])
+                            btns['all_btn'].color = "#FF00FF" if any_on else "#666666"
+                
+                # Now set all the click handlers with the update function
+                for group_data in master_led_buttons:
+                    grp = group_data['group']
+                    btns = group_data['buttons']
+                    led_rows = group_data['led_rows']
+                    
+                    # Set ALL button handler
+                    btns['all_btn'].on_click(make_all_click_handler(grp, update_master_led_button_colors))
+                    
+                    # Set row button handlers
+                    for row_idx, led_indices in enumerate(led_rows):
+                        if row_idx in btns['row_btns']:
+                            btns['row_btns'][row_idx].on_click(
+                                make_row_click_handler(grp, row_idx, led_indices, update_master_led_button_colors)
+                            )
+                    
+                    # Set LED button handlers
+                    for led_idx, led_btn in btns['led_btns'].items():
+                        led_btn.on_click(make_led_click_handler(grp, led_idx, update_master_led_button_colors))
+                
+                # Initial color update
+                update_master_led_button_colors()
+            
+            # Setup master control callbacks
+            def make_update_handler(groups_list):
+                def update_all_from_master(_):
+                    if loading_in_progress[0]:
+                        return
+                    loading_in_progress[0] = True
+                    
+                    # Build master rotation matrix
+                    rot_x_rad = np.radians(master_rot_x.value)
+                    rot_y_rad = np.radians(master_rot_y.value)
+                    rot_z_rad = np.radians(master_rot_z.value)
+                    
+                    Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
+                    Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
+                    Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
+                    R_master = Rz @ Ry @ Rx
+                    
+                    master_pos_offset = np.array([master_pos_x.value, master_pos_y.value, master_pos_z.value])
+                    
+                    for group in groups_list:
+                        group['enable'].value = master_enable.value
+                        if master_enable.value:
+                            init_pos = np.array(group.get('initial_pos', [0.0, 0.0, 0.0]))
+                            init_rot = np.array(group.get('initial_rot', [0, 0, 0]))
+                            
+                            new_pos = R_master @ init_pos + master_pos_offset
+                            group['pos_x'].value = float(new_pos[0])
+                            group['pos_y'].value = float(new_pos[1])
+                            group['pos_z'].value = float(new_pos[2])
+                            
+                            new_rot = init_rot + np.array([master_rot_x.value, master_rot_y.value, master_rot_z.value])
+                            group['rot_x'].value = int(new_rot[0])
+                            group['rot_y'].value = int(new_rot[1])
+                            group['rot_z'].value = int(new_rot[2])
+                    
+                    loading_in_progress[0] = False
+                    update_scene()
+                return update_all_from_master
+            
+            def make_remove_handler(groups_list, folder):
+                def remove_all(_):
+                    for group in groups_list:
+                        custom_groups.remove(group)
+                        group['folder'].remove()
+                    folder.remove()
+                    for template_data in template_folders[:]:
+                        if template_data['folder'] == folder:
+                            template_folders.remove(template_data)
+                    update_scene()
+                return remove_all
+            
+            update_handler = make_update_handler(created_groups)
+            remove_handler = make_remove_handler(created_groups, template_folder)
+            
+            master_enable.on_update(update_handler)
+            master_pos_x.on_update(update_handler)
+            master_pos_y.on_update(update_handler)
+            master_pos_z.on_update(update_handler)
+            master_rot_x.on_update(update_handler)
+            master_rot_y.on_update(update_handler)
+            master_rot_z.on_update(update_handler)
+            remove_template_btn.on_click(remove_handler)
+            
+            # Store template folder data
+            template_folders.append({
+                'folder': template_folder,
+                'groups': created_groups
+            })
+        
         # Load absorbers configuration if present
         absorbers_cfg = cfg.get("absorbers", {})
         if absorbers_cfg:
@@ -1172,6 +1581,44 @@ def main():
             abs3_off_y.value = abs3_data.get('y', 10.5)
             abs3_off_z.value = abs3_data.get('z', 0.0)
             abs3_rot_z.value = abs3_data.get('rot_z', 14)
+        
+        # Load STL model configuration if present
+        stl_cfg = cfg.get("stl_model")
+        if stl_cfg:
+            # Clear existing model first
+            clear_stl_model()
+            
+            # Load file path and try to load the model
+            file_path = stl_cfg.get('file_path', '')
+            if file_path and os.path.exists(file_path):
+                stl_file_path.value = file_path
+                load_stl_file()  # Load the mesh
+                
+                # Apply saved settings
+                stl_absorber_enable.value = stl_cfg.get('absorber_enable', True)
+                stl_visible.value = stl_cfg.get('visible', True)
+                stl_scale.value = stl_cfg.get('scale', 1.0)
+                
+                position = stl_cfg.get('position', [0, 0, 0])
+                stl_pos_x.value = position[0]
+                stl_pos_y.value = position[1]
+                stl_pos_z.value = position[2]
+                
+                rotation = stl_cfg.get('rotation', [0, 0, 0])
+                stl_rot_x.value = rotation[0]
+                stl_rot_y.value = rotation[1]
+                stl_rot_z.value = rotation[2]
+                
+                stl_opacity.value = stl_cfg.get('opacity', 0.8)
+                stl_wireframe.value = stl_cfg.get('wireframe', False)
+                
+                print(f"✓ STL model loaded from config: {os.path.basename(file_path)}")
+            else:
+                if file_path:
+                    print(f"⚠️ STL file not found: {file_path}")
+        else:
+            # No STL model in config, clear any existing model
+            clear_stl_model()
         
         # Recreate individual LEDs from config (skip intermediate scene updates)
         clear_all_individual_leds()
@@ -1303,6 +1750,21 @@ def main():
         abs3_off_z.value = 0.0
         abs3_rot_z.value = 14
         
+        # Clear STL model
+        clear_stl_model()
+        stl_file_path.value = ""
+        stl_absorber_enable.value = True
+        stl_visible.value = True
+        stl_scale.value = 1.0
+        stl_pos_x.value = 0.0
+        stl_pos_y.value = 0.0
+        stl_pos_z.value = 0.0
+        stl_rot_x.value = 0.0
+        stl_rot_y.value = 0.0
+        stl_rot_z.value = 0.0
+        stl_opacity.value = 0.8
+        stl_wireframe.value = False
+        
         # Re-enable callbacks
         loading_in_progress[0] = False
         
@@ -1379,6 +1841,7 @@ def main():
             master_rot_x = server.gui.add_slider("Master Rotation X (°)", min=-180, max=180, step=1, initial_value=0)
             master_rot_y = server.gui.add_slider("Master Rotation Y (°)", min=-180, max=180, step=1, initial_value=0)
             master_rot_z = server.gui.add_slider("Master Rotation Z (°)", min=-180, max=180, step=1, initial_value=0)
+            server.gui.add_html("<hr style='margin:8px 0;'>")
             remove_template_btn = server.gui.add_button("Remove Template", color="red")
         
         # Create all groups from template
@@ -1431,14 +1894,21 @@ def main():
             group_data['enable'].value = group_cfg.get('enabled', True)
             
             # Store initial offset for this group
-            initial_positions.append([pos[0], pos[1], pos[2]])
-            initial_rotations.append([
+            init_pos = [pos[0], pos[1], pos[2]]
+            init_rot = [
                 group_cfg.get('rotation_x', 0),
                 group_cfg.get('rotation_y', 0),
                 group_cfg.get('rotation_z', 0)
-            ])
+            ]
+            initial_positions.append(init_pos)
+            initial_rotations.append(init_rot)
             
-            # Hide individual group folder
+            # Mark as belonging to this template
+            group_data['template_name'] = template.get('name', template_name)
+            group_data['initial_pos'] = init_pos
+            group_data['initial_rot'] = init_rot
+            
+            # Hide individual group folder - LED controls will be in master folder
             group_data['folder'].visible = False
             
             created_groups.append(group_data)
@@ -1549,13 +2019,156 @@ def main():
             initial_positions.append([0.0, 0.0, 0.0])
             initial_rotations.append([0, 0, 0])
             
-            # Hide individual group folder
+            # Mark as belonging to this template
+            group_data['template_name'] = template.get('name', template_name)
+            group_data['initial_pos'] = [0.0, 0.0, 0.0]
+            group_data['initial_rot'] = [0, 0, 0]
+            
+            # Hide individual group folder - LED controls will be in master folder
             group_data['folder'].visible = False
             
             created_groups.append(group_data)
             
             print(f"✓ Converted {num_leds} individual LED(s) into 1 custom group with {len(led_rows_indices)} row(s)")
 
+        
+        # Add LED controls in master folder for each group
+        with template_folder:
+            server.gui.add_html("<hr style='margin:8px 0;'><b>LED Controls:</b>")
+            
+            # Store button references for dynamic color updates
+            master_led_buttons = []  # List of dicts with button references per group
+            
+            for group_idx, group in enumerate(created_groups):
+                with server.gui.add_folder(f"Group {group_idx + 1} LEDs"):
+                    # Store button references for this group
+                    group_buttons = {
+                        'all_btn': None,
+                        'row_btns': {},
+                        'led_btns': {}
+                    }
+                    
+                    # ALL button for this group
+                    group_all_btn = server.gui.add_button("ALL LEDs", color="#666666")
+                    group_buttons['all_btn'] = group_all_btn
+                    
+                    server.gui.add_html("<hr style='margin:4px 0;'>")
+                    
+                    # Row buttons
+                    led_rows = group.get('led_rows', [[0,1,2], [3,4,5], [6,7,8], [9,10,11]])
+                    for row_idx, led_indices in enumerate(led_rows):
+                        row_btn = server.gui.add_button(f"Row {row_idx + 1}", color="#666666")
+                        group_buttons['row_btns'][row_idx] = row_btn
+                        
+                        # Create row handler
+                        def make_row_click_handler(grp, r_idx, leds_in_row, update_colors_fn):
+                            def handler(_):
+                                # Toggle all LEDs in this row
+                                all_on = all(grp['led_states'][i] for i in leds_in_row if i < len(grp['led_states']))
+                                for led_i in leds_in_row:
+                                    if led_i < len(grp['led_states']):
+                                        grp['led_states'][led_i] = not all_on
+                                # Update both standard and master button colors
+                                if grp.get('update_button_colors'):
+                                    grp['update_button_colors']()
+                                update_colors_fn()
+                                update_scene()
+                            return handler
+                        
+                        # Will set handler after update function is defined
+                    
+                    server.gui.add_html("<hr style='margin:4px 0;'>")
+                    
+                    # Individual LED buttons
+                    num_leds = group.get('num_leds', 12)
+                    for led_idx in range(num_leds):
+                        initial_color = "#FF00FF" if group['led_states'][led_idx] else "#444444"
+                        led_btn = server.gui.add_button(f"LED {led_idx + 1}", color=initial_color)
+                        group_buttons['led_btns'][led_idx] = led_btn
+                        
+                        # Create LED handler
+                        def make_led_click_handler(grp, l_idx, update_colors_fn):
+                            def handler(_):
+                                if l_idx < len(grp['led_states']):
+                                    grp['led_states'][l_idx] = not grp['led_states'][l_idx]
+                                # Update both standard and master button colors
+                                if grp.get('update_button_colors'):
+                                    grp['update_button_colors']()
+                                update_colors_fn()
+                                update_scene()
+                            return handler
+                        
+                        # Will set handler after update function is defined
+                    
+                    # ALL button handler
+                    def make_all_click_handler(grp, update_colors_fn):
+                        def handler(_):
+                            # Toggle all LEDs in this group
+                            all_on = all(grp['led_states'])
+                            for i in range(len(grp['led_states'])):
+                                grp['led_states'][i] = not all_on
+                            # Update both standard and master button colors
+                            if grp.get('update_button_colors'):
+                                grp['update_button_colors']()
+                            update_colors_fn()
+                            update_scene()
+                        return handler
+                    
+                    # Will set handler after update function is defined
+                    
+                    master_led_buttons.append({
+                        'group': group,
+                        'buttons': group_buttons,
+                        'led_rows': led_rows
+                    })
+            
+            # Create function to update all master button colors
+            def update_master_led_button_colors():
+                """Update colors of all LED control buttons in master folder."""
+                for group_data in master_led_buttons:
+                    grp = group_data['group']
+                    btns = group_data['buttons']
+                    led_rows = group_data['led_rows']
+                    
+                    # Update individual LED buttons
+                    for led_idx, led_btn in btns['led_btns'].items():
+                        if led_idx < len(grp['led_states']):
+                            color = "#FF00FF" if grp['led_states'][led_idx] else "#444444"
+                            led_btn.color = color
+                    
+                    # Update row buttons
+                    for row_idx, led_indices in enumerate(led_rows):
+                        if row_idx in btns['row_btns']:
+                            any_on = any(grp['led_states'][i] for i in led_indices if i < len(grp['led_states']))
+                            btns['row_btns'][row_idx].color = "#FF00FF" if any_on else "#666666"
+                    
+                    # Update ALL button
+                    if btns['all_btn']:
+                        any_on = any(grp['led_states'])
+                        btns['all_btn'].color = "#FF00FF" if any_on else "#666666"
+            
+            # Now set all the click handlers with the update function
+            for group_data in master_led_buttons:
+                grp = group_data['group']
+                btns = group_data['buttons']
+                led_rows = group_data['led_rows']
+                
+                # Set ALL button handler
+                btns['all_btn'].on_click(make_all_click_handler(grp, update_master_led_button_colors))
+                
+                # Set row button handlers
+                for row_idx, led_indices in enumerate(led_rows):
+                    if row_idx in btns['row_btns']:
+                        btns['row_btns'][row_idx].on_click(
+                            make_row_click_handler(grp, row_idx, led_indices, update_master_led_button_colors)
+                        )
+                
+                # Set LED button handlers
+                for led_idx, led_btn in btns['led_btns'].items():
+                    led_btn.on_click(make_led_click_handler(grp, led_idx, update_master_led_button_colors))
+            
+            # Initial color update
+            update_master_led_button_colors()
         
         # Setup master control callbacks to sync all groups
         def update_all_from_master(_):
@@ -1689,7 +2302,10 @@ def main():
                     current_config_name[0] = name
                     project_loaded[0] = True
                     apply_config(cfg)
+                # Set the loaded config name in the save field for easy re-saving
+                save_name_input.value = name
                 print(f"✓ Configuration loaded: {name}")
+                print(f"  💡 Modify and click 'Save Project' to update the configuration")
 
         @save_project_btn.on_click
         def _(_):
@@ -1876,6 +2492,333 @@ def main():
         row4_chk = server.gui.add_checkbox("Row 4 on", initial_value=False)
         # Absorber controls moved to dedicated folder for clarity
 
+    # 3D Model Import (STL files)
+    stl_mesh_handle = [None]  # Store mesh handle for removal/update
+    stl_mesh_data = [None]  # Store loaded trimesh object
+    
+    with server.gui.add_folder("3D Models (STL)"):
+        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Import 3D CAD models</div>")
+        stl_file_path = server.gui.add_text("STL File Path", initial_value=r"C:\Users\gianmatteo.marietti_\Downloads\109045 E3 CAGE ASSEMBLY_Coarse.STL")
+        stl_load_button = server.gui.add_button("📂 Load STL", color="#4CAF50")
+        stl_clear_button = server.gui.add_button("🗑️ Clear Model", color="#FF5555")
+        
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        stl_absorber_enable = server.gui.add_checkbox("Enable as Light Absorber", initial_value=True)
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>When enabled, the 3D model blocks light rays</div>")
+        
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        stl_visible = server.gui.add_checkbox("Show Model", initial_value=True)
+        stl_scale = server.gui.add_slider("Scale", min=0.01, max=10.0, step=0.01, initial_value=1.0)
+        stl_pos_x = server.gui.add_slider("Position X (cm)", min=-200, max=200, step=1, initial_value=0)
+        stl_pos_y = server.gui.add_slider("Position Y (cm)", min=-200, max=200, step=1, initial_value=0)
+        stl_pos_z = server.gui.add_slider("Position Z (cm)", min=-200, max=200, step=1, initial_value=0)
+        stl_rot_x = server.gui.add_slider("Rotation X (°)", min=-180, max=180, step=1, initial_value=0)
+        stl_rot_y = server.gui.add_slider("Rotation Y (°)", min=-180, max=180, step=1, initial_value=0)
+        stl_rot_z = server.gui.add_slider("Rotation Z (°)", min=-180, max=180, step=1, initial_value=0)
+        stl_opacity = server.gui.add_slider("Opacity", min=0.0, max=1.0, step=0.05, initial_value=0.8)
+        stl_wireframe = server.gui.add_checkbox("Wireframe", initial_value=False)
+        
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        update_mesh_lighting_btn = server.gui.add_button("🔆 Update Mesh Lighting", color="#FFA500")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Recalculate lighting based on current LED configuration</div>")
+        
+        stl_info_html = server.gui.add_html(
+            "<div style='font-family: sans-serif; font-size: 11px; color: #666;'>"
+            "No model loaded"
+            "</div>"
+        )
+        
+        def load_stl_file():
+            """Load STL file and display in scene."""
+            file_path = stl_file_path.value.strip()
+            if not file_path:
+                print("⚠️ Please enter a file path")
+                return
+            
+            if not os.path.exists(file_path):
+                print(f"⚠️ File not found: {file_path}")
+                return
+            
+            try:
+                print(f"Loading STL file: {file_path}")
+                mesh = trimesh.load(file_path)
+                
+                # Handle multiple meshes (Scene object)
+                if isinstance(mesh, trimesh.Scene):
+                    # Combine all meshes in the scene
+                    mesh = trimesh.util.concatenate(
+                        [geom for geom in mesh.geometry.values() if isinstance(geom, trimesh.Trimesh)]
+                    )
+                
+                # Center mesh at origin (move centroid to 0,0,0)
+                mesh.vertices -= mesh.centroid
+                
+                stl_mesh_data[0] = mesh
+                
+                # Calculate mesh dimensions
+                num_vertices = len(mesh.vertices)
+                num_faces = len(mesh.faces)
+                bounds = mesh.bounds
+                size = bounds[1] - bounds[0]
+                
+                # Auto-calculate ideal scale for this project
+                # Project uses cm scale, typical diameter ~70cm (2 * radius 35cm)
+                # Assume largest dimension should be around 70cm in project space
+                target_size_cm = 70.0  # Target size in cm
+                max_dimension = np.max(size)
+                
+                if max_dimension > 0:
+                    # Calculate scale: target_size / current_size
+                    # Note: mesh is in STL units (usually mm), we want it in cm for display
+                    ideal_scale = target_size_cm / max_dimension
+                    stl_scale.value = ideal_scale
+                    print(f"Auto-scale applied: {ideal_scale:.4f} (model size: {max_dimension:.1f} → {target_size_cm}cm)")
+                
+                # Update info
+                info_text = (
+                    f"<div style='font-family: sans-serif; font-size: 11px; color: #4CAF50;'>"
+                    f"✓ Model loaded<br>"
+                    f"Vertices: {num_vertices:,}<br>"
+                    f"Faces: {num_faces:,}<br>"
+                    f"Original size: {size[0]:.1f} × {size[1]:.1f} × {size[2]:.1f}<br>"
+                    f"Scaled size: {size[0]*ideal_scale:.1f} × {size[1]*ideal_scale:.1f} × {size[2]*ideal_scale:.1f} cm"
+                    f"</div>"
+                )
+                stl_info_html.content = info_text
+                
+                print(f"✓ STL loaded: {num_vertices:,} vertices, {num_faces:,} faces")
+                update_stl_mesh()
+                
+            except Exception as e:
+                print(f"❌ Error loading STL: {e}")
+                stl_info_html.content = f"<div style='color:#FF5555;'>Error: {str(e)}</div>"
+        
+        def update_stl_mesh():
+            """Update STL mesh visualization in scene."""
+            nonlocal stl_mesh_handle
+            
+            try:
+                # Remove existing mesh
+                if stl_mesh_handle[0] is not None:
+                    try:
+                        stl_mesh_handle[0].remove()
+                    except:
+                        pass
+                    stl_mesh_handle[0] = None
+                
+                # Add mesh if loaded and visible
+                if stl_mesh_data[0] is not None and stl_visible.value:
+                    mesh = stl_mesh_data[0].copy()
+                    
+                    # Validate values (protect against NaN)
+                    scale = float(stl_scale.value)
+                    if not np.isfinite(scale) or scale <= 0:
+                        scale = 1.0
+                    
+                    pos_x = float(stl_pos_x.value)
+                    pos_y = float(stl_pos_y.value)
+                    pos_z = float(stl_pos_z.value)
+                    if not np.isfinite(pos_x):
+                        pos_x = 0.0
+                    if not np.isfinite(pos_y):
+                        pos_y = 0.0
+                    if not np.isfinite(pos_z):
+                        pos_z = 0.0
+                    
+                    rot_x = float(stl_rot_x.value)
+                    rot_y = float(stl_rot_y.value)
+                    rot_z = float(stl_rot_z.value)
+                    if not np.isfinite(rot_x):
+                        rot_x = 0.0
+                    if not np.isfinite(rot_y):
+                        rot_y = 0.0
+                    if not np.isfinite(rot_z):
+                        rot_z = 0.0
+                    
+                    opacity = float(stl_opacity.value)
+                    if not np.isfinite(opacity):
+                        opacity = 0.8
+                    
+                    # Calculate original and scaled sizes for info display
+                    orig_mesh = stl_mesh_data[0]
+                    bounds = orig_mesh.bounds
+                    orig_size = bounds[1] - bounds[0]
+                    scaled_size = orig_size * scale
+                    
+                    # Update info display with current scale
+                    num_vertices = len(orig_mesh.vertices)
+                    num_faces = len(orig_mesh.faces)
+                    info_text = (
+                        f"<div style='font-family: sans-serif; font-size: 11px; color: #4CAF50;'>"
+                        f"✓ Model loaded<br>"
+                        f"Vertices: {num_vertices:,}<br>"
+                        f"Faces: {num_faces:,}<br>"
+                        f"Original size: {orig_size[0]:.1f} × {orig_size[1]:.1f} × {orig_size[2]:.1f}<br>"
+                        f"Scaled size: {scaled_size[0]:.1f} × {scaled_size[1]:.1f} × {scaled_size[2]:.1f} cm"
+                        f"</div>"
+                    )
+                    stl_info_html.content = info_text
+                    
+                    # Apply transformations by creating a transformed copy
+                    # This prevents the original mesh from being modified
+                    
+                    # Get original vertices and faces
+                    orig_vertices = mesh.vertices.copy()
+                    orig_faces = mesh.faces.copy()
+                    
+                    # Build transformation matrix: Scale * Rotation * Translation
+                    # 1. Scale matrix
+                    T_scale = np.eye(4)
+                    T_scale[0, 0] = scale
+                    T_scale[1, 1] = scale
+                    T_scale[2, 2] = scale
+                    
+                    # 2. Rotation matrices
+                    T_rot = np.eye(4)
+                    if rot_x != 0:
+                        T_rot = T_rot @ trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
+                    if rot_y != 0:
+                        T_rot = T_rot @ trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
+                    if rot_z != 0:
+                        T_rot = T_rot @ trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
+                    
+                    # 3. Translation matrix (in cm, will be converted to meters later)
+                    T_trans = trimesh.transformations.translation_matrix([pos_x, pos_y, pos_z])
+                    
+                    # 4. Final cm to meters conversion
+                    T_to_meters = np.eye(4) * 0.01  # Scale by 0.01
+                    T_to_meters[3, 3] = 1.0  # Keep homogeneous coordinate
+                    
+                    # Combine: first scale, then rotate, then translate, then convert to meters
+                    T_combined = T_to_meters @ T_trans @ T_rot @ T_scale
+                    
+                    # Apply combined transform to vertices
+                    vertices_homogeneous = np.hstack([orig_vertices, np.ones((len(orig_vertices), 1))])
+                    vertices_transformed = (T_combined @ vertices_homogeneous.T).T[:, :3]
+                    
+                    # Transform normals (rotation only, no translation or scale for normals)
+                    # Use the upper-left 3x3 of the rotation matrix
+                    R_only = T_rot[:3, :3]
+                    normals_transformed = (R_only @ mesh.vertex_normals.T).T
+                    # Normalize
+                    normals_transformed = normals_transformed / (np.linalg.norm(normals_transformed, axis=1, keepdims=True) + 1e-10)
+                    
+                    # Create new mesh with transformed vertices
+                    from trimesh import Trimesh
+                    mesh_transformed = Trimesh(
+                        vertices=vertices_transformed.astype(np.float32),
+                        faces=orig_faces,
+                        vertex_normals=normals_transformed.astype(np.float32),
+                        process=False  # Don't recompute normals
+                    )
+                    
+                    vertices = mesh_transformed.vertices
+                    faces = mesh_transformed.faces
+                    vertex_normals = mesh_transformed.vertex_normals
+                    
+                    # For lighting calculation, vertices are already in world space (meters)
+                    vertices_world = vertices
+                    
+                    # Calculate dynamic lighting based on current LEDs
+                    base_color = (0.7, 0.7, 0.9)  # Light blue base color
+                    vertex_colors = calculate_mesh_lighting(
+                        vertices_world, 
+                        vertex_normals, 
+                        current_leds,
+                        base_color=base_color
+                    )
+                    
+                    # Set vertex colors on the mesh before adding to scene
+                    # Convert to uint8 RGBA format (Viser/Three.js expects 0-255 range)
+                    vertex_colors_uint8 = (vertex_colors * 255).astype(np.uint8)
+                    # Add alpha channel with user-controlled opacity
+                    alpha_value = int(opacity * 255)
+                    vertex_colors_rgba = np.concatenate([
+                        vertex_colors_uint8,
+                        np.full((len(vertex_colors_uint8), 1), alpha_value, dtype=np.uint8)
+                    ], axis=1)
+                    
+                    # Assign to mesh visual
+                    from trimesh.visual import ColorVisuals
+                    mesh_transformed.visual = ColorVisuals(mesh=mesh_transformed, vertex_colors=vertex_colors_rgba)
+                    
+                    # Add to scene
+                    # Note: add_mesh_trimesh doesn't support opacity and wireframe parameters
+                    # Opacity is controlled via alpha channel in vertex colors
+                    # Wireframe mode is not supported with per-vertex colors
+                    # Position, rotation, and scale are already baked into the mesh
+                    stl_mesh_handle[0] = server.scene.add_mesh_trimesh(
+                        name="/stl_model",
+                        mesh=mesh_transformed,
+                        visible=True,
+                    )
+            except Exception as e:
+                print(f"Error updating STL mesh: {e}")
+        
+        def clear_stl_model():
+            """Clear loaded STL model."""
+            nonlocal stl_mesh_handle
+            if stl_mesh_handle[0] is not None:
+                try:
+                    stl_mesh_handle[0].remove()
+                except:
+                    pass
+                stl_mesh_handle[0] = None
+            stl_mesh_data[0] = None
+            stl_info_html.content = "<div style='color:#666;'>No model loaded</div>"
+            print("STL model cleared")
+        
+        # Button callbacks
+        @stl_load_button.on_click
+        def _(_):
+            load_stl_file()
+        
+        @stl_clear_button.on_click
+        def _(_):
+            clear_stl_model()
+        
+        @update_mesh_lighting_btn.on_click
+        def _(_):
+            try:
+                if stl_mesh_data[0] is not None:
+                    update_stl_mesh()
+                    print("✓ Mesh lighting updated")
+                else:
+                    print("⚠️ No mesh loaded")
+            except Exception as e:
+                print(f"Error updating mesh lighting: {e}")
+        
+        # Update mesh when parameters change (with error protection)
+        def safe_update_stl(_):
+            try:
+                update_stl_mesh()
+                # Update ray visualization with new STL mesh
+                update_scene()
+                # Note: Intensity calculations remain manual (use update buttons)
+            except Exception as e:
+                print(f"Error in STL update callback: {e}")
+        
+        def safe_update_stl_absorber(_):
+            """Update when STL absorber enable/disable changes - affects ray blocking."""
+            try:
+                # Update ray visualization with new STL absorber state
+                update_scene()
+                # Note: Intensity calculations remain manual (use update buttons)
+            except Exception as e:
+                print(f"Error in STL absorber update callback: {e}")
+        
+        stl_visible.on_update(safe_update_stl)
+        stl_scale.on_update(safe_update_stl)
+        stl_pos_x.on_update(safe_update_stl)
+        stl_pos_y.on_update(safe_update_stl)
+        stl_pos_z.on_update(safe_update_stl)
+        stl_rot_x.on_update(safe_update_stl)
+        stl_rot_y.on_update(safe_update_stl)
+        stl_rot_z.on_update(safe_update_stl)
+        stl_opacity.on_update(safe_update_stl)
+        stl_wireframe.on_update(safe_update_stl)
+        stl_absorber_enable.on_update(safe_update_stl_absorber)
+
     # Room Mode - Cubic room with 5 walls (no back wall behind LEDs)
     with server.gui.add_folder("Room Mode"):
         room_mode_enable = server.gui.add_checkbox("Enable Room Mode", initial_value=False)
@@ -1917,6 +2860,93 @@ def main():
     room_intensity_handles = []
     room_wall_handles = []
     absorber_handles = []
+    
+    # Store current LED objects (for reuse in room intensity calculation)
+    current_leds = []
+
+    def calculate_mesh_lighting(mesh_vertices, mesh_normals, leds, base_color=(0.7, 0.7, 0.9)):
+        """
+        Calculate per-vertex lighting for STL mesh using Lambert's cosine law.
+        
+        Args:
+            mesh_vertices: Nx3 array of vertex positions in meters (Viser units)
+            mesh_normals: Nx3 array of vertex normals
+            leds: List of LED objects with position, direction, enabled
+            base_color: RGB tuple for base mesh color (0-1 range)
+        
+        Returns:
+            Nx3 array of RGB colors for each vertex
+        """
+        num_vertices = len(mesh_vertices)
+        vertex_colors = np.zeros((num_vertices, 3), dtype=np.float32)
+        
+        # Base ambient lighting (minimum visibility)
+        ambient = 0.15  # 15% ambient light
+        vertex_colors[:] = np.array(base_color) * ambient
+        
+        # Get only enabled LEDs
+        active_leds = [led for led in leds if getattr(led, 'enabled', True)]
+        
+        if len(active_leds) == 0:
+            return vertex_colors
+        
+        # For each active LED, calculate contribution to each vertex
+        for led in active_leds:
+            # LED position in cm, convert to meters
+            led_pos_m = np.array(led.position) / 100.0
+            led_dir = np.array(led.direction)
+            led_dir_norm = led_dir / (np.linalg.norm(led_dir) + 1e-10)
+            
+            # Vector from LED to each vertex
+            to_vertex = mesh_vertices - led_pos_m  # Shape: (N, 3)
+            distances = np.linalg.norm(to_vertex, axis=1, keepdims=True) + 1e-6  # Avoid division by zero
+            to_vertex_norm = to_vertex / distances  # Normalized direction to vertex
+            
+            # Check if vertex is within LED's viewing cone
+            # Dot product between LED direction and direction to vertex
+            cos_angle_to_vertex = np.sum(led_dir_norm * to_vertex_norm, axis=1, keepdims=True)
+            viewing_half_angle_rad = np.radians(led.viewing_angle / 2.0)
+            cos_half_angle = np.cos(viewing_half_angle_rad)
+            
+            # Only illuminate vertices within viewing cone
+            in_cone = (cos_angle_to_vertex > cos_half_angle).flatten()
+            
+            if np.sum(in_cone) == 0:
+                continue
+            
+            # Lambert's cosine law: intensity = max(0, N · L)
+            # N = surface normal, L = direction from surface to light
+            cos_incident = np.sum(mesh_normals * (-to_vertex_norm), axis=1, keepdims=True)
+            cos_incident = np.maximum(0, cos_incident)  # Only positive (facing the light)
+            
+            # Distance attenuation: 1/d²
+            # Scale by 100 to account for cm->m conversion and make falloff reasonable
+            distance_attenuation = 100.0 / (distances ** 2 + 1.0)
+            
+            # Viewing angle attenuation (smooth falloff at cone edges)
+            # Smooth transition from 1.0 at center to 0.0 at edge
+            angle_attenuation = np.maximum(0, (cos_angle_to_vertex - cos_half_angle) / (1.0 - cos_half_angle))
+            angle_attenuation = angle_attenuation ** 2  # Squared for smoother falloff
+            
+            # Combined intensity (only for vertices in cone)
+            intensity = np.zeros((num_vertices, 1), dtype=np.float32)
+            intensity[in_cone] = (cos_incident[in_cone] * 
+                                  distance_attenuation[in_cone] * 
+                                  angle_attenuation[in_cone])
+            
+            # LED color contribution (use LED's RGB color)
+            led_color = np.array(led.color) if hasattr(led, 'color') else np.array([1.0, 1.0, 1.0])
+            
+            # Add this LED's contribution to vertex colors
+            # Scale intensity to reasonable range (tunable parameter)
+            brightness_scale = 0.8  # Adjust this to control overall brightness
+            vertex_colors += intensity * led_color * brightness_scale
+        
+        # Multiply by base color and clamp to [0, 1]
+        vertex_colors = vertex_colors * np.array(base_color)
+        vertex_colors = np.clip(vertex_colors, 0.0, 1.0)
+        
+        return vertex_colors
 
     # Absorbers folder (separate group for easier access)
     absorbers_folder = server.gui.add_folder("Absorbers")
@@ -2037,6 +3067,9 @@ def main():
             'row_buttons': row_buttons,
             'led_buttons': led_buttons,
             'update_button_colors': None,  # Will be set after function definition
+            'template_name': None,  # Will be set if created from template
+            'initial_pos': [0.0, 0.0, 0.0],  # Initial position before master transforms
+            'initial_rot': [0, 0, 0],  # Initial rotation before master transforms
         }
         
         # Function to update button colors based on LED states
@@ -2271,7 +3304,7 @@ def main():
 
 
     def compute_wall_intensity(
-        leds, wall_dist, num_rays_per_led, grid_size=50, wall_size=80, absorbers=None
+        leds, wall_dist, num_rays_per_led, grid_size=50, wall_size=80, absorbers=None, stl_mesh_data=None
     ):
         """Trace rays and compute intensity grid on wall."""
         # Grid covers -wall_size/2 to +wall_size/2 cm in Y and Z
@@ -2345,7 +3378,8 @@ def main():
                 'grid_size': grid_size,
                 'wall_size': wall_size,
                 'lumens_per_led': lumens_per_led,
-                'absorbers': absorbers,
+                'absorbers': absorbers if absorbers else [],
+                'stl_mesh_data': stl_mesh_data,
                 'ray_uniformity': ray_uniformity,
                 'led_idx': led_idx,
             }
@@ -2367,7 +3401,7 @@ def main():
         return grid, wall_size
 
     def compute_room_intensity(
-        leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, absorbers=None
+        leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, absorbers=None, stl_mesh_data=None
     ):
         """Trace rays and compute intensity grids on all 5 room walls using multiprocessing."""
         
@@ -2462,7 +3496,8 @@ def main():
             'num_rays_per_led': num_rays_per_led,
             'grid_size': grid_size,
             'lumens_per_led': lumens_per_led,
-            'absorbers': absorbers,
+            'absorbers': absorbers if absorbers else [],
+            'stl_mesh_data': stl_mesh_data,
             'ray_uniformity': ray_uniformity,
             'grid_shapes': grid_shapes,
             'wall_specs': wall_specs
@@ -2906,6 +3941,45 @@ def main():
                         hit_absorbed = True
                         break
                 
+                # Check STL mesh intersection
+                if not hit_absorbed and stl_absorber_enable.value and stl_mesh_data[0] is not None:
+                    mesh = stl_mesh_data[0].copy()
+                    
+                    # Build transformation matrix  (same as before)
+                    transform = np.eye(4)
+                    scale = float(stl_scale.value)
+                    if np.isfinite(scale) and scale > 0:
+                        transform[:3, :3] *= scale
+                    
+                    rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
+                    rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
+                    rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
+                    
+                    if rot_x != 0:
+                        rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
+                        transform = rot_mat @ transform
+                    if rot_y != 0:
+                        rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
+                        transform = rot_mat @ transform
+                    if rot_z != 0:
+                        rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
+                        transform = rot_mat @ transform
+                    
+                    pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
+                    pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
+                    pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
+                    transform[:3, 3] = [pos_x, pos_y, pos_z]
+                    
+                    mesh_data_ray = {
+                        'vertices': mesh.vertices,
+                        'faces': mesh.faces,
+                        'transform': transform
+                    }
+                    
+                    t_hit = _ray_mesh_intersection(led.position, world_dir, mesh_data_ray)
+                    if t_hit is not None and t_hit > 0:
+                        hit_absorbed = True
+                
                 if hit_absorbed:
                     continue
                 
@@ -3290,10 +4364,52 @@ def main():
                 'rotation': (qw, qx, qy, qz),
             })
         
+        # Prepare STL mesh data for ray tracing if enabled
+        stl_mesh_for_raytracing = None
+        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
+            # Prepare transformation matrix for STL mesh
+            mesh = stl_mesh_data[0].copy()
+            
+            # Build transformation matrix
+            transform = np.eye(4)
+            
+            # Apply scale
+            scale = float(stl_scale.value)
+            if np.isfinite(scale) and scale > 0:
+                transform[:3, :3] *= scale
+            
+            # Apply rotations
+            rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
+            rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
+            rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
+            
+            if rot_x != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
+                transform = rot_mat @ transform
+            if rot_y != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
+                transform = rot_mat @ transform
+            if rot_z != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
+                transform = rot_mat @ transform
+            
+            # Apply translation (convert cm to same units as LED positions)
+            pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
+            pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
+            pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
+            transform[:3, 3] = [pos_x, pos_y, pos_z]
+            
+            stl_mesh_for_raytracing = {
+                'vertices': mesh.vertices,
+                'faces': mesh.faces,
+                'transform': transform
+            }
+            print(f"STL mesh enabled as light absorber ({len(mesh.faces)} triangles)")
+        
         # Compute intensity with rays_per_pixel from slider
         rays_per_pixel = int(intensity_rays_slider.value)
         intensity_grid, actual_wall_size = compute_wall_intensity(
-            leds, wall_dist, rays_per_pixel, grid_size, wall_size, absorbers=absorbers
+            leds, wall_dist, rays_per_pixel, grid_size, wall_size, absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
         )
         # Clean up any NaN or Inf values in the grid
         intensity_grid = np.nan_to_num(intensity_grid, nan=0.0, posinf=0.0, neginf=0.0)
@@ -3491,155 +4607,21 @@ def main():
         top_bottom_dist = room_top_bottom_dist.value
         grid_size = int(room_grid_size.value)
         
-        # Get current LEDs configuration (fixed angles: front=0°, side=90°)
-        front_angle = 0.0  # Fixed front angle
-        side_angle = 90.0  # Fixed side angle
-        viewing_angle = viewing_angle_slider.value
+        # Use LEDs from current scene (already created in update_scene)
+        leds = current_leds
+        if not leds:
+            print("Error: No LEDs available. Update scene first.")
+            return
+        
+        # Build absorbers (still needed for room mode)
+        absorbers = []
+        
+        # Get current geometry values for absorber calculation
+        front_angle = 0.0
         radius = radius_slider.value
         circle_center_x = circle_center_slider.value
         
-        rotations = [
-            rot_front_pos.value,
-            rot_front_neg.value,
-            rot_side_pos.value,
-            rot_side_neg.value,
-        ]
-        
-        rotations_y = [
-            rot_y_front_pos.value,
-            rot_y_front_neg.value,
-            rot_y_side_pos.value,
-            rot_y_side_neg.value,
-        ]
-        
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
-        
-        # Build custom groups configs list
-        custom_groups_configs = []
-        for group in custom_groups:
-            config = {
-                'enabled': group['enable'].value,
-                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
-                'rotation_y': group['rot_y'].value,
-                'rotation_z': group['rot_z'].value,
-                'led_states': group['led_states'],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            }
-            # Add dynamic group info if present
-            if group.get('is_dynamic', False):
-                config['num_leds'] = group.get('num_leds', 0)
-                
-                # Get rotation angles
-                rot_x_deg = group['rot_x'].value if 'rot_x' in group else 0
-                rot_y_deg = group['rot_y'].value
-                rot_z_deg = group['rot_z'].value
-                
-                # Convert to radians
-                rot_x_rad = np.radians(rot_x_deg)
-                rot_y_rad = np.radians(rot_y_deg)
-                rot_z_rad = np.radians(rot_z_deg)
-                
-                # Rotation matrices
-                # Rotation around X axis (red)
-                Rx = np.array([
-                    [1, 0, 0],
-                    [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)],
-                    [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]
-                ])
-                
-                # Rotation around Y axis (green)
-                Ry = np.array([
-                    [np.cos(rot_y_rad), 0, np.sin(rot_y_rad)],
-                    [0, 1, 0],
-                    [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]
-                ])
-                
-                # Rotation around Z axis (blue)
-                Rz = np.array([
-                    [np.cos(rot_z_rad), -np.sin(rot_z_rad), 0],
-                    [np.sin(rot_z_rad), np.cos(rot_z_rad), 0],
-                    [0, 0, 1]
-                ])
-                
-                # Combined rotation: Rz * Ry * Rx
-                R_combined = Rz @ Ry @ Rx
-                
-                # Calculate center of original positions
-                original_positions = group.get('led_positions', [])
-                if original_positions:
-                    positions_array = np.array(original_positions)
-                    center = positions_array.mean(axis=0)
-                else:
-                    center = np.array([0.0, 0.0, 0.0])
-                
-                # Apply rotation to positions (around center) and then translation
-                position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                rotated_positions = []
-                for orig_pos in original_positions:
-                    # Move to origin (relative to center)
-                    pos_relative = np.array(orig_pos) - center
-                    # Rotate
-                    rotated_relative = R_combined @ pos_relative
-                    # Move back and apply translation offset
-                    final_pos = rotated_relative + center + position_offset
-                    rotated_positions.append(tuple(final_pos))
-                
-                # Apply rotations to LED directions
-                # original_rotations now contains direction vectors, not angles
-                original_rotations = group.get('led_rotations', [])
-                rotated_directions = []
-                for orig_dir in original_rotations:
-                    # Direct rotation of direction vector
-                    dir_array = np.array(orig_dir)
-                    rotated_dir = R_combined @ dir_array
-                    rotated_directions.append(tuple(rotated_dir))
-                
-                config['led_positions'] = rotated_positions
-                config['led_rotations'] = rotated_directions
-                config['led_sizes'] = group.get('led_sizes', [])
-            custom_groups_configs.append(config)
-        
-        # Build individual LEDs configs list
-        individual_leds_configs = []
-        for led in individual_leds:
-            config = {
-                'enabled': led['enable'].value,
-                'led_on': led.get('led_on', True),
-                'pos_x': led['pos_x'].value,
-                'pos_y': led['pos_y'].value,
-                'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value,
-                'rot_y': led['rot_y'].value,
-                'rot_z': led['rot_z'].value,
-                'size': led['size'].value,
-            }
-            individual_leds_configs.append(config)
-        
-        leds = create_leds(
-            front_angle,
-            side_angle,
-            viewing_angle,
-            radius,
-            circle_center_x,
-            group_rotations=rotations,
-            group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states,
-            group_offsets=offsets,
-            custom_groups_configs=custom_groups_configs,
-            individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
-        )
-        
-        # Build absorbers
-        absorbers = []
-        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
+        angles_deg = [front_angle, -front_angle, 90.0, -90.0]
         for i, angle_deg in enumerate(angles_deg):
             if i not in (0, 1):
                 continue
@@ -3723,8 +4705,51 @@ def main():
         
         # Compute room intensity
         rays_per_pixel = int(intensity_rays_slider.value)
+        
+        # Prepare STL mesh data for ray tracing if enabled
+        stl_mesh_for_raytracing = None
+        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
+            # Prepare transformation matrix for STL mesh
+            mesh = stl_mesh_data[0].copy()
+            
+            # Build transformation matrix
+            transform = np.eye(4)
+            
+            # Apply scale
+            scale = float(stl_scale.value)
+            if np.isfinite(scale) and scale > 0:
+                transform[:3, :3] *= scale
+            
+            # Apply rotations
+            rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
+            rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
+            rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
+            
+            if rot_x != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
+                transform = rot_mat @ transform
+            if rot_y != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
+                transform = rot_mat @ transform
+            if rot_z != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
+                transform = rot_mat @ transform
+            
+            # Apply translation (convert cm to same units as LED positions)
+            pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
+            pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
+            pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
+            transform[:3, 3] = [pos_x, pos_y, pos_z]
+            
+            stl_mesh_for_raytracing = {
+                'vertices': mesh.vertices,
+                'faces': mesh.faces,
+                'transform': transform
+            }
+            print(f"STL mesh enabled as light absorber ({len(mesh.faces)} triangles)")
+        
         grids, wall_specs = compute_room_intensity(
-            leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, absorbers=absorbers
+            leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
         )
         
         # Find max lux across all walls for color normalization
@@ -3755,88 +4780,88 @@ def main():
             for gi in range(grid_shape[0]):
                 for gj in range(grid_shape[1]):
                     intensity = intensity_grid[gi, gj]
-                    if intensity > 0:
-                        color = intensity_to_color(intensity, max_lux)
-                        
-                        # Calculate cell position based on wall orientation
-                        # Position cells exactly on wall surfaces (same as gray walls)
-                        if wall_name == 'front':
-                            # YZ plane at x=front_dist
-                            size_y = wall_spec['size_y']
-                            size_z = wall_spec['size_z']
-                            grid_y = wall_spec['grid_y']
-                            grid_z = wall_spec['grid_z']
-                            cell_size_y = size_y / grid_y
-                            cell_size_z = size_z / grid_z
-                            x_pos = front_dist / 100.0
-                            y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
-                            z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                            dims = (0.01, cell_size_y / 100.0 * 0.98, cell_size_z / 100.0 * 0.98)
-                        
-                        elif wall_name == 'left':
-                            # XZ plane at y=-side_dist
-                            size_x = wall_spec['size_x']
-                            size_z = wall_spec['size_z']
-                            grid_x = wall_spec['grid_x']
-                            grid_z = wall_spec['grid_z']
-                            x_min = wall_spec['x_min']
-                            cell_size_x = size_x / grid_x
-                            cell_size_z = size_z / grid_z
-                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                            y_pos = -side_dist / 100.0
-                            z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                            dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
-                        
-                        elif wall_name == 'right':
-                            # XZ plane at y=+side_dist
-                            size_x = wall_spec['size_x']
-                            size_z = wall_spec['size_z']
-                            grid_x = wall_spec['grid_x']
-                            grid_z = wall_spec['grid_z']
-                            x_min = wall_spec['x_min']
-                            cell_size_x = size_x / grid_x
-                            cell_size_z = size_z / grid_z
-                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                            y_pos = side_dist / 100.0
-                            z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                            dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
-                        
-                        elif wall_name == 'top':
-                            # XY plane at z=+top_bottom_dist
-                            size_x = wall_spec['size_x']
-                            size_y = wall_spec['size_y']
-                            grid_x = wall_spec['grid_x']
-                            grid_y = wall_spec['grid_y']
-                            x_min = wall_spec['x_min']
-                            cell_size_x = size_x / grid_x
-                            cell_size_y = size_y / grid_y
-                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                            y_pos = (-size_y/2 + (grid_shape[0] - 1 - gi) * cell_size_y + cell_size_y / 2) / 100.0
-                            z_pos = top_bottom_dist / 100.0
-                            dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
-                        
-                        elif wall_name == 'bottom':
-                            # XY plane at z=-top_bottom_dist
-                            size_x = wall_spec['size_x']
-                            size_y = wall_spec['size_y']
-                            grid_x = wall_spec['grid_x']
-                            grid_y = wall_spec['grid_y']
-                            x_min = wall_spec['x_min']
-                            cell_size_x = size_x / grid_x
-                            cell_size_y = size_y / grid_y
-                            x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                            y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
-                            z_pos = -top_bottom_dist / 100.0
-                            dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
-                        
-                        handle = server.scene.add_box(
-                            f"/room_intensity/{wall_name}/cell_{gi}_{gj}",
-                            dimensions=dims,
-                            color=color,
-                            position=(x_pos, y_pos, z_pos),
-                        )
-                        room_intensity_handles.append(handle)
-                        cells_created[wall_name] += 1
+                    # Create ALL cells (even with zero intensity) to show full wall dimensions
+                    color = intensity_to_color(intensity, max_lux)
+                    
+                    # Calculate cell position based on wall orientation
+                    # Position cells exactly on wall surfaces (same as gray walls)
+                    if wall_name == 'front':
+                        # YZ plane at x=front_dist
+                        size_y = wall_spec['size_y']
+                        size_z = wall_spec['size_z']
+                        grid_y = wall_spec['grid_y']
+                        grid_z = wall_spec['grid_z']
+                        cell_size_y = size_y / grid_y
+                        cell_size_z = size_z / grid_z
+                        x_pos = front_dist / 100.0
+                        y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
+                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        dims = (0.01, cell_size_y / 100.0 * 0.98, cell_size_z / 100.0 * 0.98)
+                    
+                    elif wall_name == 'left':
+                        # XZ plane at y=-side_dist
+                        size_x = wall_spec['size_x']
+                        size_z = wall_spec['size_z']
+                        grid_x = wall_spec['grid_x']
+                        grid_z = wall_spec['grid_z']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_z = size_z / grid_z
+                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_pos = -side_dist / 100.0
+                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
+                    
+                    elif wall_name == 'right':
+                        # XZ plane at y=+side_dist
+                        size_x = wall_spec['size_x']
+                        size_z = wall_spec['size_z']
+                        grid_x = wall_spec['grid_x']
+                        grid_z = wall_spec['grid_z']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_z = size_z / grid_z
+                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_pos = side_dist / 100.0
+                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
+                    
+                    elif wall_name == 'top':
+                        # XY plane at z=+top_bottom_dist
+                        size_x = wall_spec['size_x']
+                        size_y = wall_spec['size_y']
+                        grid_x = wall_spec['grid_x']
+                        grid_y = wall_spec['grid_y']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_y = size_y / grid_y
+                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_pos = (-size_y/2 + (grid_shape[0] - 1 - gi) * cell_size_y + cell_size_y / 2) / 100.0
+                        z_pos = top_bottom_dist / 100.0
+                        dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
+                    
+                    elif wall_name == 'bottom':
+                        # XY plane at z=-top_bottom_dist
+                        size_x = wall_spec['size_x']
+                        size_y = wall_spec['size_y']
+                        grid_x = wall_spec['grid_x']
+                        grid_y = wall_spec['grid_y']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_y = size_y / grid_y
+                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
+                        z_pos = -top_bottom_dist / 100.0
+                        dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
+                    
+                    handle = server.scene.add_box(
+                        f"/room_intensity/{wall_name}/cell_{gi}_{gj}",
+                        dimensions=dims,
+                        color=color,
+                        position=(x_pos, y_pos, z_pos),
+                    )
+                    room_intensity_handles.append(handle)
+                    cells_created[wall_name] += 1
         
         print(f"Cells visualized:")
         for wall_name, count in cells_created.items():
@@ -3875,7 +4900,7 @@ def main():
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles
+        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, current_leds
 
         # Ray-box intersection helper for update_scene (positions in cm)
         def ray_box_intersection(pos, direction, box):
@@ -3914,7 +4939,7 @@ def main():
                     tmin = max(tmin, t_near)
                     tmax = min(tmax, t_far)
                     if tmin > tmax:
-                        return None
+                       return None
             if tmax < 0:
                 return None
             return tmin if tmin > 0 else (tmax if tmax > 0 else None)
@@ -4079,6 +5104,9 @@ def main():
             individual_leds_configs=individual_leds_configs,
             create_base_groups=any(led_states[:48]),
         )
+        
+        # Save LEDs for reuse in room intensity calculation
+        current_leds = leds
         
         # Build absorbers
         absorbers = []
@@ -4289,6 +5317,46 @@ def main():
                     )
                     led_handles.append(handle)
 
+        # Prepare STL mesh data for ray tracing visualization if enabled
+        stl_mesh_for_raytracing = None
+        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
+            mesh = stl_mesh_data[0].copy()
+            
+            # Build transformation matrix
+            transform = np.eye(4)
+            
+            # Apply scale
+            scale = float(stl_scale.value)
+            if np.isfinite(scale) and scale > 0:
+                transform[:3, :3] *= scale
+            
+            # Apply rotations
+            rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
+            rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
+            rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
+            
+            if rot_x != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
+                transform = rot_mat @ transform
+            if rot_y != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
+                transform = rot_mat @ transform
+            if rot_z != 0:
+                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
+                transform = rot_mat @ transform
+            
+            # Apply translation
+            pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
+            pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
+            pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
+            transform[:3, 3] = [pos_x, pos_y, pos_z]
+            
+            stl_mesh_for_raytracing = {
+                'vertices': mesh.vertices,
+                'faces': mesh.faces,
+                'transform': transform
+            }
+
         # Draw rays (toggleable)
         if show_rays_output.value:
             for i, led in enumerate(leds):
@@ -4308,6 +5376,13 @@ def main():
                             if t_hit is not None and t_hit > 0:
                                 if t_abs_min is None or t_hit < t_abs_min:
                                     t_abs_min = t_hit
+                    
+                    # Check STL mesh intersection
+                    if stl_mesh_for_raytracing is not None:
+                        t_stl = _ray_mesh_intersection(pos, direction, stl_mesh_for_raytracing)
+                        if t_stl is not None and t_stl > 0:
+                            if t_abs_min is None or t_stl < t_abs_min:
+                                t_abs_min = t_stl
 
                     # Clip at wall(s) - if room mode, check all 5 walls
                     t_wall = None
@@ -4429,6 +5504,13 @@ def main():
                                 if t_hit is not None and t_hit > 0:
                                     if t_abs_min is None or t_hit < t_abs_min:
                                         t_abs_min = t_hit
+                        
+                        # Check STL mesh intersection
+                        if stl_mesh_for_raytracing is not None:
+                            t_stl = _ray_mesh_intersection(led.position, world_dir, stl_mesh_for_raytracing)
+                            if t_stl is not None and t_stl > 0:
+                                if t_abs_min is None or t_stl < t_abs_min:
+                                    t_abs_min = t_stl
 
                         t_wall = None
                         if room_mode_enable.value:

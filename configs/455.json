@@ -1,0 +1,212 @@
+{
+    "viewing_angle": 120,
+    "radius": 35,
+    "circle_center_x": -35,
+    "group_rotations": [
+        0.0,
+        0.0,
+        0,
+        0
+    ],
+    "group_rotations_y": [
+        0,
+        0,
+        0,
+        0
+    ],
+    "group_offsets": [
+        [
+            0.0,
+            0.0,
+            0.0
+        ],
+        [
+            0.0,
+            0.0,
+            0.0
+        ],
+        [
+            0.0,
+            0.0,
+            0.0
+        ],
+        [
+            0.0,
+            0.0,
+            0.0
+        ]
+    ],
+    "row_enabled": [
+        false,
+        false,
+        false,
+        false
+    ],
+    "led_states": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+    ],
+    "custom_groups": [
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                0.0,
+                4.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ]
+        },
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                0.0,
+                4.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true
+            ],
+            "is_dynamic": true,
+            "num_leds": 1,
+            "led_positions": [
+                [
+                    0.0,
+                    0.7,
+                    0.0
+                ]
+            ],
+            "led_rotations": [
+                [
+                    0.9510565162951536,
+                    0.0,
+                    0.30901699437494745
+                ]
+            ],
+            "led_sizes": [
+                0.5
+            ],
+            "led_rows": [
+                [
+                    0
+                ]
+            ]
+        },
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ]
+        }
+    ],
+    "individual_leds": [],
+    "absorbers": {
+        "enabled": false,
+        "abs0": {
+            "x": -1.0,
+            "y": 2.5,
+            "z": 0.0
+        },
+        "abs1": {
+            "x": -1.0,
+            "y": -2.5,
+            "z": 0.0
+        },
+        "abs2": {
+            "x": -1.8,
+            "y": -10.5,
+            "z": 0.0,
+            "rot_z": -14
+        },
+        "abs3": {
+            "x": -1.8,
+            "y": 10.5,
+            "z": 0.0,
+            "rot_z": 14
+        }
+    },
+    "name": "455"
+}
