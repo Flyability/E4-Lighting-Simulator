@@ -921,6 +921,9 @@ def main():
     individual_leds = []  # Each LED: {id, enable, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, size, folder}
     next_individual_led_id = [0]  # Counter for unique IDs
     
+    # Template folders - track loaded templates with master controls
+    template_folders = []  # List of template folder handles to remove on new project/load
+    
     # Store button handles for LED control
     led_buttons = {}
     row_buttons = {}
@@ -1034,6 +1037,20 @@ def main():
         # Update scene to remove visual elements
         update_scene()
     
+    def clear_all_template_folders():
+        """Remove all loaded template folders."""
+        nonlocal template_folders, custom_groups
+        for template_data in template_folders[:]:
+            try:
+                template_data['folder'].remove()
+                # Also remove groups associated with this template
+                for group in template_data.get('groups', []):
+                    if group in custom_groups:
+                        custom_groups.remove(group)
+            except (KeyError, AttributeError):
+                pass
+        template_folders.clear()
+    
     def apply_config(cfg):
         """Update GUI elements with values from config."""
         nonlocal loading_in_progress
@@ -1041,6 +1058,7 @@ def main():
         
         # Clear all existing custom groups first (this calls update_scene())
         clear_all_custom_groups()
+        clear_all_template_folders()
         
         viewing_angle_slider.value = cfg.get("viewing_angle", 120)
         radius_slider.value = cfg.get("radius", 35)
@@ -1181,10 +1199,14 @@ def main():
         # Final scene update after all groups are recreated
         update_scene()
         
-        # Refresh LED markers to ensure clean state
-        show_led_markers.value = False
-        time.sleep(0.1)
-        show_led_markers.value = True
+        # Force refresh LED markers to ensure all handles are created correctly
+        if show_led_markers.value:
+            show_led_markers.value = False
+            time.sleep(0.05)
+            update_scene()
+            time.sleep(0.05)
+            show_led_markers.value = True
+            update_scene()
         
         # Update UI visibility indicators
         update_ui_visibility()
@@ -1226,6 +1248,7 @@ def main():
         # Clear custom groups and individual LEDs (this calls update_scene() with led_states already disabled)
         clear_all_custom_groups()
         clear_all_individual_leds()
+        clear_all_template_folders()
         
         # Reset to default geometry values
         viewing_angle_slider.value = 120
@@ -1345,8 +1368,24 @@ def main():
                 'led_states': template.get('led_states', [True] * 12)
             }]
         
+        # Create a master folder with shared controls for this template
+        template_folder = server.gui.add_folder(f"Template: {template.get('name', template_name)}")
+        
+        with template_folder:
+            master_enable = server.gui.add_checkbox("Enable All", initial_value=True)
+            master_pos_x = server.gui.add_slider("Master Position X (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
+            master_pos_y = server.gui.add_slider("Master Position Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            master_pos_z = server.gui.add_slider("Master Position Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            master_rot_x = server.gui.add_slider("Master Rotation X (°)", min=-180, max=180, step=1, initial_value=0)
+            master_rot_y = server.gui.add_slider("Master Rotation Y (°)", min=-180, max=180, step=1, initial_value=0)
+            master_rot_z = server.gui.add_slider("Master Rotation Z (°)", min=-180, max=180, step=1, initial_value=0)
+            remove_template_btn = server.gui.add_button("Remove Template", color="red")
+        
         # Create all groups from template
         created_groups = []
+        initial_positions = []  # Store initial offset for each group
+        initial_rotations = []
+        
         for group_cfg in groups_data:
             # Check if this is a dynamic group (from individual LEDs)
             if 'num_leds' in group_cfg and 'led_rows' in group_cfg:
@@ -1390,6 +1429,17 @@ def main():
             
             # Enable the group AFTER all parameters are loaded
             group_data['enable'].value = group_cfg.get('enabled', True)
+            
+            # Store initial offset for this group
+            initial_positions.append([pos[0], pos[1], pos[2]])
+            initial_rotations.append([
+                group_cfg.get('rotation_x', 0),
+                group_cfg.get('rotation_y', 0),
+                group_cfg.get('rotation_z', 0)
+            ])
+            
+            # Hide individual group folder
+            group_data['folder'].visible = False
             
             created_groups.append(group_data)
         
@@ -1495,14 +1545,98 @@ def main():
             if 'update_button_colors' in group_data and group_data['update_button_colors']:
                 group_data['update_button_colors']()
             
+            # Store initial offset (individual LEDs converted to group at 0,0,0)
+            initial_positions.append([0.0, 0.0, 0.0])
+            initial_rotations.append([0, 0, 0])
+            
+            # Hide individual group folder
+            group_data['folder'].visible = False
+            
             created_groups.append(group_data)
             
             print(f"✓ Converted {num_leds} individual LED(s) into 1 custom group with {len(led_rows_indices)} row(s)")
 
         
+        # Setup master control callbacks to sync all groups
+        def update_all_from_master(_):
+            if loading_in_progress[0]:
+                return
+            loading_in_progress[0] = True
+            
+            # Build master rotation matrix
+            rot_x_rad = np.radians(master_rot_x.value)
+            rot_y_rad = np.radians(master_rot_y.value)
+            rot_z_rad = np.radians(master_rot_z.value)
+            
+            Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
+            Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
+            Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
+            R_master = Rz @ Ry @ Rx
+            
+            master_pos_offset = np.array([master_pos_x.value, master_pos_y.value, master_pos_z.value])
+            
+            for idx, group in enumerate(created_groups):
+                group['enable'].value = master_enable.value
+                
+                # Rotate initial position around origin, then add position offset
+                initial_pos = np.array(initial_positions[idx])
+                rotated_pos = R_master @ initial_pos
+                final_pos = rotated_pos + master_pos_offset
+                
+                group['pos_x'].value = final_pos[0]
+                group['pos_y'].value = final_pos[1]
+                group['pos_z'].value = final_pos[2]
+                
+                # Add master rotations to initial rotations
+                group['rot_x'].value = initial_rotations[idx][0] + master_rot_x.value
+                group['rot_y'].value = initial_rotations[idx][1] + master_rot_y.value
+                group['rot_z'].value = initial_rotations[idx][2] + master_rot_z.value
+            loading_in_progress[0] = False
+            update_scene()
+        
+        def remove_all_groups(_):
+            """Remove all groups from this template."""
+            for group in created_groups:
+                if group in custom_groups:
+                    custom_groups.remove(group)
+                group['folder'].remove()
+            template_folder.remove()
+            # Remove from template_folders list
+            for template_data in template_folders[:]:
+                if template_data['folder'] == template_folder:
+                    template_folders.remove(template_data)
+                    break
+            update_scene()
+        
+        # Register callbacks
+        master_enable.on_update(update_all_from_master)
+        master_pos_x.on_update(update_all_from_master)
+        master_pos_y.on_update(update_all_from_master)
+        master_pos_z.on_update(update_all_from_master)
+        master_rot_x.on_update(update_all_from_master)
+        master_rot_y.on_update(update_all_from_master)
+        master_rot_z.on_update(update_all_from_master)
+        remove_template_btn.on_click(remove_all_groups)
+        
+        # Store template folder data for cleanup on new project/load
+        template_folders.append({
+            'folder': template_folder,
+            'groups': created_groups
+        })
+        
         # Re-enable callbacks and update scene
         loading_in_progress[0] = False
         update_scene()
+        
+        # Force refresh LED markers to ensure all handles are created correctly
+        if show_led_markers.value:
+            show_led_markers.value = False
+            time.sleep(0.05)
+            update_scene()
+            time.sleep(0.05)
+            show_led_markers.value = True
+            update_scene()
+        
         print(f"✓ Loaded {len(created_groups)} custom group(s) from template: {template.get('name', template_name)}")
         return created_groups
 
@@ -1580,146 +1714,50 @@ def main():
                 # Refresh dropdown options
                 config_dropdown.options = get_available_configs()
             else:
-                # Save as custom group template
-                # Unify all custom groups and individual LEDs into a SINGLE group
+                # Save as custom group template - save groups separately
                 if len(custom_groups) > 0 or len(individual_leds) > 0:
-                    # Collect ALL LEDs from all groups and individual LEDs
-                    all_led_positions = []
-                    all_led_rotations = []
-                    all_led_sizes = []
-                    all_led_states = []
-                    
-                    # Standard 12-LED group local positions
-                    standard_led_local_positions = [
-                        (-7.5, 0, 5.0), (-2.5, 0, 5.0), (2.5, 0, 5.0), (7.5, 0, 5.0),
-                        (-7.5, 0, 0.0), (-2.5, 0, 0.0), (2.5, 0, 0.0), (7.5, 0, 0.0),
-                        (-7.5, 0, -5.0), (-2.5, 0, -5.0), (2.5, 0, -5.0), (7.5, 0, -5.0)
-                    ]
-                    
-                    # Process all custom groups
+                    # Save custom groups
+                    custom_groups_data = []
                     for group in custom_groups:
-                        group_pos = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                        group_rot_x = np.radians(group['rot_x'].value if 'rot_x' in group else 0)
-                        group_rot_y = np.radians(group['rot_y'].value)
-                        group_rot_z = np.radians(group['rot_z'].value)
-                        
-                        # Build rotation matrix
-                        Rx = np.array([[1, 0, 0], [0, np.cos(group_rot_x), -np.sin(group_rot_x)], [0, np.sin(group_rot_x), np.cos(group_rot_x)]])
-                        Ry = np.array([[np.cos(group_rot_y), 0, np.sin(group_rot_y)], [0, 1, 0], [-np.sin(group_rot_y), 0, np.cos(group_rot_y)]])
-                        Rz = np.array([[np.cos(group_rot_z), -np.sin(group_rot_z), 0], [np.sin(group_rot_z), np.cos(group_rot_z), 0], [0, 0, 1]])
-                        R_combined = Rz @ Ry @ Rx
-                        
+                        group_cfg = {
+                            'enabled': group['enable'].value,
+                            'position': [group['pos_x'].value, group['pos_y'].value, group['pos_z'].value],
+                            'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
+                            'rotation_y': group['rot_y'].value,
+                            'rotation_z': group['rot_z'].value,
+                            'led_states': group['led_states'][:]
+                        }
+                        # Save dynamic group properties if present
                         if group.get('is_dynamic', False):
-                            # Dynamic group - transform LEDs to world space
-                            led_positions = group.get('led_positions', [])
-                            led_rotations = group.get('led_rotations', [])
-                            led_sizes = group.get('led_sizes', [])
-                            led_states = group['led_states'][:]
-                            
-                            for i in range(len(led_positions)):
-                                # Transform position
-                                local_pos = np.array(led_positions[i])
-                                world_pos = R_combined @ local_pos + group_pos
-                                all_led_positions.append(tuple(world_pos))
-                                
-                                # Transform direction
-                                local_dir = np.array(led_rotations[i])
-                                dir_norm = np.linalg.norm(local_dir)
-                                if dir_norm < 1e-10:
-                                    local_dir = np.array([1.0, 0.0, 0.0])
-                                else:
-                                    local_dir = local_dir / dir_norm
-                                world_dir = R_combined @ local_dir
-                                all_led_rotations.append(tuple(world_dir))
-                                
-                                all_led_sizes.append(led_sizes[i] if i < len(led_sizes) else 0.5)
-                                all_led_states.append(led_states[i] if i < len(led_states) else True)
-                        else:
-                            # Standard 12-LED group - transform to world space
-                            led_states = group['led_states'][:]
-                            for i, local_pos in enumerate(standard_led_local_positions):
-                                world_pos = R_combined @ np.array(local_pos) + group_pos
-                                all_led_positions.append(tuple(world_pos))
-                                
-                                local_dir = np.array([1.0, 0.0, 0.0])
-                                world_dir = R_combined @ local_dir
-                                all_led_rotations.append(tuple(world_dir))
-                                
-                                all_led_sizes.append(0.5)
-                                all_led_states.append(led_states[i] if i < len(led_states) else True)
+                            group_cfg['is_dynamic'] = True
+                            group_cfg['num_leds'] = group.get('num_leds', 12)
+                            group_cfg['led_positions'] = group.get('led_positions', [])
+                            group_cfg['led_rotations'] = group.get('led_rotations', [])
+                            group_cfg['led_sizes'] = group.get('led_sizes', [])
+                            group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
+                        custom_groups_data.append(group_cfg)
                     
-                    # Add individual LEDs (already in world space)
+                    # Save individual LEDs
+                    individual_leds_data = []
                     for led in individual_leds:
-                        pos = [led['pos_x'].value, led['pos_y'].value, led['pos_z'].value]
-                        all_led_positions.append(tuple(pos))
-                        
-                        # Convert rotation angles to direction vector
-                        rot_x_rad = np.radians(led['rot_x'].value)
-                        rot_y_rad = np.radians(led['rot_y'].value)
-                        rot_z_rad = np.radians(led['rot_z'].value)
-                        
-                        direction = np.array([1.0, 0.0, 0.0])
-                        Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
-                        direction = Rz @ direction
-                        Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
-                        direction = Ry @ direction
-                        Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
-                        direction = Rx @ direction
-                        
-                        all_led_rotations.append(tuple(direction / np.linalg.norm(direction)))
-                        all_led_sizes.append(led['size'].value)
-                        all_led_states.append(led['led_on'])
+                        individual_leds_data.append({
+                            'enabled': led['enable'].value,
+                            'led_on': led['led_on'],
+                            'pos_x': led['pos_x'].value,
+                            'pos_y': led['pos_y'].value,
+                            'pos_z': led['pos_z'].value,
+                            'rot_x': led['rot_x'].value,
+                            'rot_y': led['rot_y'].value,
+                            'rot_z': led['rot_z'].value,
+                            'size': led['size'].value
+                        })
                     
-                    # Sort by Z coordinate and create rows
-                    led_data = list(zip(all_led_positions, all_led_rotations, all_led_sizes, all_led_states))
-                    led_data_sorted = sorted(led_data, key=lambda x: x[0][2], reverse=True)
-                    
-                    sorted_positions = [list(x[0]) for x in led_data_sorted]
-                    sorted_rotations = [list(x[1]) for x in led_data_sorted]
-                    sorted_sizes = [x[2] for x in led_data_sorted]
-                    sorted_states = [x[3] for x in led_data_sorted]
-                    
-                    # Group LEDs by Z coordinate into rows
-                    z_tolerance = 0.5
-                    led_rows_indices = []
-                    current_row = []
-                    current_z = None
-                    
-                    for idx, pos in enumerate(sorted_positions):
-                        if current_z is None or abs(pos[2] - current_z) <= z_tolerance:
-                            current_row.append(idx)
-                            if current_z is None:
-                                current_z = pos[2]
-                        else:
-                            if current_row:
-                                led_rows_indices.append(current_row)
-                            current_row = [idx]
-                            current_z = pos[2]
-                    if current_row:
-                        led_rows_indices.append(current_row)
-                    
-                    # Create single unified group
-                    unified_group = {
-                        'enabled': True,
-                        'position': [0.0, 0.0, 0.0],  # All coordinates are now absolute
-                        'rotation_x': 0,
-                        'rotation_y': 0,
-                        'rotation_z': 0,
-                        'led_states': sorted_states,
-                        'is_dynamic': True,
-                        'num_leds': len(sorted_positions),
-                        'led_positions': sorted_positions,
-                        'led_rotations': sorted_rotations,
-                        'led_sizes': sorted_sizes,
-                        'led_rows': led_rows_indices
-                    }
-                    
-                    # Save as single group (no individual LEDs)
-                    save_custom_group_template(name, [unified_group], [])
+                    # Save as template with separate groups
+                    save_custom_group_template(name, custom_groups_data, individual_leds_data)
                     # Refresh template dropdown list
                     template_dropdown.options = ["Empty"] + get_available_templates()
                     
-                    print(f"✓ Unified and saved: {len(custom_groups)} group(s) + {len(individual_leds)} LED(s) = {len(sorted_positions)} total LEDs in {len(led_rows_indices)} row(s)")
+                    print(f"✓ Template saved: {len(custom_groups_data)} group(s) + {len(individual_leds_data)} individual LED(s)")
                 else:
                     print("Error: No custom groups or individual LEDs to save as template")
 
