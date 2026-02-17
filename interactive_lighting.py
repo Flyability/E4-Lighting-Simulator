@@ -1218,7 +1218,8 @@ def main():
                 'rot_x': led['rot_x'].value,
                 'rot_y': led['rot_y'].value,
                 'rot_z': led['rot_z'].value,
-                'size': led['size'].value
+                'size': led['size'].value,
+                'viewing_angle': led['viewing_angle'].value
             })
         
         return {
@@ -1787,6 +1788,7 @@ def main():
             led_data['rot_y'].value = led_cfg.get('rot_y', 0.0)
             led_data['rot_z'].value = led_cfg.get('rot_z', 0.0)
             led_data['size'].value = led_cfg.get('size', 0.5)
+            led_data['viewing_angle'].value = led_cfg.get('viewing_angle', 120)
         
         # Re-enable callbacks and do final scene update
         loading_in_progress[0] = False
@@ -2513,7 +2515,8 @@ def main():
                             'rot_x': led['rot_x'].value,
                             'rot_y': led['rot_y'].value,
                             'rot_z': led['rot_z'].value,
-                            'size': led['size'].value
+                            'size': led['size'].value,
+                            'viewing_angle': led['viewing_angle'].value
                         })
                     
                     # Save as template with separate groups
@@ -2604,7 +2607,7 @@ def main():
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
         )
         led_lumens_slider = server.gui.add_slider(
-            "LED lumens (lm/LED)", min=100, max=1000, step=10, initial_value=100
+            "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=100
         )
         calibration_factor_slider = server.gui.add_slider(
             "Calibration factor", min=0.5, max=1.5, step=0.001, initial_value=1.0
@@ -2656,7 +2659,7 @@ def main():
         
         server.gui.add_html("<hr style='margin:8px 0;'>")
         stl_visible = server.gui.add_checkbox("Show Model", initial_value=True)
-        stl_scale = server.gui.add_slider("Scale", min=0.01, max=10.0, step=0.01, initial_value=1.0)
+        stl_scale = server.gui.add_slider("Scale", min=0.01, max=10.0, step=0.01, initial_value=0.1)
         stl_pos_x = server.gui.add_slider("Position X (cm)", min=-200, max=200, step=1, initial_value=0)
         stl_pos_y = server.gui.add_slider("Position Y (cm)", min=-200, max=200, step=1, initial_value=0)
         stl_pos_z = server.gui.add_slider("Position Z (cm)", min=-200, max=200, step=1, initial_value=0)
@@ -2669,6 +2672,25 @@ def main():
         server.gui.add_html("<hr style='margin:8px 0;'>")
         update_mesh_lighting_btn = server.gui.add_button("🔆 Update Mesh Lighting", color="#FFA500")
         server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Recalculate lighting based on current LED configuration</div>")
+        
+# Mesh lighting legend (gradient from dark blue to white)
+        server.gui.add_html(
+            "<div style='font-family: sans-serif; margin-top: 12px;'>" 
+            "<div style='font-weight:600; margin-bottom:6px; font-size:12px;'>Mesh Lighting Intensity:</div>"
+            "<div style='display:flex; align-items:center; gap:8px;'>"
+            "<span style='font-size:10px; color:#888;'>Dark</span>"
+            "<div style='flex:1; height:20px; background:linear-gradient(to right, "
+            "#000033 0%, #000055 10%, #0000AA 20%, #1133CC 30%, #2255DD 40%, "
+            "#3366EE 50%, #5588FF 60%, #77AAFF 65%, #99CCFF 75%, #BBDDFF 85%, #DDEEFF 92%, #FFFFFF 100%); "
+            "border:1px solid #444; border-radius:3px;'></div>"
+            "<span style='font-size:10px; color:#888;'>Bright</span>"
+            "</div>"
+            "<div style='font-size:10px; color:#666; margin-top:4px;'>"
+            "• Color map: Dark Blue → White<br>"
+            "• Physics: Lux = (Lumens × cos θ) / d² | Responds to LED lumens"
+            "</div>"
+            "</div>"
+        )
         
         stl_info_html = server.gui.add_html(
             "<div style='font-family: sans-serif; font-size: 11px; color: #666;'>"
@@ -2873,7 +2895,8 @@ def main():
                         vertices_world, 
                         vertex_normals, 
                         current_leds,
-                        base_color=base_color
+                        base_color=base_color,
+                        led_lumens=led_lumens_slider.value
                     )
                     
                     # Set vertex colors on the mesh before adding to scene
@@ -3012,15 +3035,16 @@ def main():
     # Store current LED objects (for reuse in room intensity calculation)
     current_leds = []
 
-    def calculate_mesh_lighting(mesh_vertices, mesh_normals, leds, base_color=(0.7, 0.7, 0.9)):
+    def calculate_mesh_lighting(mesh_vertices, mesh_normals, leds, base_color=(0.7, 0.7, 0.9), led_lumens=100):
         """
-        Calculate per-vertex lighting for STL mesh using Lambert's cosine law.
+        Calculate per-vertex lighting for STL mesh using physical lux calculation.
         
         Args:
             mesh_vertices: Nx3 array of vertex positions in meters (Viser units)
             mesh_normals: Nx3 array of vertex normals
             leds: List of LED objects with position, direction, enabled
             base_color: RGB tuple for base mesh color (0-1 range)
+            led_lumens: Luminous flux per LED in lumens (default 100)
         
         Returns:
             Nx3 array of RGB colors for each vertex
@@ -3038,6 +3062,10 @@ def main():
         if len(active_leds) == 0:
             return vertex_colors
         
+        # Calculate luminous intensity (candelas) from lumens and viewing angle
+        # For a cone with half-angle θ: solid_angle = 2π(1 - cos(θ))
+        # Luminous intensity I = Φ / Ω (candelas = lumens / steradians)
+        
         # For each active LED, calculate contribution to each vertex
         for led in active_leds:
             # LED position in cm, convert to meters
@@ -3045,15 +3073,27 @@ def main():
             led_dir = np.array(led.direction)
             led_dir_norm = led_dir / (np.linalg.norm(led_dir) + 1e-10)
             
+            # Calculate solid angle for this LED's cone
+            viewing_half_angle_rad = np.radians(led.viewing_angle / 2.0)
+            solid_angle = 2 * np.pi * (1 - np.cos(viewing_half_angle_rad))  # steradians
+            
+            # Protect against division by zero or very small solid angles
+            if solid_angle < 0.001:
+                solid_angle = 0.001
+            
+            luminous_intensity = led_lumens / solid_angle  # candelas
+            
+            # Validate luminous intensity
+            if not np.isfinite(luminous_intensity) or luminous_intensity <= 0:
+                continue
+            
             # Vector from LED to each vertex
             to_vertex = mesh_vertices - led_pos_m  # Shape: (N, 3)
-            distances = np.linalg.norm(to_vertex, axis=1, keepdims=True) + 1e-6  # Avoid division by zero
+            distances = np.linalg.norm(to_vertex, axis=1, keepdims=True) + 1e-6  # meters
             to_vertex_norm = to_vertex / distances  # Normalized direction to vertex
             
             # Check if vertex is within LED's viewing cone
-            # Dot product between LED direction and direction to vertex
             cos_angle_to_vertex = np.sum(led_dir_norm * to_vertex_norm, axis=1, keepdims=True)
-            viewing_half_angle_rad = np.radians(led.viewing_angle / 2.0)
             cos_half_angle = np.cos(viewing_half_angle_rad)
             
             # Only illuminate vertices within viewing cone
@@ -3062,39 +3102,58 @@ def main():
             if np.sum(in_cone) == 0:
                 continue
             
-            # Lambert's cosine law: intensity = max(0, N · L)
-            # N = surface normal, L = direction from surface to light
+            # Lambert's cosine law: intensity depends on angle of incidence
+            # N = surface normal, L = direction from surface to light source
             cos_incident = np.sum(mesh_normals * (-to_vertex_norm), axis=1, keepdims=True)
             cos_incident = np.maximum(0, cos_incident)  # Only positive (facing the light)
             
-            # Distance attenuation: 1/d²
-            # Scale by 100 to account for cm->m conversion and make falloff reasonable
-            distance_attenuation = 100.0 / (distances ** 2 + 1.0)
+            # Physical illuminance calculation (lux)
+            # E = I × cos(θ_incident) / d²
+            # where: E = illuminance (lux), I = luminous intensity (cd), d = distance (m)
+            illuminance = np.zeros((num_vertices, 1), dtype=np.float32)
+            illuminance[in_cone] = (luminous_intensity * cos_incident[in_cone] / 
+                                   (distances[in_cone] ** 2))
             
-            # Viewing angle attenuation (smooth falloff at cone edges)
-            # Smooth transition from 1.0 at center to 0.0 at edge
-            angle_attenuation = np.maximum(0, (cos_angle_to_vertex - cos_half_angle) / (1.0 - cos_half_angle))
-            angle_attenuation = angle_attenuation ** 2  # Squared for smoother falloff
+            # Remove any NaN or infinite values
+            illuminance = np.nan_to_num(illuminance, nan=0.0, posinf=0.0, neginf=0.0)
             
-            # Combined intensity (only for vertices in cone)
-            intensity = np.zeros((num_vertices, 1), dtype=np.float32)
-            intensity[in_cone] = (cos_incident[in_cone] * 
-                                  distance_attenuation[in_cone] * 
-                                  angle_attenuation[in_cone])
+            # Apply cone edge falloff for smooth transition
+            angle_factor = np.ones((num_vertices, 1), dtype=np.float32)
+            angle_factor[in_cone] = np.maximum(0, 
+                (cos_angle_to_vertex[in_cone] - cos_half_angle) / (1.0 - cos_half_angle)) ** 2
+            illuminance *= angle_factor
             
-            # LED color contribution (use LED's RGB color)
-            led_color = np.array(led.color) if hasattr(led, 'color') else np.array([1.0, 1.0, 1.0])
+            # Convert lux to color intensity (normalize to reasonable range)
+            # Typical indoor lighting: 100-500 lux
+            # Scale factor to map lux to [0, 1] color range
+            lux_to_color_scale = 0.002  # Adjust to control brightness response
+            color_intensity = np.clip(illuminance * lux_to_color_scale, 0.0, 1.0)
             
-            # Add this LED's contribution to vertex colors
-            # Scale intensity to reasonable range (tunable parameter)
-            brightness_scale = 0.8  # Adjust this to control overall brightness
-            vertex_colors += intensity * led_color * brightness_scale
+            # Ensure no NaN values in final color intensity
+            color_intensity = np.nan_to_num(color_intensity, nan=0.0)
+            
+            # Add this LED's contribution to vertex colors (accumulate intensity)
+            # Keep as (N, 1) for proper broadcasting with (N, 3)
+            vertex_colors += color_intensity
         
-        # Multiply by base color and clamp to [0, 1]
-        vertex_colors = vertex_colors * np.array(base_color)
-        vertex_colors = np.clip(vertex_colors, 0.0, 1.0)
+        # Final safety check: remove any remaining NaN or infinite values
+        vertex_colors = np.nan_to_num(vertex_colors, nan=0.0, posinf=1.0, neginf=0.0)
         
-        return vertex_colors
+        # Calculate total intensity per vertex (average across RGB channels)
+        intensity_per_vertex = np.mean(vertex_colors, axis=1, keepdims=True)
+        
+        # Map accumulated intensity to blue-to-white color gradient
+        # Dark blue (0,0,0.2) at low intensity → White (1,1,1) at high intensity
+        blue_base = np.array([0.0, 0.0, 0.2])  # Dark blue
+        white = np.array([1.0, 1.0, 1.0])  # White
+        
+        # Interpolate between blue and white based on intensity
+        # Use a smooth curve for better visual appearance
+        intensity_normalized = np.clip(intensity_per_vertex, 0.0, 1.0)
+        final_colors = blue_base * (1.0 - intensity_normalized) + white * intensity_normalized
+        final_colors = np.clip(final_colors, 0.0, 1.0)
+        
+        return final_colors
 
     # Absorbers folder (separate group for easier access)
     absorbers_folder = server.gui.add_folder("Absorbers")
@@ -3463,6 +3522,7 @@ def main():
                 led_data['rot_y'].value = float(rot_angles[1])
                 led_data['rot_z'].value = float(rot_angles[2])
                 led_data['size'].value = float(led_sizes[led_idx])
+                led_data['viewing_angle'].value = 120  # Default viewing angle for converted LEDs
                 
                 # Mark as part of this template for potential regrouping
                 led_data['template_source'] = template_name
@@ -3488,6 +3548,7 @@ def main():
             led_data['rot_y'].value = led_cfg.get('rot_y', 0)
             led_data['rot_z'].value = led_cfg.get('rot_z', 0)
             led_data['size'].value = led_cfg.get('size', 0.5)
+            led_data['viewing_angle'].value = led_cfg.get('viewing_angle', 120)
             
             # Mark as part of this template
             led_data['template_source'] = template_name
@@ -3534,6 +3595,9 @@ def main():
             server.gui.add_html("<b>Size:</b>")
             size_slider = server.gui.add_slider("Square side (cm)", min=0.1, max=5.0, step=0.1, initial_value=0.5)
             
+            server.gui.add_html("<b>Viewing Angle:</b>")
+            viewing_angle_slider = server.gui.add_slider("Viewing angle (°)", min=10, max=130, step=5, initial_value=120)
+            
             remove_btn = server.gui.add_button("Remove LED", color="red")
         
         # Store LED data
@@ -3550,6 +3614,7 @@ def main():
             'rot_y': rot_y,
             'rot_z': rot_z,
             'size': size_slider,
+            'viewing_angle': viewing_angle_slider,
             'remove_btn': remove_btn,
         }
         
@@ -3576,6 +3641,7 @@ def main():
         rot_y.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         rot_z.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         size_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        viewing_angle_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         remove_btn.on_click(on_remove)
         
         individual_leds.append(led_data)
@@ -3613,7 +3679,8 @@ def main():
                     "y": float(led_data['rot_y'].value),
                     "z": float(led_data['rot_z'].value)
                 },
-                "size": float(led_data['size'].value)
+                "size": float(led_data['size'].value),
+                "viewing_angle": float(led_data['viewing_angle'].value)
             }
             
             # Add metadata if present (template source info)
