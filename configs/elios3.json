@@ -37,10 +37,10 @@
         ]
     ],
     "row_enabled": [
-        false,
         true,
         true,
-        false
+        true,
+        true
     ],
     "led_states": [
         true,

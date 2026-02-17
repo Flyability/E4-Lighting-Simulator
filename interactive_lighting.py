@@ -1058,9 +1058,157 @@ def main():
                 group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
             custom_groups_data.append(group_cfg)
         
-        # Save individual LEDs
-        individual_leds_data = []
+        # Process individual LEDs: separate template-sourced from standalone
+        template_leds = {}  # {(template_name, group_index): [leds]}
+        standalone_leds = []
+        
         for led in individual_leds:
+            template_source = led.get('template_source')
+            if template_source:
+                # This LED came from a template - group it for saving as custom group
+                group_index = led.get('group_index')
+                key = (template_source, group_index)
+                if key not in template_leds:
+                    template_leds[key] = []
+                template_leds[key].append(led)
+            else:
+                # Standalone individual LED
+                standalone_leds.append(led)
+        
+        # Convert template-sourced LEDs back into custom groups for saving
+        for (template_name, group_index), leds_list in template_leds.items():
+            if not leds_list:
+                continue
+            
+            # Sort LEDs by position to maintain consistent ordering
+            leds_list_sorted = sorted(leds_list, key=lambda l: (l['pos_z'].value, l['pos_y'].value, l['pos_x'].value))
+            
+            # Extract LED data
+            num_leds = len(leds_list_sorted)
+            led_positions = [(led['pos_x'].value, led['pos_y'].value, led['pos_z'].value) for led in leds_list_sorted]
+            led_sizes = [led['size'].value for led in leds_list_sorted]
+            led_states = [led['led_on'] for led in leds_list_sorted]
+            
+            # Convert rotation angles to direction vectors
+            led_rotations = []
+            for led in leds_list_sorted:
+                rot_x = np.radians(led['rot_x'].value)
+                rot_y = np.radians(led['rot_y'].value)
+                rot_z = np.radians(led['rot_z'].value)
+                
+                # Build rotation matrix
+                Rx = np.array([[1, 0, 0], [0, np.cos(rot_x), -np.sin(rot_x)], [0, np.sin(rot_x), np.cos(rot_x)]])
+                Ry = np.array([[np.cos(rot_y), 0, np.sin(rot_y)], [0, 1, 0], [-np.sin(rot_y), 0, np.cos(rot_y)]])
+                Rz = np.array([[np.cos(rot_z), -np.sin(rot_z), 0], [np.sin(rot_z), np.cos(rot_z), 0], [0, 0, 1]])
+                R = Rz @ Ry @ Rx
+                
+                # Apply rotation to forward direction (1, 0, 0)
+                direction = R @ np.array([1, 0, 0])
+                led_rotations.append(tuple(direction))
+            
+            # Auto-detect row organization based on Z coordinate
+            z_tolerance = 0.5
+            led_rows = []
+            current_row = []
+            current_z = None
+            
+            for idx, led in enumerate(leds_list_sorted):
+                z = led['pos_z'].value
+                if current_z is None or abs(z - current_z) < z_tolerance:
+                    current_row.append(idx)
+                    current_z = z if current_z is None else current_z
+                else:
+                    if current_row:
+                        led_rows.append(current_row)
+                    current_row = [idx]
+                    current_z = z
+            
+            if current_row:
+                led_rows.append(current_row)
+            
+            # If no rows detected, create one row with all LEDs
+            if not led_rows:
+                led_rows = [list(range(num_leds))]
+            
+            # Check if LEDs have original group position saved
+            original_pos = None
+            original_rot = None
+            for led in leds_list_sorted:
+                if led.get('original_group_pos') is not None:
+                    original_pos = led['original_group_pos']
+                    original_rot = led['original_group_rot']
+                    break
+            
+            # If we have original group position, use it; otherwise calculate average
+            if original_pos is not None:
+                group_pos = original_pos
+                group_rot = original_rot if original_rot is not None else [0, 0, 0]
+            else:
+                # Calculate average position (center of group)
+                group_pos = [
+                    sum(p[0] for p in led_positions) / num_leds,
+                    sum(p[1] for p in led_positions) / num_leds,
+                    sum(p[2] for p in led_positions) / num_leds
+                ]
+                group_rot = [0, 0, 0]
+            
+            # Convert LED positions to relative (from group center)
+            # If we have original rotation, need to reverse it
+            if original_rot is not None and any(original_rot):
+                # Build inverse rotation matrix
+                rot_x_rad = np.radians(group_rot[0])
+                rot_y_rad = np.radians(group_rot[1])
+                rot_z_rad = np.radians(group_rot[2])
+                
+                Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
+                Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
+                Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
+                R_group = Rz @ Ry @ Rx
+                R_group_inv = R_group.T  # Inverse is transpose for rotation matrices
+                
+                # Convert positions to relative by removing group offset and rotation
+                led_positions_relative = []
+                for pos in led_positions:
+                    pos_offset = np.array([pos[0] - group_pos[0], pos[1] - group_pos[1], pos[2] - group_pos[2]])
+                    pos_local = R_group_inv @ pos_offset
+                    led_positions_relative.append(tuple(pos_local))
+                
+                # Also reverse-transform the direction vectors
+                led_rotations_original = []
+                for direction in led_rotations:
+                    dir_local = R_group_inv @ np.array(direction)
+                    led_rotations_original.append(tuple(dir_local))
+                led_rotations = led_rotations_original
+            else:
+                led_positions_relative = [(p[0] - group_pos[0], p[1] - group_pos[1], p[2] - group_pos[2]) for p in led_positions]
+            
+            # Check if all LEDs are enabled
+            all_enabled = all(led['enable'].value for led in leds_list_sorted)
+            
+            # Create custom group config
+            group_cfg = {
+                'enabled': all_enabled,
+                'position': group_pos,
+                'rotation_x': group_rot[0],
+                'rotation_y': group_rot[1],
+                'rotation_z': group_rot[2],
+                'led_states': led_states,
+                'is_dynamic': True,
+                'num_leds': num_leds,
+                'led_positions': led_positions_relative,
+                'led_rotations': led_rotations,
+                'led_sizes': led_sizes,
+                'led_rows': led_rows,
+                'template_name': template_name if template_name != "unnamed" else None,
+                'initial_pos': [0.0, 0.0, 0.0],
+                'initial_rot': [0, 0, 0]
+            }
+            
+            custom_groups_data.append(group_cfg)
+        
+        # Save standalone individual LEDs
+        individual_leds_data = []
+        for led in standalone_leds:
             individual_leds_data.append({
                 'enabled': led['enable'].value,
                 'led_on': led['led_on'],
@@ -3159,20 +3307,201 @@ def main():
             initial_value="Empty"
         )
         
+        load_mode_dropdown = server.gui.add_dropdown(
+            "Load Mode",
+            options=["As Group (Solid)", "As Individual LEDs (Editable)"],
+            initial_value="As Group (Solid)"
+        )
+        
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>"
+                           "• Group: Fast, moves as one unit<br>"
+                           "• Individual LEDs: Edit each LED position/rotation/size separately</div>")
+        
         add_custom_group_btn = server.gui.add_button("➕ Add Custom Group", color="green")
         
         @add_custom_group_btn.on_click
         def _(_):
             selected_template = template_dropdown.value
+            load_mode = load_mode_dropdown.value
+            
             if selected_template == "Empty":
                 # Create empty custom group
                 create_custom_group()
                 print("✓ Empty custom group added")
             else:
                 # Load from template
-                load_custom_group_from_template(selected_template)
+                if load_mode == "As Individual LEDs (Editable)":
+                    # Load template as individual LEDs
+                    load_template_as_individual_leds(selected_template)
+                else:
+                    # Load as solid group (default behavior)
+                    load_custom_group_from_template(selected_template)
                 # Refresh template list in case new templates were added
                 template_dropdown.options = ["Empty"] + get_available_templates()
+    
+    def load_template_as_individual_leds(template_name):
+        """Load a template and create individual editable LEDs instead of a group."""
+        nonlocal loading_in_progress
+        loading_in_progress[0] = True
+        
+        path = os.path.join(custom_groups_templates_dir, f"{template_name}.json")
+        if not os.path.exists(path):
+            print(f"Template not found: {template_name}")
+            loading_in_progress[0] = False
+            return
+        
+        with open(path, "r") as f:
+            template = json.load(f)
+        
+        # Get groups data from template
+        groups_data = template.get('groups', [])
+        if not groups_data and 'enabled' in template:
+            # Old single-group format
+            groups_data = [template]
+        
+        total_leds_created = 0
+        
+        # Process each group in the template
+        for group_cfg in groups_data:
+            num_leds = group_cfg.get('num_leds', 12)
+            led_rows = group_cfg.get('led_rows', [[0,1,2], [3,4,5], [6,7,8], [9,10,11]])
+            led_states = group_cfg.get('led_states', [True] * num_leds)
+            
+            # Get LED positions and rotations
+            is_dynamic = group_cfg.get('is_dynamic', False)
+            if is_dynamic:
+                # Dynamic group with custom LED positions
+                led_positions = group_cfg.get('led_positions', [(0, 0, 0)] * num_leds)
+                led_rotations = group_cfg.get('led_rotations', [(1, 0, 0)] * num_leds)
+                led_sizes = group_cfg.get('led_sizes', [0.5] * num_leds)
+            else:
+                # Static group - generate positions based on rows
+                led_positions = []
+                led_rotations = []
+                led_sizes = []
+                
+                for row_idx, led_indices in enumerate(led_rows):
+                    y_pos = 0.0
+                    z_pos = -row_idx * 2.0  # Space rows by 2cm
+                    for led_idx_in_row, led_idx in enumerate(led_indices):
+                        x_pos = led_idx_in_row * 1.5  # Space LEDs by 1.5cm
+                        led_positions.append((x_pos, y_pos, z_pos))
+                        led_rotations.append((1, 0, 0))  # Forward direction
+                        led_sizes.append(0.5)
+            
+            # Get group position and rotation offset
+            # Support both old format (position list) and new format (pos_x/y/z)
+            if 'position' in group_cfg:
+                pos = group_cfg['position']
+                group_pos = [pos[0] if len(pos) > 0 else 0.0, 
+                            pos[1] if len(pos) > 1 else 0.0, 
+                            pos[2] if len(pos) > 2 else 0.0]
+            else:
+                group_pos = [
+                    group_cfg.get('pos_x', 0.0),
+                    group_cfg.get('pos_y', 0.0),
+                    group_cfg.get('pos_z', 0.0)
+                ]
+            
+            # Support both rotation_x/y/z and rot_x/y/z
+            group_rot = [
+                group_cfg.get('rotation_x', group_cfg.get('rot_x', 0)),
+                group_cfg.get('rotation_y', group_cfg.get('rot_y', 0)),
+                group_cfg.get('rotation_z', group_cfg.get('rot_z', 0))
+            ]
+            
+            # Create rotation matrix for group rotation
+            rot_x_rad = np.radians(group_rot[0])
+            rot_y_rad = np.radians(group_rot[1])
+            rot_z_rad = np.radians(group_rot[2])
+            
+            Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
+            Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
+            Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
+            R_group = Rz @ Ry @ Rx
+            
+            # Create individual LED for each LED in the group
+            for led_idx in range(num_leds):
+                # Apply group rotation to LED position
+                led_pos_local = np.array(led_positions[led_idx])
+                led_pos_rotated = R_group @ led_pos_local
+                led_pos_final = led_pos_rotated + np.array(group_pos)
+                
+                # Apply group rotation to LED direction
+                led_dir_local = np.array(led_rotations[led_idx])
+                led_dir_rotated = R_group @ led_dir_local
+                
+                # Convert direction to rotation angles
+                # Forward direction is (1, 0, 0)
+                # Calculate rotation needed to transform (1,0,0) to led_dir_rotated
+                forward = np.array([1, 0, 0])
+                
+                # Calculate rotation axis and angle
+                if np.allclose(led_dir_rotated, forward):
+                    rot_angles = [0, 0, 0]
+                elif np.allclose(led_dir_rotated, -forward):
+                    rot_angles = [0, 180, 0]
+                else:
+                    # Use standard transformation
+                    # Y rotation (tilt up/down)
+                    rot_y = np.degrees(np.arctan2(led_dir_rotated[2], led_dir_rotated[0]))
+                    # Z rotation (tilt left/right)
+                    rot_z = np.degrees(np.arctan2(led_dir_rotated[1], np.sqrt(led_dir_rotated[0]**2 + led_dir_rotated[2]**2)))
+                    rot_angles = [0, rot_y, rot_z]
+                
+                # Create individual LED
+                led_data = create_individual_led(skip_update_scene=True)
+                
+                # Set LED properties
+                led_data['enable'].value = group_cfg.get('enabled', True)
+                led_data['led_on'] = led_states[led_idx]
+                led_data['led_on_btn'].color = "#00FF00" if led_states[led_idx] else "#FF0000"
+                led_data['pos_x'].value = float(led_pos_final[0])
+                led_data['pos_y'].value = float(led_pos_final[1])
+                led_data['pos_z'].value = float(led_pos_final[2])
+                led_data['rot_x'].value = float(rot_angles[0])
+                led_data['rot_y'].value = float(rot_angles[1])
+                led_data['rot_z'].value = float(rot_angles[2])
+                led_data['size'].value = float(led_sizes[led_idx])
+                
+                # Mark as part of this template for potential regrouping
+                led_data['template_source'] = template_name
+                led_data['group_index'] = len(groups_data) if len(groups_data) > 1 else None
+                led_data['original_group_pos'] = group_pos  # Save original group position
+                led_data['original_group_rot'] = group_rot  # Save original group rotation
+                
+                total_leds_created += 1
+        
+        # Process individual LEDs from template (if any)
+        individual_leds_data = template.get('individual_leds', [])
+        for led_cfg in individual_leds_data:
+            led_data = create_individual_led(skip_update_scene=True)
+            
+            # Set LED properties
+            led_data['enable'].value = led_cfg.get('enabled', True)
+            led_data['led_on'] = led_cfg.get('led_on', True)
+            led_data['led_on_btn'].color = "#00FF00" if led_cfg.get('led_on', True) else "#FF0000"
+            led_data['pos_x'].value = led_cfg.get('pos_x', 0.0)
+            led_data['pos_y'].value = led_cfg.get('pos_y', 0.0)
+            led_data['pos_z'].value = led_cfg.get('pos_z', 0.0)
+            led_data['rot_x'].value = led_cfg.get('rot_x', 0)
+            led_data['rot_y'].value = led_cfg.get('rot_y', 0)
+            led_data['rot_z'].value = led_cfg.get('rot_z', 0)
+            led_data['size'].value = led_cfg.get('size', 0.5)
+            
+            # Mark as part of this template
+            led_data['template_source'] = template_name
+            led_data['group_index'] = None
+            led_data['original_group_pos'] = None  # No group position for standalone LEDs
+            led_data['original_group_rot'] = None
+            
+            total_leds_created += 1
+        
+        loading_in_progress[0] = False
+        update_scene()
+        
+        print(f"✓ Loaded {total_leds_created} individual LED(s) from template: {template_name}")
+        print("  Edit each LED individually - they will be saved as a group when you save the project")
 
     # Individual LEDs folder (single LED management)
     individual_leds_folder = server.gui.add_folder("Individual LEDs")
@@ -3256,16 +3585,86 @@ def main():
         
         return led_data
     
+    def export_individual_leds_simple():
+        """Export all individual LEDs to a simple JSON format (preserves exact coordinates)."""
+        if len(individual_leds) == 0:
+            print("⚠️ No individual LEDs to export")
+            return
+        
+        # Export directory
+        export_dir = "exports"
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+        
+        # Collect current LED data (exact coordinates, no transformations)
+        leds_export = []
+        for led_data in individual_leds:
+            led_export = {
+                "id": led_data['id'],
+                "enabled": led_data['enable'].value,
+                "led_on": led_data['led_on'],
+                "position": {
+                    "x": float(led_data['pos_x'].value),
+                    "y": float(led_data['pos_y'].value),
+                    "z": float(led_data['pos_z'].value)
+                },
+                "rotation": {
+                    "x": float(led_data['rot_x'].value),
+                    "y": float(led_data['rot_y'].value),
+                    "z": float(led_data['rot_z'].value)
+                },
+                "size": float(led_data['size'].value)
+            }
+            
+            # Add metadata if present (template source info)
+            if 'template_source' in led_data:
+                led_export['template_source'] = led_data['template_source']
+            if 'group_index' in led_data:
+                led_export['group_index'] = led_data['group_index']
+            
+            leds_export.append(led_export)
+        
+        # Generate filename with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"individual_leds_{timestamp}.json"
+        filepath = os.path.join(export_dir, filename)
+        
+        # Save to file
+        export_data = {
+            "format_version": "1.0",
+            "description": "Individual LEDs export - exact coordinates (no transformations)",
+            "export_date": timestamp,
+            "num_leds": len(leds_export),
+            "leds": leds_export
+        }
+        
+        with open(filepath, "w") as f:
+            json.dump(export_data, f, indent=2)
+        
+        print(f"✓ Exported {len(leds_export)} individual LED(s) to: {filename}")
+        return filepath
+    
     with individual_leds_folder:
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Add New Individual LED</div>")
         server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Add single LEDs with custom position, rotation, and size</div>")
         
         add_individual_led_btn = server.gui.add_button("➕ Add LED", color="cyan")
         
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export Individual LEDs</div>")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Save exact coordinates without transformations</div>")
+        
+        export_individual_leds_btn = server.gui.add_button("💾 Export to JSON", color="#4CAF50")
+        
         @add_individual_led_btn.on_click
         def _(_):
             create_individual_led()
             print("✓ Individual LED added")
+        
+        @export_individual_leds_btn.on_click
+        def _(_):
+            export_individual_leds_simple()
 
 
     # LED Control Matrix (individual LED and row control for base groups)
