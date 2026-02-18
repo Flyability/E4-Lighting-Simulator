@@ -1,0 +1,42 @@
+{
+    "name": "90",
+    "groups": [],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": -3.9,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": -2.7,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 0,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": 0.0,
+            "rot_x": -76,
+            "rot_y": -26,
+            "rot_z": -18,
+            "size": 0.5,
+            "viewing_angle": 120
+        }
+    ]
+}

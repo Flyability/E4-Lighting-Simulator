@@ -226,6 +226,13 @@ def create_leds(
                     sa_r * rotated_row_dir[0] + ca_r * rotated_row_dir[1],
                     rotated_row_dir[2],
                 ])
+                # Apply rotation Z to row_center as well (RIGID BODY)
+                row_center_rel = row_center - np.array([x, y, z])
+                row_center = np.array([x, y, z]) + np.array([
+                    ca_r * row_center_rel[0] - sa_r * row_center_rel[1],
+                    sa_r * row_center_rel[0] + ca_r * row_center_rel[1],
+                    row_center_rel[2],
+                ])
                 
                 # Tilt around axis perpendicular to radial: apply to rotated Z axis so rows follow group rotation
                 z_unit = np.array((0.0, 0.0, 1.0))
@@ -282,6 +289,7 @@ def create_leds(
             led_rotations = custom_group_config.get('led_rotations', [])
             led_sizes = custom_group_config.get('led_sizes', [])
             led_viewing_angles = custom_group_config.get('led_viewing_angles', [])
+            led_row_dirs = custom_group_config.get('led_row_directions', [])
             num_leds = custom_group_config.get('num_leds', 0)
             
             custom_color = (1.0, 0.0, 1.0)  # Magenta for custom group
@@ -303,6 +311,16 @@ def create_leds(
                 led_view_angle = led_viewing_angles[i] if i < len(led_viewing_angles) else viewing_angle
                 is_led_on = custom_led_states_array[i] if i < len(custom_led_states_array) else True
                 
+                # Get row direction: from config if available, else compute from direction
+                if i < len(led_row_dirs):
+                    row_dir = np.array(led_row_dirs[i])
+                else:
+                    # Compute default row direction from LED direction
+                    row_dir = np.cross(direction, [0, 0, 1])
+                    if np.linalg.norm(row_dir) < 0.01:
+                        row_dir = np.cross(direction, [0, 1, 0])
+                    row_dir = row_dir / np.linalg.norm(row_dir)
+                
                 led = LED(
                     width=size,
                     viewing_angle=led_view_angle,
@@ -312,7 +330,7 @@ def create_leds(
                 )
                 led.enabled = is_led_on
                 led.led_index = led_index
-                led.row_direction = np.array([0.0, 1.0, 0.0])  # Default row direction
+                led.row_direction = row_dir
                 led.is_custom = True  # Mark as custom group LED
                 led.is_dynamic_group = True  # Mark as dynamic group LED
                 leds.append(led)
@@ -320,6 +338,7 @@ def create_leds(
         else:
             # Standard custom group: 12 LEDs with fixed geometry
             custom_pos = custom_group_config.get('position', (0.0, 0.0, 0.0))
+            custom_rot_x_deg = custom_group_config.get('rotation_x', 0.0)
             custom_rot_y_deg = custom_group_config.get('rotation_y', 0.0)
             custom_rot_z_deg = custom_group_config.get('rotation_z', 0.0)
             custom_led_states_array = custom_group_config.get('led_states', [True] * 12)
@@ -344,6 +363,21 @@ def create_leds(
             x_axis = x_axis / np.linalg.norm(x_axis)
             y_axis = np.cross(z_axis, x_axis)
 
+            # Apply roll rotation (rotation_x) around radial/forward axis BEFORE the row loop
+            # For custom groups at 0°, radial = [1,0,0], so roll = standard Rx matrix
+            roll_rad = np.radians(custom_rot_x_deg)
+            cr, sr = np.cos(roll_rad), np.sin(roll_rad)
+            roll_matrix = np.array([
+                [1, 0, 0],
+                [0, cr, -sr],
+                [0, sr, cr]
+            ])
+            # Roll rotates the local frame axes (but not the radial/forward axis itself)
+            x_axis = roll_matrix @ x_axis
+            y_axis = roll_matrix @ y_axis
+            # The vertical direction used for row offsets also gets rolled
+            rolled_z = roll_matrix @ np.array([0.0, 0.0, 1.0])
+
             # LED spacing parameters
             led_spacing_cm = 0.8
             row_spacing_cm = 1.1
@@ -355,7 +389,8 @@ def create_leds(
             for row_idx, alpha_deg in enumerate(inclinations):
                 alpha = np.radians(alpha_deg)
                 center_off = row_offsets[row_idx]
-                row_center = np.array((x, y, z)) + np.array([0, 0, 1]) * center_off
+                # Use rolled Z direction for row offsets (rigid body)
+                row_center = np.array((x, y, z)) + rolled_z * center_off
 
                 # Compute rotated LED direction for this row
                 radial_unit = np.array([1.0, 0.0, 0.0])  # Points along +X
@@ -400,9 +435,16 @@ def create_leds(
                     sz * rotated_x_axis[0] + cz * rotated_x_axis[1],
                     rotated_x_axis[2],
                 ])
+                # Apply rotation Z to row_center as well (RIGID BODY: all positions must rotate together)
+                row_center_rel = row_center - np.array([x, y, z])
+                row_center = np.array([x, y, z]) + np.array([
+                    cz * row_center_rel[0] - sz * row_center_rel[1],
+                    sz * row_center_rel[0] + cz * row_center_rel[1],
+                    row_center_rel[2],
+                ])
                 
                 # Tilt around axis perpendicular to radial: apply to rotated Z axis so rows follow group rotation
-                z_unit = np.array((0.0, 0.0, 1.0))
+                z_unit = rolled_z.copy()  # Use rolled Z (accounts for rotation_x/roll)
                 # Apply Y local rotation to Z axis as well
                 rotated_z = rot_y_matrix @ z_unit
                 # Apply Z rotation to rotated Z axis
@@ -498,6 +540,24 @@ def create_leds(
         # Normalize direction
         direction = direction / np.linalg.norm(direction)
         
+        # Compute row_direction based on square_roll angle
+        # First, compute default row_direction perpendicular to direction
+        default_row_dir = np.cross(direction, np.array([0, 0, 1]))
+        if np.linalg.norm(default_row_dir) < 1e-6:
+            default_row_dir = np.cross(direction, np.array([0, 1, 0]))
+        default_row_dir = default_row_dir / np.linalg.norm(default_row_dir)
+        
+        # Apply square_roll: rotate row_direction around the LED's direction vector
+        square_roll_deg = individual_led_config.get('square_roll', 0.0)
+        if abs(square_roll_deg) > 0.01:
+            sq_roll_rad = np.radians(square_roll_deg)
+            # Rodrigues' rotation formula: rotate default_row_dir around direction by sq_roll_rad
+            k = direction  # rotation axis (already normalized)
+            v = default_row_dir
+            row_dir = v * np.cos(sq_roll_rad) + np.cross(k, v) * np.sin(sq_roll_rad) + k * np.dot(k, v) * (1 - np.cos(sq_roll_rad))
+        else:
+            row_dir = default_row_dir
+        
         # Create LED
         individual_color = (0.0, 1.0, 1.0)  # Cyan for individual LEDs
         led = LED(
@@ -509,7 +569,7 @@ def create_leds(
         )
         led.enabled = led_is_on  # LED is active only if turned on
         led.led_index = led_index
-        led.row_direction = np.array([0.0, 1.0, 0.0])  # Default row direction (Y axis)
+        led.row_direction = row_dir
         led.is_individual = True  # Mark as individual LED
         leds.append(led)
         led_index += 1
@@ -920,9 +980,9 @@ def _process_led_worker(args):
                 y = led.position[1] + world_dir[1] * t
                 intersections.append(('bottom', t, x, y))
         
-        # Back wall (behind LEDs, negative X direction)
+        # Back wall (at negative X, symmetric to front wall)
         if back_dist is not None and world_dir[0] < 0:
-            back_x_pos = led_x_center - back_dist
+            back_x_pos = -back_dist
             t = (back_x_pos - led.position[0]) / world_dir[0]
             if t > 0:
                 y = led.position[1] + world_dir[1] * t
@@ -1060,9 +1120,9 @@ def main():
             group_cfg = {
                 'enabled': group['enable'].value,
                 'position': [group['pos_x'].value, group['pos_y'].value, group['pos_z'].value],
-                'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
-                'rotation_y': group['rot_y'].value,
-                'rotation_z': group['rot_z'].value,
+                'rotation_x': 0.0,  # Rotations are baked into led_positions/led_rotations
+                'rotation_y': 0.0,
+                'rotation_z': 0.0,
                 'led_states': group['led_states'][:],
                 'template_name': group.get('template_name'),  # Save template association
                 'initial_pos': group.get('initial_pos', [0.0, 0.0, 0.0]),  # Save initial position
@@ -1072,8 +1132,10 @@ def main():
             if group.get('is_dynamic', False):
                 group_cfg['is_dynamic'] = True
                 group_cfg['num_leds'] = group.get('num_leds', 12)
-                group_cfg['led_positions'] = group.get('led_positions', [])
-                group_cfg['led_rotations'] = group.get('led_rotations', [])
+                # CRITICAL: Save ORIGINAL positions (not the current rotated ones!)
+                group_cfg['led_positions'] = group.get('original_led_positions', group.get('led_positions', []))
+                group_cfg['led_rotations'] = group.get('original_led_rotations', group.get('led_rotations', []))
+                group_cfg['led_row_directions'] = group.get('original_led_row_directions', group.get('led_row_directions', []))
                 group_cfg['led_sizes'] = group.get('led_sizes', [])
                 group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
                 group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
@@ -1204,6 +1266,18 @@ def main():
             else:
                 led_positions_relative = [(p[0] - group_pos[0], p[1] - group_pos[1], p[2] - group_pos[2]) for p in led_positions]
             
+            # Compute row directions from direction vectors
+            led_row_directions = []
+            for direction in led_rotations:
+                dir_arr = np.array(direction)
+                row_dir = np.cross(dir_arr, np.array([0, 0, 1]))
+                norm = np.linalg.norm(row_dir)
+                if norm > 1e-6:
+                    row_dir = row_dir / norm
+                else:
+                    row_dir = np.array([0, -1, 0])
+                led_row_directions.append(tuple(row_dir))
+            
             # Check if all LEDs are enabled
             all_enabled = all(led['enable'].value for led in leds_list_sorted)
             
@@ -1219,6 +1293,7 @@ def main():
                 'num_leds': num_leds,
                 'led_positions': led_positions_relative,
                 'led_rotations': led_rotations,
+                'led_row_directions': led_row_directions,
                 'led_sizes': led_sizes,
                 'led_viewing_angles': led_viewing_angles,
                 'led_rows': led_rows,
@@ -1242,7 +1317,8 @@ def main():
                 'rot_y': led['rot_y'].value,
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
-                'viewing_angle': led['viewing_angle'].value
+                'viewing_angle': led['viewing_angle'].value,
+                'square_roll': led['square_roll'].value
             })
         
         return {
@@ -1418,21 +1494,37 @@ def main():
                 group_data['is_dynamic'] = True
                 group_data['led_positions'] = group_cfg.get('led_positions', [])
                 group_data['led_rotations'] = group_cfg.get('led_rotations', [])
+                group_data['led_row_directions'] = group_cfg.get('led_row_directions', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
                 group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
+                # IMPORTANT: Positions in saved config are already RELATIVE
+                # They were saved with original_led_positions, use directly
+                group_data['original_led_positions'] = [tuple(pos) for pos in group_data['led_positions']]
+                group_data['original_led_rotations'] = [tuple(rot) for rot in group_data['led_rotations']]
+                if group_data['led_row_directions']:
+                    group_data['original_led_row_directions'] = [tuple(rd) for rd in group_data['led_row_directions']]
+                # Calculate rotation center
+                if group_data['led_positions']:
+                    positions_array = np.array(group_data['led_positions'])
+                    group_data['rotation_center'] = tuple(positions_array.mean(axis=0))
+                else:
+                    group_data['rotation_center'] = (0.0, 0.0, 0.0)
             else:
                 # Standard 12-LED group
                 group_data = create_custom_group(skip_update_scene=True)
             
-            # Apply saved position and rotation values first
+            # Apply saved position and rotation values
             pos = group_cfg.get('position', [0, 0, 0])
             group_data['pos_x'].value = pos[0]
             group_data['pos_y'].value = pos[1]
             group_data['pos_z'].value = pos[2]
-            if 'rot_x' in group_data:
-                group_data['rot_x'].value = group_cfg.get('rotation_x', 0)
-            group_data['rot_y'].value = group_cfg.get('rotation_y', 0)
-            group_data['rot_z'].value = group_cfg.get('rotation_z', 0)
+            # Rotations are always 0 (transformations are baked into led_positions/led_rotations)
+            if 'rot_tilt_lr' in group_data:
+                group_data['rot_tilt_lr'].value = 0
+            if 'rot_tilt_ud' in group_data:
+                group_data['rot_tilt_ud'].value = 0
+            if 'rot_roll' in group_data:
+                group_data['rot_roll'].value = 0
             
             # Load LED states BEFORE enabling the group
             led_states_cfg = group_cfg.get('led_states', [])
@@ -1483,8 +1575,26 @@ def main():
                     group_data['is_dynamic'] = True
                     group_data['led_positions'] = group_cfg.get('led_positions', [])
                     group_data['led_rotations'] = group_cfg.get('led_rotations', [])
+                    group_data['led_row_directions'] = group_cfg.get('led_row_directions', [])
                     group_data['led_sizes'] = group_cfg.get('led_sizes', [])
                     group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
+                    # IMPORTANT: Save RELATIVE positions as originals (subtract group offset)
+                    # The config contains absolute positions, we need relative ones
+                    group_offset = np.array([pos[0], pos[1], pos[2]])
+                    relative_positions = []
+                    for led_pos in group_data['led_positions']:
+                        relative_pos = np.array(led_pos) - group_offset
+                        relative_positions.append(tuple(relative_pos))
+                    group_data['original_led_positions'] = relative_positions
+                    group_data['original_led_rotations'] = [tuple(rot) for rot in group_data['led_rotations']]
+                    if group_data['led_row_directions']:
+                        group_data['original_led_row_directions'] = [tuple(rd) for rd in group_data['led_row_directions']]
+                    # Calculate rotation center
+                    if group_data['led_positions']:
+                        positions_array = np.array(group_data['led_positions'])
+                        group_data['rotation_center'] = tuple(positions_array.mean(axis=0))
+                    else:
+                        group_data['rotation_center'] = (0.0, 0.0, 0.0)
                 else:
                     # Standard 12-LED group
                     group_data = create_custom_group(skip_update_scene=True)
@@ -1494,10 +1604,13 @@ def main():
                 group_data['pos_x'].value = pos[0]
                 group_data['pos_y'].value = pos[1]
                 group_data['pos_z'].value = pos[2]
-                if 'rot_x' in group_data:
-                    group_data['rot_x'].value = group_cfg.get('rotation_x', 0)
-                group_data['rot_y'].value = group_cfg.get('rotation_y', 0)
-                group_data['rot_z'].value = group_cfg.get('rotation_z', 0)
+                # Rotations are always 0 (transformations are baked into led_positions/led_rotations)
+                if 'rot_tilt_lr' in group_data:
+                    group_data['rot_tilt_lr'].value = 0
+                if 'rot_tilt_ud' in group_data:
+                    group_data['rot_tilt_ud'].value = 0
+                if 'rot_roll' in group_data:
+                    group_data['rot_roll'].value = 0
                 
                 # Load LED states
                 led_states_cfg = group_cfg.get('led_states', [])
@@ -1667,17 +1780,16 @@ def main():
                         return
                     loading_in_progress[0] = True
                     
-                    # Build master rotation matrix
-                    rot_x_rad = np.radians(master_rot_x.value)
-                    rot_y_rad = np.radians(master_rot_y.value)
-                    rot_z_rad = np.radians(master_rot_z.value)
-                    
-                    Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
-                    Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
-                    Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
-                    R_master = Rz @ Ry @ Rx
-                    
                     master_pos_offset = np.array([master_pos_x.value, master_pos_y.value, master_pos_z.value])
+                    
+                    # Build master rotation matrix (extrinsic X-Y-Z)
+                    roll_rad = np.radians(master_rot_x.value)
+                    pitch_rad = np.radians(master_rot_y.value)
+                    yaw_rad = np.radians(master_rot_z.value)
+                    Rx = np.array([[1,0,0],[0,np.cos(roll_rad),-np.sin(roll_rad)],[0,np.sin(roll_rad),np.cos(roll_rad)]])
+                    Ry = np.array([[np.cos(pitch_rad),0,np.sin(pitch_rad)],[0,1,0],[-np.sin(pitch_rad),0,np.cos(pitch_rad)]])
+                    Rz = np.array([[np.cos(yaw_rad),-np.sin(yaw_rad),0],[np.sin(yaw_rad),np.cos(yaw_rad),0],[0,0,1]])
+                    R_master = Rz @ Ry @ Rx
                     
                     for group in groups_list:
                         group['enable'].value = master_enable.value
@@ -1685,15 +1797,17 @@ def main():
                             init_pos = np.array(group.get('initial_pos', [0.0, 0.0, 0.0]))
                             init_rot = np.array(group.get('initial_rot', [0, 0, 0]))
                             
-                            new_pos = R_master @ init_pos + master_pos_offset
-                            group['pos_x'].value = float(new_pos[0])
-                            group['pos_y'].value = float(new_pos[1])
-                            group['pos_z'].value = float(new_pos[2])
+                            # RIGID BODY: rotate group positions around template center
+                            rotated_pos = R_master @ init_pos + master_pos_offset
+                            group['pos_x'].value = float(rotated_pos[0])
+                            group['pos_y'].value = float(rotated_pos[1])
+                            group['pos_z'].value = float(rotated_pos[2])
                             
+                            # Add master rotations to initial rotations
                             new_rot = init_rot + np.array([master_rot_x.value, master_rot_y.value, master_rot_z.value])
-                            group['rot_x'].value = int(new_rot[0])
-                            group['rot_y'].value = int(new_rot[1])
-                            group['rot_z'].value = int(new_rot[2])
+                            group['rot_roll'].value = int(new_rot[0])
+                            group['rot_tilt_ud'].value = int(new_rot[1])
+                            group['rot_tilt_lr'].value = int(new_rot[2])
                     
                     loading_in_progress[0] = False
                     update_scene()
@@ -1814,6 +1928,7 @@ def main():
             led_data['rot_z'].value = led_cfg.get('rot_z', 0.0)
             led_data['size'].value = led_cfg.get('size', 0.5)
             led_data['viewing_angle'].value = led_cfg.get('viewing_angle', 120)
+            led_data['square_roll'].value = led_cfg.get('square_roll', 0)
         
         # Re-enable callbacks and do final scene update
         loading_in_progress[0] = False
@@ -2038,22 +2153,32 @@ def main():
                 # Standard 12-LED group
                 group_data = create_custom_group(skip_update_scene=True)
             
-            # Load position and rotation first
+            # Load position and rotation
             pos = group_cfg.get('position', [0, 0, 0])
             group_data['pos_x'].value = pos[0]
             group_data['pos_y'].value = pos[1]
             group_data['pos_z'].value = pos[2]
-            if 'rot_x' in group_data:
-                group_data['rot_x'].value = group_cfg.get('rotation_x', 0)
-            group_data['rot_y'].value = group_cfg.get('rotation_y', 0)
-            group_data['rot_z'].value = group_cfg.get('rotation_z', 0)
+            # Rotations are always 0 (transformations are baked into led_positions/led_rotations)
+            if 'rot_tilt_lr' in group_data:
+                group_data['rot_tilt_lr'].value = 0
+            if 'rot_tilt_ud' in group_data:
+                group_data['rot_tilt_ud'].value = 0
+            if 'rot_roll' in group_data:
+                group_data['rot_roll'].value = 0
             
             # Load dynamic group properties if present
             if group_cfg.get('is_dynamic', False):
                 group_data['is_dynamic'] = True
                 group_data['led_positions'] = group_cfg.get('led_positions', [])
                 group_data['led_rotations'] = group_cfg.get('led_rotations', [])
+                group_data['led_row_directions'] = group_cfg.get('led_row_directions', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
+                # IMPORTANT: Positions in template are already RELATIVE (not absolute!)
+                # They were saved with original_led_positions, so use them directly
+                group_data['original_led_positions'] = [tuple(pos) for pos in group_data['led_positions']]
+                group_data['original_led_rotations'] = [tuple(rot) for rot in group_data['led_rotations']]
+                if group_data['led_row_directions']:
+                    group_data['original_led_row_directions'] = [tuple(rd) for rd in group_data['led_row_directions']]
             
             # Load LED states BEFORE enabling the group to avoid IndexError
             led_states_cfg = group_cfg.get('led_states', [])
@@ -2168,6 +2293,20 @@ def main():
                 direction = direction / np.linalg.norm(direction)
                 led_rotations.append(tuple(direction))
             
+            # Compute row_direction for each LED
+            # Row direction is perpendicular to LED direction, lying in a plane
+            # For the Elios3 panel geometry, row_dir = cross(direction, [1,0,0]) normalized
+            # If direction is along X, use cross(direction, [0,0,1]) as fallback
+            led_row_directions = []
+            for direction_tuple in led_rotations:
+                d = np.array(direction_tuple)
+                # Use the same logic as standard panel: cross(z_axis, [0,0,1])
+                row_dir = np.cross(d, [0, 0, 1])
+                if np.linalg.norm(row_dir) < 0.01:
+                    row_dir = np.cross(d, [0, 1, 0])
+                row_dir = row_dir / np.linalg.norm(row_dir)
+                led_row_directions.append(tuple(row_dir))
+            
             # 5. Create custom group with dynamic structure
             group_data = create_custom_group(
                 skip_update_scene=True,
@@ -2182,6 +2321,17 @@ def main():
             group_data['led_rotations'] = led_rotations
             group_data['led_sizes'] = led_sizes
             group_data['led_viewing_angles'] = led_viewing_angles
+            # IMPORTANT: Save original positions/rotations immediately (never modify these)
+            group_data['original_led_positions'] = [tuple(pos) for pos in led_positions]
+            group_data['original_led_rotations'] = [tuple(rot) for rot in led_rotations]
+            group_data['led_row_directions'] = led_row_directions
+            group_data['original_led_row_directions'] = [tuple(rd) for rd in led_row_directions]
+            # Calculate rotation center
+            if led_positions:
+                positions_array = np.array(led_positions)
+                group_data['rotation_center'] = tuple(positions_array.mean(axis=0))
+            else:
+                group_data['rotation_center'] = (0.0, 0.0, 0.0)
             
             # Set LED states
             for i, state in enumerate(initial_led_states):
@@ -2353,34 +2503,32 @@ def main():
                 return
             loading_in_progress[0] = True
             
-            # Build master rotation matrix
-            rot_x_rad = np.radians(master_rot_x.value)
-            rot_y_rad = np.radians(master_rot_y.value)
-            rot_z_rad = np.radians(master_rot_z.value)
-            
-            Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
-            Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
-            Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
-            R_master = Rz @ Ry @ Rx
-            
             master_pos_offset = np.array([master_pos_x.value, master_pos_y.value, master_pos_z.value])
+            
+            # Build master rotation matrix (extrinsic X-Y-Z)
+            roll_rad = np.radians(master_rot_x.value)
+            pitch_rad = np.radians(master_rot_y.value)
+            yaw_rad = np.radians(master_rot_z.value)
+            Rx = np.array([[1,0,0],[0,np.cos(roll_rad),-np.sin(roll_rad)],[0,np.sin(roll_rad),np.cos(roll_rad)]])
+            Ry = np.array([[np.cos(pitch_rad),0,np.sin(pitch_rad)],[0,1,0],[-np.sin(pitch_rad),0,np.cos(pitch_rad)]])
+            Rz = np.array([[np.cos(yaw_rad),-np.sin(yaw_rad),0],[np.sin(yaw_rad),np.cos(yaw_rad),0],[0,0,1]])
+            R_master = Rz @ Ry @ Rx
             
             for idx, group in enumerate(created_groups):
                 group['enable'].value = master_enable.value
                 
-                # Rotate initial position around origin, then add position offset
+                # RIGID BODY: rotate group positions around template center
                 initial_pos = np.array(initial_positions[idx])
-                rotated_pos = R_master @ initial_pos
-                final_pos = rotated_pos + master_pos_offset
+                rotated_pos = R_master @ initial_pos + master_pos_offset
                 
-                group['pos_x'].value = final_pos[0]
-                group['pos_y'].value = final_pos[1]
-                group['pos_z'].value = final_pos[2]
+                group['pos_x'].value = float(rotated_pos[0])
+                group['pos_y'].value = float(rotated_pos[1])
+                group['pos_z'].value = float(rotated_pos[2])
                 
                 # Add master rotations to initial rotations
-                group['rot_x'].value = initial_rotations[idx][0] + master_rot_x.value
-                group['rot_y'].value = initial_rotations[idx][1] + master_rot_y.value
-                group['rot_z'].value = initial_rotations[idx][2] + master_rot_z.value
+                group['rot_roll'].value = initial_rotations[idx][0] + master_rot_x.value
+                group['rot_tilt_ud'].value = initial_rotations[idx][1] + master_rot_y.value
+                group['rot_tilt_lr'].value = initial_rotations[idx][2] + master_rot_z.value
             loading_in_progress[0] = False
             update_scene()
         
@@ -2515,17 +2663,20 @@ def main():
                         group_cfg = {
                             'enabled': group['enable'].value,
                             'position': [group['pos_x'].value, group['pos_y'].value, group['pos_z'].value],
-                            'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
-                            'rotation_y': group['rot_y'].value,
-                            'rotation_z': group['rot_z'].value,
+                            'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
+                            'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
+                            'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                             'led_states': group['led_states'][:]
                         }
                         # Save dynamic group properties if present
                         if group.get('is_dynamic', False):
                             group_cfg['is_dynamic'] = True
                             group_cfg['num_leds'] = group.get('num_leds', 12)
-                            group_cfg['led_positions'] = group.get('led_positions', [])
-                            group_cfg['led_rotations'] = group.get('led_rotations', [])
+                            # CRITICAL: Save ORIGINAL positions (not the current rotated ones!)
+                            # This ensures template always contains undeformed geometry
+                            group_cfg['led_positions'] = group.get('original_led_positions', group.get('led_positions', []))
+                            group_cfg['led_rotations'] = group.get('original_led_rotations', group.get('led_rotations', []))
+                            group_cfg['led_row_directions'] = group.get('original_led_row_directions', group.get('led_row_directions', []))
                             group_cfg['led_sizes'] = group.get('led_sizes', [])
                             group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
                             group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
@@ -3027,10 +3178,10 @@ def main():
             "Front wall distance (cm)", min=20, max=200, step=10, initial_value=50
         )
         room_side_dist = server.gui.add_slider(
-            "Side walls distance (cm)", min=50, max=300, step=10, initial_value=150
+            "Side walls distance (cm)", min=20, max=300, step=10, initial_value=50
         )
         room_top_bottom_dist = server.gui.add_slider(
-            "Top/Bottom walls distance (cm)", min=50, max=300, step=10, initial_value=150
+            "Top/Bottom walls distance (cm)", min=20, max=300, step=10, initial_value=50
         )
         show_back_wall = server.gui.add_checkbox("Show Back Wall", initial_value=False)
         room_back_dist = server.gui.add_slider(
@@ -3254,9 +3405,9 @@ def main():
             pos_x = server.gui.add_slider("Position X (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
             pos_y = server.gui.add_slider("Position Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
             pos_z = server.gui.add_slider("Position Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-            rot_x = server.gui.add_slider("Rotation X - Red axis (°)", min=-180, max=180, step=1, initial_value=0)
-            rot_y = server.gui.add_slider("Rotation Y - Green axis (°)", min=-180, max=180, step=1, initial_value=0)
-            rot_z = server.gui.add_slider("Rotation Z - Blue axis (°)", min=-180, max=180, step=1, initial_value=0)
+            rot_tilt_lr = server.gui.add_slider("Inclina Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=0)
+            rot_tilt_ud = server.gui.add_slider("Inclina Alto/Basso (°)", min=-180, max=180, step=1, initial_value=0)
+            rot_roll = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
             remove_btn = server.gui.add_button("Remove Group", color="red")
             
             server.gui.add_html("<hr style='margin:4px 0;'><b>LED Controls:</b>")
@@ -3295,9 +3446,9 @@ def main():
             'pos_x': pos_x,
             'pos_y': pos_y,
             'pos_z': pos_z,
-            'rot_x': rot_x,
-            'rot_y': rot_y,
-            'rot_z': rot_z,
+            'rot_tilt_lr': rot_tilt_lr,
+            'rot_tilt_ud': rot_tilt_ud,
+            'rot_roll': rot_roll,
             'remove_btn': remove_btn,
             'led_states': led_states,
             'led_rows': led_rows,  # Store row organization
@@ -3309,6 +3460,11 @@ def main():
             'template_name': None,  # Will be set if created from template
             'initial_pos': [0.0, 0.0, 0.0],  # Initial position before master transforms
             'initial_rot': [0, 0, 0],  # Initial rotation before master transforms
+            'rotation_center': None,  # Center point for rotations (calculated once)
+            'original_led_positions': None,  # Original LED positions (never modified)
+            'original_led_rotations': None,  # Original LED directions (never modified)
+            'led_row_directions': None,  # Row direction for each LED (for square orientation)
+            'original_led_row_directions': None,  # Original row directions (never modified)
         }
         
         # Function to update button colors based on LED states
@@ -3369,14 +3525,105 @@ def main():
             led_buttons[led_idx].on_click(make_led_handler(led_idx))
         remove_btn.on_click(on_remove)
         
+        # Rotation callbacks - apply rotation to LED directions only (keep positions fixed)
+        def apply_rotation_transform():
+            """Apply current rotation sliders to group's LED directions (NOT positions)."""
+            if not group_data.get('is_dynamic', False):
+                return  # Only applies to dynamic groups with led_positions/led_rotations
+            
+            # Get rotation angles from sliders (Euler angles)
+            roll_deg = rot_roll.value        # Rotation around X axis
+            pitch_deg = rot_tilt_ud.value    # Rotation around Y axis
+            yaw_deg = rot_tilt_lr.value      # Rotation around Z axis
+            
+            # Check if original rotations are available
+            if group_data.get('original_led_rotations') is None:
+                return  # No original rotations saved yet
+            
+            # Build rotation matrices for Euler angles (extrinsic rotations)
+            # Applied to the FIXED initial reference frame
+            roll_rad = np.radians(roll_deg)
+            pitch_rad = np.radians(pitch_deg)
+            yaw_rad = np.radians(yaw_deg)
+            
+            # Rotation matrix around X axis (roll)
+            Rx = np.array([
+                [1, 0, 0],
+                [0, np.cos(roll_rad), -np.sin(roll_rad)],
+                [0, np.sin(roll_rad), np.cos(roll_rad)]
+            ])
+            
+            # Rotation matrix around Y axis (pitch)
+            Ry = np.array([
+                [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
+                [0, 1, 0],
+                [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
+            ])
+            
+            # Rotation matrix around Z axis (yaw)
+            Rz = np.array([
+                [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
+                [np.sin(yaw_rad), np.cos(yaw_rad), 0],
+                [0, 0, 1]
+            ])
+            
+            # Compose rotations: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
+            # (applied right to left: first X, then Y, then Z in fixed frame)
+            R_total = Rz @ Ry @ Rx
+            
+            # RIGID BODY rotation: rotate BOTH positions AND directions
+            # R is orthogonal, so all distances are preserved
+            original_positions = group_data.get('original_led_positions')
+            original_rotations = group_data['original_led_rotations']
+            
+            # Rotate positions (relative to group center)
+            if original_positions is not None:
+                rotated_positions = []
+                for pos in original_positions:
+                    pos_rotated = R_total @ np.array(pos)
+                    rotated_positions.append(tuple(pos_rotated))
+                group_data['led_positions'] = rotated_positions
+            
+            # Rotate direction vectors
+            rotated_directions = []
+            for direction in original_rotations:
+                dir_rotated = R_total @ np.array(direction)
+                rotated_directions.append(tuple(dir_rotated))
+            
+            group_data['led_rotations'] = rotated_directions
+            
+            # Rotate row direction vectors
+            original_row_dirs = group_data.get('original_led_row_directions')
+            if original_row_dirs is not None:
+                rotated_row_dirs = []
+                for rd in original_row_dirs:
+                    rd_rotated = R_total @ np.array(rd)
+                    rotated_row_dirs.append(tuple(rd_rotated))
+                group_data['led_row_directions'] = rotated_row_dirs
+        
+        def on_rot_tilt_lr_update(_):
+            if not loading_in_progress[0]:
+                apply_rotation_transform()
+                update_scene()
+        
+        def on_rot_tilt_ud_update(_):
+            if not loading_in_progress[0]:
+                apply_rotation_transform()
+                update_scene()
+        
+        def on_rot_roll_update(_):
+            if not loading_in_progress[0]:
+                apply_rotation_transform()
+                update_scene()
+        
         # Register slider callbacks (check loading flag to prevent updates during config load)
         enable_chk.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         pos_x.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         pos_y.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         pos_z.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
-        rot_x.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
-        rot_y.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
-        rot_z.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        rot_tilt_lr.on_update(on_rot_tilt_lr_update)
+        rot_tilt_ud.on_update(on_rot_tilt_ud_update)
+        rot_roll.on_update(on_rot_roll_update)
         
         custom_groups.append(group_data)
         
@@ -3633,6 +3880,9 @@ def main():
             server.gui.add_html("<b>Viewing Angle:</b>")
             viewing_angle_slider = server.gui.add_slider("Viewing angle (°)", min=10, max=130, step=5, initial_value=120)
             
+            server.gui.add_html("<b>Rotazione quadrato:</b>")
+            square_roll_slider = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
+            
             remove_btn = server.gui.add_button("Remove LED", color="red")
         
         # Store LED data
@@ -3650,6 +3900,7 @@ def main():
             'rot_z': rot_z,
             'size': size_slider,
             'viewing_angle': viewing_angle_slider,
+            'square_roll': square_roll_slider,
             'remove_btn': remove_btn,
         }
         
@@ -3677,6 +3928,7 @@ def main():
         rot_z.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         size_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         viewing_angle_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        square_roll_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         remove_btn.on_click(on_remove)
         
         individual_leds.append(led_data)
@@ -3715,7 +3967,8 @@ def main():
                     "z": float(led_data['rot_z'].value)
                 },
                 "size": float(led_data['size'].value),
-                "viewing_angle": float(led_data['viewing_angle'].value)
+                "viewing_angle": float(led_data['viewing_angle'].value),
+                "square_roll": float(led_data['square_roll'].value)
             }
             
             # Add metadata if present (template source info)
@@ -3914,20 +4167,16 @@ def main():
         # Increase depth (X axis) for side/top/bottom walls by at least 2x
         side_topbottom_depth_x = wall_width_x * 2.5  # 2.5x depth for lateral, top, bottom walls
         
-        # Find maximum dimension to establish uniform cell size
-        max_dimension = max(side_topbottom_depth_x, wall_width_y, wall_height_z)
-        cell_size = max_dimension / grid_size  # Physical size of each cell
+        # Each wall gets grid_size x grid_size cells to ensure complete coverage
+        # Cells adapt to exact wall dimensions
+        front_grid_y = grid_size
+        front_grid_z = grid_size
         
-        # Calculate grid dimensions for each wall to have uniform cell size
-        # Each wall gets grid dimensions proportional to its physical size
-        front_grid_y = max(2, int(np.ceil(wall_width_y / cell_size)))  # Y direction
-        front_grid_z = max(2, int(np.ceil(wall_height_z / cell_size)))  # Z direction
+        side_grid_x = grid_size
+        side_grid_z = grid_size
         
-        side_grid_x = max(2, int(np.ceil(side_topbottom_depth_x / cell_size)))  # X direction for left/right (increased)
-        side_grid_z = max(2, int(np.ceil(wall_height_z / cell_size)))  # Z direction for left/right
-        
-        topbottom_grid_x = max(2, int(np.ceil(side_topbottom_depth_x / cell_size)))  # X direction for top/bottom (increased)
-        topbottom_grid_y = max(2, int(np.ceil(wall_width_y / cell_size)))  # Y direction for top/bottom
+        topbottom_grid_x = grid_size
+        topbottom_grid_y = grid_size
         
         # Initialize grids for each wall with appropriate dimensions
         # Grid indexed as [gi, gj] where gi is first axis (vertical/rows), gj is second axis (horizontal/cols)
@@ -3949,21 +4198,21 @@ def main():
         
         wall_specs = {
             'front': {'size_y': wall_width_y, 'size_z': wall_height_z, 'dims': ('y', 'z'), 
-                     'grid_y': front_grid_y, 'grid_z': front_grid_z, 'cell_size': cell_size},
+                     'grid_y': front_grid_y, 'grid_z': front_grid_z},
             'left': {'size_x': side_topbottom_depth_x, 'size_z': wall_height_z, 'dims': ('x', 'z'), 'x_min': extended_x_min,
-                    'grid_x': side_grid_x, 'grid_z': side_grid_z, 'cell_size': cell_size},
+                    'grid_x': side_grid_x, 'grid_z': side_grid_z},
             'right': {'size_x': side_topbottom_depth_x, 'size_z': wall_height_z, 'dims': ('x', 'z'), 'x_min': extended_x_min,
-                     'grid_x': side_grid_x, 'grid_z': side_grid_z, 'cell_size': cell_size},
+                     'grid_x': side_grid_x, 'grid_z': side_grid_z},
             'top': {'size_x': side_topbottom_depth_x, 'size_y': wall_width_y, 'dims': ('x', 'y'), 'x_min': extended_x_min,
-                   'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y, 'cell_size': cell_size},
+                   'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y},
             'bottom': {'size_x': side_topbottom_depth_x, 'size_y': wall_width_y, 'dims': ('x', 'y'), 'x_min': extended_x_min,
-                      'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y, 'cell_size': cell_size}
+                      'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y}
         }
         
         # Add back wall specs if enabled
         if back_dist is not None:
             wall_specs['back'] = {'size_y': wall_width_y, 'size_z': wall_height_z, 'dims': ('y', 'z'),
-                                 'grid_y': front_grid_y, 'grid_z': front_grid_z, 'cell_size': cell_size}
+                                 'grid_y': front_grid_y, 'grid_z': front_grid_z}
         
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
@@ -3974,10 +4223,11 @@ def main():
         print(f"Front wall: x={front_dist}cm, Left: y={-side_dist}cm, Right: y={+side_dist}cm")
         print(f"Top: z={+top_bottom_dist}cm, Bottom: z={-top_bottom_dist}cm")
         if back_dist is not None:
-            back_x_pos = circle_center_slider.value - back_dist
-            print(f"Back wall: x={back_x_pos}cm")
-        print(f"Uniform cell size: {cell_size:.2f}cm")
-        print(f"Grid resolutions: Front {front_grid_y}×{front_grid_z}, Side {side_grid_x}×{side_grid_z}, Top/Bottom {topbottom_grid_x}×{topbottom_grid_y}")
+            print(f"Back wall: x={-back_dist}cm")
+        print(f"Grid: {grid_size}×{grid_size} cells per wall (cells adapt to each wall's dimensions)")
+        print(f"Cell sizes: Front {wall_width_y/front_grid_y:.2f}×{wall_height_z/front_grid_z:.2f}cm, "
+              f"Side {side_topbottom_depth_x/side_grid_x:.2f}×{wall_height_z/side_grid_z:.2f}cm, "
+              f"Top/Bottom {side_topbottom_depth_x/topbottom_grid_x:.2f}×{wall_width_y/topbottom_grid_y:.2f}cm")
         
         # Track ray hits per wall for debugging
         ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
@@ -4119,9 +4369,9 @@ def main():
             config = {
                 'enabled': group['enable'].value,
                 'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
-                'rotation_y': group['rot_y'].value,
-                'rotation_z': group['rot_z'].value,
+                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
+                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
+                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
@@ -4129,75 +4379,83 @@ def main():
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
                 
-                # Get rotation angles
-                rot_x_deg = group['rot_x'].value if 'rot_x' in group else 0
-                rot_y_deg = group['rot_y'].value
-                rot_z_deg = group['rot_z'].value
+                # Get rotation angles (Euler angles in fixed frame)
+                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0  # Rotation around X
+                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0  # Rotation around Y
+                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0  # Rotation around Z
                 
-                # Convert to radians
-                rot_x_rad = np.radians(rot_x_deg)
-                rot_y_rad = np.radians(rot_y_deg)
-                rot_z_rad = np.radians(rot_z_deg)
+                # Build Euler rotation matrices (extrinsic X-Y-Z)
+                roll_rad = np.radians(roll_deg)
+                pitch_rad = np.radians(pitch_deg)
+                yaw_rad = np.radians(yaw_deg)
                 
-                # Rotation matrices
-                # Rotation around X axis (red)
+                # Rotation matrix around X axis
                 Rx = np.array([
                     [1, 0, 0],
-                    [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)],
-                    [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]
+                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
+                    [0, np.sin(roll_rad), np.cos(roll_rad)]
                 ])
                 
-                # Rotation around Y axis (green)
+                # Rotation matrix around Y axis
                 Ry = np.array([
-                    [np.cos(rot_y_rad), 0, np.sin(rot_y_rad)],
+                    [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
                     [0, 1, 0],
-                    [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]
+                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
                 ])
                 
-                # Rotation around Z axis (blue)
+                # Rotation matrix around Z axis
                 Rz = np.array([
-                    [np.cos(rot_z_rad), -np.sin(rot_z_rad), 0],
-                    [np.sin(rot_z_rad), np.cos(rot_z_rad), 0],
+                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
+                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
                     [0, 0, 1]
                 ])
                 
-                # Combined rotation: Rz * Ry * Rx
-                R_combined = Rz @ Ry @ Rx
+                # Compose: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
+                R_total = Rz @ Ry @ Rx
                 
-                # Calculate center of original positions
-                original_positions = group.get('led_positions', [])
-                if original_positions:
-                    positions_array = np.array(original_positions)
-                    center = positions_array.mean(axis=0)
-                else:
-                    center = np.array([0.0, 0.0, 0.0])
-                
-                # Apply rotation to positions (around center) and then translation
+                # RIGID BODY rotation: rotate BOTH positions AND directions
+                # R is orthogonal => all distances are preserved
                 position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                rotated_positions = []
-                for orig_pos in original_positions:
-                    # Move to origin (relative to center)
-                    pos_relative = np.array(orig_pos) - center
-                    # Rotate
-                    rotated_relative = R_combined @ pos_relative
-                    # Move back and apply translation offset
-                    final_pos = rotated_relative + center + position_offset
-                    rotated_positions.append(tuple(final_pos))
                 
-                # Apply rotations to LED directions
-                # original_rotations now contains direction vectors, not angles
-                original_rotations = group.get('led_rotations', [])
+                # Save originals if missing (for backward compatibility)
+                if 'original_led_positions' not in group and 'led_positions' in group:
+                    relative_positions = []
+                    for led_pos in group.get('led_positions', []):
+                        relative_pos = np.array(led_pos) - position_offset
+                        relative_positions.append(tuple(relative_pos))
+                    group['original_led_positions'] = relative_positions
+                if 'original_led_rotations' not in group and 'led_rotations' in group:
+                    group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
+                if 'original_led_row_directions' not in group and 'led_row_directions' in group:
+                    group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
+
+                # Get originals
+                original_positions = group.get('original_led_positions', group.get('led_positions', []))
+                original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
+                
+                # Rotate relative positions then translate (rigid body)
+                translated_positions = []
+                for orig_pos in original_positions:
+                    rotated_pos = R_total @ np.array(orig_pos)
+                    final_pos = rotated_pos + position_offset
+                    translated_positions.append(tuple(final_pos))
+                
+                # Rotate direction vectors
                 rotated_directions = []
                 for orig_dir in original_rotations:
-                    # Direct rotation of direction vector
-                    dir_array = np.array(orig_dir)
-                    rotated_dir = R_combined @ dir_array
+                    rotated_dir = R_total @ np.array(orig_dir)
                     rotated_directions.append(tuple(rotated_dir))
                 
-                config['led_positions'] = rotated_positions
+                config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
+                
+                # Rotate row direction vectors
+                original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
+                if original_row_dirs:
+                    rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
+                    config['led_row_directions'] = rotated_row_dirs
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -4213,6 +4471,8 @@ def main():
                 'rot_y': led['rot_y'].value,
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
+                'viewing_angle': led['viewing_angle'].value,
+                'square_roll': led['square_roll'].value,
             }
             individual_leds_configs.append(config)
         
@@ -4688,9 +4948,9 @@ def main():
             config = {
                 'enabled': group['enable'].value,
                 'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
-                'rotation_y': group['rot_y'].value,
-                'rotation_z': group['rot_z'].value,
+                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
+                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
+                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
@@ -4698,74 +4958,82 @@ def main():
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
                 
-                # Get rotation angles
-                rot_x_deg = group['rot_x'].value if 'rot_x' in group else 0
-                rot_y_deg = group['rot_y'].value
-                rot_z_deg = group['rot_z'].value
+                # Get rotation angles (Euler angles in fixed frame)
+                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0  # Rotation around X
+                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0  # Rotation around Y
+                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0  # Rotation around Z
                 
-                # Convert to radians
-                rot_x_rad = np.radians(rot_x_deg)
-                rot_y_rad = np.radians(rot_y_deg)
-                rot_z_rad = np.radians(rot_z_deg)
+                # Build Euler rotation matrices (extrinsic X-Y-Z)
+                roll_rad = np.radians(roll_deg)
+                pitch_rad = np.radians(pitch_deg)
+                yaw_rad = np.radians(yaw_deg)
                 
-                # Rotation matrices
-                # Rotation around X axis (red)
+                # Rotation matrix around X axis
                 Rx = np.array([
                     [1, 0, 0],
-                    [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)],
-                    [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]
+                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
+                    [0, np.sin(roll_rad), np.cos(roll_rad)]
                 ])
                 
-                # Rotation around Y axis (green)
+                # Rotation matrix around Y axis
                 Ry = np.array([
-                    [np.cos(rot_y_rad), 0, np.sin(rot_y_rad)],
+                    [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
                     [0, 1, 0],
-                    [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]
+                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
                 ])
                 
-                # Rotation around Z axis (blue)
+                # Rotation matrix around Z axis
                 Rz = np.array([
-                    [np.cos(rot_z_rad), -np.sin(rot_z_rad), 0],
-                    [np.sin(rot_z_rad), np.cos(rot_z_rad), 0],
+                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
+                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
                     [0, 0, 1]
                 ])
                 
-                # Combined rotation: Rz * Ry * Rx
-                R_combined = Rz @ Ry @ Rx
+                # Compose: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
+                R_total = Rz @ Ry @ Rx
                 
-                # Calculate center of original positions
-                original_positions = group.get('led_positions', [])
-                if original_positions:
-                    positions_array = np.array(original_positions)
-                    center = positions_array.mean(axis=0)
-                else:
-                    center = np.array([0.0, 0.0, 0.0])
-                
-                # Apply rotation to positions (around center) and then translation
+                # RIGID BODY rotation: rotate BOTH positions AND directions
+                # R is orthogonal => all distances are preserved
                 position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                rotated_positions = []
-                for orig_pos in original_positions:
-                    # Move to origin (relative to center)
-                    pos_relative = np.array(orig_pos) - center
-                    # Rotate
-                    rotated_relative = R_combined @ pos_relative
-                    # Move back and apply translation offset
-                    final_pos = rotated_relative + center + position_offset
-                    rotated_positions.append(tuple(final_pos))
                 
-                # Apply rotations to LED directions
-                # original_rotations now contains direction vectors, not angles
-                original_rotations = group.get('led_rotations', [])
+                # Save originals if missing (for backward compatibility)
+                if 'original_led_positions' not in group and 'led_positions' in group:
+                    relative_positions = []
+                    for led_pos in group.get('led_positions', []):
+                        relative_pos = np.array(led_pos) - position_offset
+                        relative_positions.append(tuple(relative_pos))
+                    group['original_led_positions'] = relative_positions
+                if 'original_led_rotations' not in group and 'led_rotations' in group:
+                    group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
+                if 'original_led_row_directions' not in group and 'led_row_directions' in group:
+                    group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
+
+                # Get originals
+                original_positions = group.get('original_led_positions', group.get('led_positions', []))
+                original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
+                
+                # Rotate relative positions then translate (rigid body)
+                translated_positions = []
+                for orig_pos in original_positions:
+                    rotated_pos = R_total @ np.array(orig_pos)
+                    final_pos = rotated_pos + position_offset
+                    translated_positions.append(tuple(final_pos))
+                
+                # Rotate direction vectors
                 rotated_directions = []
                 for orig_dir in original_rotations:
-                    # Direct rotation of direction vector
-                    dir_array = np.array(orig_dir)
-                    rotated_dir = R_combined @ dir_array
+                    rotated_dir = R_total @ np.array(orig_dir)
                     rotated_directions.append(tuple(rotated_dir))
                 
-                config['led_positions'] = rotated_positions
+                config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
+                
+                # Rotate row direction vectors
+                original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
+                if original_row_dirs:
+                    rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
+                    config['led_row_directions'] = rotated_row_dirs
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -4782,6 +5050,7 @@ def main():
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
                 'viewing_angle': led['viewing_angle'].value,
+                'square_roll': led['square_roll'].value,
             }
             individual_leds_configs.append(config)
         
@@ -5099,13 +5368,13 @@ def main():
         )
         room_wall_handles.append(handle)
         
-        # Back wall (YZ plane at x=back_dist behind LEDs) - optional
+        # Back wall (YZ plane at x=-back_dist) - optional
         if show_back_wall.value:
             back_dist = room_back_dist.value
             back_width = 2 * side_dist / 100.0  # Y direction
             back_height = 2 * top_bottom_dist / 100.0  # Z direction
-            # Back wall is behind the LEDs (negative X direction)
-            back_x_pos = led_x_min / 100.0 - back_dist / 100.0
+            # Back wall is at negative X (symmetric to front wall)
+            back_x_pos = -back_dist / 100.0
             handle = server.scene.add_box(
                 "/room_walls/back",
                 dimensions=(0.01, back_width, back_height),
@@ -5376,7 +5645,7 @@ def main():
                         cell_size_x = size_x / grid_x
                         cell_size_y = size_y / grid_y
                         x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                        y_pos = (-size_y/2 + (grid_shape[0] - 1 - gi) * cell_size_y + cell_size_y / 2) / 100.0
+                        y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
                         z_pos = top_bottom_dist / 100.0
                         dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
                     
@@ -5395,15 +5664,14 @@ def main():
                         dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
                     
                     elif wall_name == 'back':
-                        # YZ plane at x=back_x_pos (behind LEDs)
+                        # YZ plane at x=-back_dist (symmetric to front wall)
                         size_y = wall_spec['size_y']
                         size_z = wall_spec['size_z']
                         grid_y = wall_spec['grid_y']
                         grid_z = wall_spec['grid_z']
                         cell_size_y = size_y / grid_y
                         cell_size_z = size_z / grid_z
-                        led_x_center = circle_center_slider.value
-                        back_x_pos = led_x_center - room_back_dist.value
+                        back_x_pos = -room_back_dist.value
                         x_pos = back_x_pos / 100.0
                         y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
                         z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
@@ -5428,29 +5696,39 @@ def main():
         # Update legend (grid stores lux)
         legend_steps = 6
         legend_vals_lux = np.linspace(0, max_lux, legend_steps)
-        # Calculate cell size for lux to lumen conversion (use max dimension approach)
-        # Cell size is uniform across all walls based on max dimension / grid_size
-        led_width = wall_specs['front']['size_y']  # Use front wall width as reference
-        led_height = wall_specs['front']['size_z']  # Use front wall height as reference
-        led_x_min = min(ws['x_min'] for ws in wall_specs.values() if 'x_min' in ws)
-        led_x_max = front_dist
-        led_depth = led_x_max - led_x_min
-        max_dimension = max(led_width, led_height, led_depth)
-        cell_size_cm = max_dimension / grid_size
-        cell_size_m = cell_size_cm / 100.0
-        cell_area_m2 = cell_size_m * cell_size_m
+        # Calculate average cell area across all walls for lux to lumen conversion
+        total_cells = 0
+        total_area_cm2 = 0
+        for wall_name, spec in wall_specs.items():
+            if wall_name in ('front', 'back'):
+                cell_width_cm = spec['size_y'] / spec['grid_y']
+                cell_height_cm = spec['size_z'] / spec['grid_z']
+            elif wall_name in ['left', 'right']:
+                cell_width_cm = spec['size_x'] / spec['grid_x']
+                cell_height_cm = spec['size_z'] / spec['grid_z']
+            else:  # top, bottom
+                cell_width_cm = spec['size_x'] / spec['grid_x']
+                cell_height_cm = spec['size_y'] / spec['grid_y']
+            cell_area = cell_width_cm * cell_height_cm
+            num_cells = spec.get('grid_y', spec.get('grid_x', 1)) * spec.get('grid_z', spec.get('grid_y', 1))
+            total_cells += num_cells
+            total_area_cm2 += cell_area * num_cells
+        
+        avg_cell_area_cm2 = total_area_cm2 / total_cells if total_cells > 0 else 1.0
+        avg_cell_area_m2 = avg_cell_area_cm2 / 10000.0
+        
         html_lines = ["<div style='font-family: sans-serif;'>",
                       "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend (lux)</div>"]
         for lux_val in reversed(legend_vals_lux):
             color = intensity_to_color(lux_val, max_lux)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            # Convert lux to lumens for this cell: Lumen = Lux × Area
-            lumen_val = lux_val * cell_area_m2
+            # Convert lux to lumens using average cell area: Lumen = Lux × Area
+            lumen_val = lux_val * avg_cell_area_m2
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
                 f"<div style='min-width:70px;'>{lux_val:.1f} lx</div>"
-                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
+                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell avg)</div></div>"
             )
         html_lines.append("</div>")
         legend_html.content = "".join(html_lines)
@@ -5550,9 +5828,9 @@ def main():
             config = {
                 'enabled': group['enable'].value,
                 'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_x'].value if 'rot_x' in group else 0,
-                'rotation_y': group['rot_y'].value,
-                'rotation_z': group['rot_z'].value,
+                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
+                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
+                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
@@ -5560,75 +5838,83 @@ def main():
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
                 
-                # Get rotation angles
-                rot_x_deg = group['rot_x'].value if 'rot_x' in group else 0
-                rot_y_deg = group['rot_y'].value
-                rot_z_deg = group['rot_z'].value
+                # Get rotation angles (Euler angles in fixed frame)
+                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0  # Rotation around X
+                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0  # Rotation around Y
+                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0  # Rotation around Z
                 
-                # Convert to radians
-                rot_x_rad = np.radians(rot_x_deg)
-                rot_y_rad = np.radians(rot_y_deg)
-                rot_z_rad = np.radians(rot_z_deg)
+                # Build Euler rotation matrices (extrinsic X-Y-Z)
+                roll_rad = np.radians(roll_deg)
+                pitch_rad = np.radians(pitch_deg)
+                yaw_rad = np.radians(yaw_deg)
                 
-                # Rotation matrices
-                # Rotation around X axis (red)
+                # Rotation matrix around X axis
                 Rx = np.array([
                     [1, 0, 0],
-                    [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)],
-                    [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]
+                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
+                    [0, np.sin(roll_rad), np.cos(roll_rad)]
                 ])
                 
-                # Rotation around Y axis (green)
+                # Rotation matrix around Y axis
                 Ry = np.array([
-                    [np.cos(rot_y_rad), 0, np.sin(rot_y_rad)],
+                    [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
                     [0, 1, 0],
-                    [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]
+                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
                 ])
                 
-                # Rotation around Z axis (blue)
+                # Rotation matrix around Z axis
                 Rz = np.array([
-                    [np.cos(rot_z_rad), -np.sin(rot_z_rad), 0],
-                    [np.sin(rot_z_rad), np.cos(rot_z_rad), 0],
+                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
+                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
                     [0, 0, 1]
                 ])
                 
-                # Combined rotation: Rz * Ry * Rx
-                R_combined = Rz @ Ry @ Rx
+                # Compose: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
+                R_total = Rz @ Ry @ Rx
                 
-                # Calculate center of original positions
-                original_positions = group.get('led_positions', [])
-                if original_positions:
-                    positions_array = np.array(original_positions)
-                    center = positions_array.mean(axis=0)
-                else:
-                    center = np.array([0.0, 0.0, 0.0])
-                
-                # Apply rotation to positions (around center) and then translation
+                # RIGID BODY rotation: rotate BOTH positions AND directions
+                # R is orthogonal => all distances are preserved
                 position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                rotated_positions = []
-                for orig_pos in original_positions:
-                    # Move to origin (relative to center)
-                    pos_relative = np.array(orig_pos) - center
-                    # Rotate
-                    rotated_relative = R_combined @ pos_relative
-                    # Move back and apply translation offset
-                    final_pos = rotated_relative + center + position_offset
-                    rotated_positions.append(tuple(final_pos))
                 
-                # Apply rotations to LED directions
-                # original_rotations now contains direction vectors, not angles
-                original_rotations = group.get('led_rotations', [])
+                # Save originals if missing (for backward compatibility)
+                if 'original_led_positions' not in group and 'led_positions' in group:
+                    relative_positions = []
+                    for led_pos in group.get('led_positions', []):
+                        relative_pos = np.array(led_pos) - position_offset
+                        relative_positions.append(tuple(relative_pos))
+                    group['original_led_positions'] = relative_positions
+                if 'original_led_rotations' not in group and 'led_rotations' in group:
+                    group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
+                if 'original_led_row_directions' not in group and 'led_row_directions' in group:
+                    group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
+
+                # Get originals
+                original_positions = group.get('original_led_positions', group.get('led_positions', []))
+                original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
+                
+                # Rotate relative positions then translate (rigid body)
+                translated_positions = []
+                for orig_pos in original_positions:
+                    rotated_pos = R_total @ np.array(orig_pos)
+                    final_pos = rotated_pos + position_offset
+                    translated_positions.append(tuple(final_pos))
+                
+                # Rotate direction vectors
                 rotated_directions = []
                 for orig_dir in original_rotations:
-                    # Direct rotation of direction vector
-                    dir_array = np.array(orig_dir)
-                    rotated_dir = R_combined @ dir_array
+                    rotated_dir = R_total @ np.array(orig_dir)
                     rotated_directions.append(tuple(rotated_dir))
                 
-                config['led_positions'] = rotated_positions
+                config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
+                
+                # Rotate row direction vectors
+                original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
+                if original_row_dirs:
+                    rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
+                    config['led_row_directions'] = rotated_row_dirs
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -5645,6 +5931,7 @@ def main():
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
                 'viewing_angle': led['viewing_angle'].value,
+                'square_roll': led['square_roll'].value,
             }
             individual_leds_configs.append(config)
         
@@ -6315,7 +6602,7 @@ def main():
     abs3_off_y.on_update(lambda _: update_scene())
     abs3_off_z.on_update(lambda _: update_scene())
     abs3_rot_z.on_update(lambda _: update_scene())
-    intensity_rays_slider.on_update(lambda _: update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else None)
+    intensity_rays_slider.on_update(lambda _: None)  # No auto-update - manual button only
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_grid_size.on_update(lambda _: update_cell_area_info())  # Update cell area when resolution changes
     wall_view_size.on_update(lambda _: update_cell_area_info())  # Update cell area when wall size changes

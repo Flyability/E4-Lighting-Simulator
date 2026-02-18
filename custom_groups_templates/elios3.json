@@ -1,0 +1,150 @@
+{
+    "name": "Elios3",
+    "groups": [],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -0.5,
+            "pos_y": 0.8,
+            "pos_z": -0.85,
+            "rot_x": 0.0,
+            "rot_y": 90.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -0.5,
+            "pos_y": 0.0,
+            "pos_z": -0.85,
+            "rot_x": 0.0,
+            "rot_y": 90.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -0.5,
+            "pos_y": -0.8,
+            "pos_z": -0.85,
+            "rot_x": 0.0,
+            "rot_y": 90.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.8,
+            "pos_z": -0.55,
+            "rot_x": 0.0,
+            "rot_y": 30.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": -0.55,
+            "rot_x": 0.0,
+            "rot_y": 30.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": -0.8,
+            "pos_z": -0.55,
+            "rot_x": 0.0,
+            "rot_y": 30.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.8,
+            "pos_z": 0.55,
+            "rot_x": 0.0,
+            "rot_y": -30.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": 0.55,
+            "rot_x": 0.0,
+            "rot_y": -30.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": -0.8,
+            "pos_z": 0.55,
+            "rot_x": 0.0,
+            "rot_y": -30.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -0.5,
+            "pos_y": 0.8,
+            "pos_z": 0.85,
+            "rot_x": 0.0,
+            "rot_y": -90.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -0.5,
+            "pos_y": 0.0,
+            "pos_z": 0.85,
+            "rot_x": 0.0,
+            "rot_y": -90.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -0.5,
+            "pos_y": -0.8,
+            "pos_z": 0.85,
+            "rot_x": 0.0,
+            "rot_y": -90.0,
+            "rot_z": 0.0,
+            "size": 0.5,
+            "viewing_angle": 120
+        }
+    ]
+}
