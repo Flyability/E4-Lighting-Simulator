@@ -43,75 +43,70 @@
         false
     ],
     "led_states": [
-        true,
-        true,
-        true
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
     ],
     "custom_groups": [
         {
             "enabled": true,
             "position": [
-                -0.3,
-                -0.6666666666666666,
+                0.0,
+                0.0,
                 0.0
             ],
             "rotation_x": 0,
             "rotation_y": 0,
             "rotation_z": 0,
             "led_states": [
-                true,
-                true,
                 true
             ],
-            "is_dynamic": true,
-            "num_leds": 3,
-            "led_positions": [
-                [
-                    0.3,
-                    -2.0333333333333337,
-                    0.0
-                ],
-                [
-                    -0.6000000000000001,
-                    0.6666666666666666,
-                    0.0
-                ],
-                [
-                    0.3,
-                    1.3666666666666667,
-                    0.0
-                ]
-            ],
-            "led_rotations": [
-                [
-                    1.0,
-                    0.0,
-                    0.0
-                ],
-                [
-                    0.03489949670250108,
-                    0.0,
-                    0.9993908270190958
-                ],
-                [
-                    1.0,
-                    0.0,
-                    0.0
-                ]
-            ],
-            "led_sizes": [
-                0.5,
-                0.5,
-                0.5
-            ],
-            "led_rows": [
-                [
-                    0,
-                    1,
-                    2
-                ]
-            ],
-            "template_name": "555",
+            "template_name": "prr",
             "initial_pos": [
                 0.0,
                 0.0,
@@ -121,6 +116,30 @@
                 0,
                 0,
                 0
+            ],
+            "is_dynamic": true,
+            "num_leds": 1,
+            "led_positions": [
+                [
+                    0.0,
+                    0.0,
+                    0.0
+                ]
+            ],
+            "led_rotations": [
+                [
+                    1.0,
+                    0.0,
+                    0.0
+                ]
+            ],
+            "led_sizes": [
+                0.5
+            ],
+            "led_rows": [
+                [
+                    0
+                ]
             ]
         }
     ],
@@ -151,5 +170,5 @@
         }
     },
     "stl_model": null,
-    "name": "555"
+    "name": "prr"
 }

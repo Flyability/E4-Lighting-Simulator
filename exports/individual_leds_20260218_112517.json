@@ -1,0 +1,25 @@
+{
+  "format_version": "1.0",
+  "description": "Individual LEDs export - exact coordinates (no transformations)",
+  "export_date": "20260218_112517",
+  "num_leds": 1,
+  "leds": [
+    {
+      "id": 1,
+      "enabled": true,
+      "led_on": true,
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "size": 0.5,
+      "viewing_angle": 120.0
+    }
+  ]
+}

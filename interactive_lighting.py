@@ -281,6 +281,7 @@ def create_leds(
             led_positions = custom_group_config.get('led_positions', [])
             led_rotations = custom_group_config.get('led_rotations', [])
             led_sizes = custom_group_config.get('led_sizes', [])
+            led_viewing_angles = custom_group_config.get('led_viewing_angles', [])
             num_leds = custom_group_config.get('num_leds', 0)
             
             custom_color = (1.0, 0.0, 1.0)  # Magenta for custom group
@@ -299,11 +300,12 @@ def create_leds(
                 else:
                     direction = np.array([1.0, 0.0, 0.0])
                 size = led_sizes[i] if i < len(led_sizes) else 0.5
+                led_view_angle = led_viewing_angles[i] if i < len(led_viewing_angles) else viewing_angle
                 is_led_on = custom_led_states_array[i] if i < len(custom_led_states_array) else True
                 
                 led = LED(
                     width=size,
-                    viewing_angle=viewing_angle,
+                    viewing_angle=led_view_angle,
                     position=(pos_x, pos_y, pos_z),
                     direction=tuple(direction),
                     color=custom_color,
@@ -456,6 +458,7 @@ def create_leds(
         rot_y_deg = individual_led_config.get('rot_y', 0.0)
         rot_z_deg = individual_led_config.get('rot_z', 0.0)
         size = individual_led_config.get('size', 0.5)
+        led_viewing_angle = individual_led_config.get('viewing_angle', viewing_angle)
         
         # Calculate direction vector from rotations
         # Start with direction pointing along +X axis (1, 0, 0)
@@ -499,7 +502,7 @@ def create_leds(
         individual_color = (0.0, 1.0, 1.0)  # Cyan for individual LEDs
         led = LED(
             width=size,
-            viewing_angle=viewing_angle,
+            viewing_angle=led_viewing_angle,
             position=(pos_x, pos_y, pos_z),
             direction=tuple(direction),
             color=individual_color,
@@ -768,6 +771,8 @@ def _process_led_worker(args):
     front_dist = params['front_dist']
     side_dist = params['side_dist']
     top_bottom_dist = params['top_bottom_dist']
+    back_dist = params.get('back_dist')
+    led_x_center = params.get('led_x_center', -35)
     num_rays_per_led = params['num_rays_per_led']
     grid_size = params['grid_size']
     lumens_per_led = params['lumens_per_led']
@@ -786,12 +791,18 @@ def _process_led_worker(args):
         'bottom': np.zeros(grid_shapes['bottom'])
     }
     local_ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+    
+    # Add back wall if enabled
+    if back_dist is not None:
+        local_grids['back'] = np.zeros(grid_shapes['back'])
+        local_ray_hits['back'] = 0
+    
     local_total_rays = 0
     
     # Calculate cell areas for each wall (in m²)
     cell_areas_m2 = {}
     for wall_name, spec in wall_specs.items():
-        if wall_name == 'front':
+        if wall_name in ('front', 'back'):
             cell_width_cm = spec['size_y'] / spec['grid_y']
             cell_height_cm = spec['size_z'] / spec['grid_z']
         elif wall_name in ['left', 'right']:
@@ -909,6 +920,15 @@ def _process_led_worker(args):
                 y = led.position[1] + world_dir[1] * t
                 intersections.append(('bottom', t, x, y))
         
+        # Back wall (behind LEDs, negative X direction)
+        if back_dist is not None and world_dir[0] < 0:
+            back_x_pos = led_x_center - back_dist
+            t = (back_x_pos - led.position[0]) / world_dir[0]
+            if t > 0:
+                y = led.position[1] + world_dir[1] * t
+                z = led.position[2] + world_dir[2] * t
+                intersections.append(('back', t, y, z))
+        
         if not intersections:
             continue
         
@@ -916,7 +936,7 @@ def _process_led_worker(args):
         wall_spec = wall_specs[wall_name]
         
         # Map coordinates to grid indices
-        if wall_name == 'front':
+        if wall_name == 'front' or wall_name == 'back':
             size_y = wall_spec['size_y']
             size_z = wall_spec['size_z']
             grid_size_y = wall_spec['grid_y']
@@ -1055,6 +1075,7 @@ def main():
                 group_cfg['led_positions'] = group.get('led_positions', [])
                 group_cfg['led_rotations'] = group.get('led_rotations', [])
                 group_cfg['led_sizes'] = group.get('led_sizes', [])
+                group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
                 group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
             custom_groups_data.append(group_cfg)
         
@@ -1087,7 +1108,8 @@ def main():
             num_leds = len(leds_list_sorted)
             led_positions = [(led['pos_x'].value, led['pos_y'].value, led['pos_z'].value) for led in leds_list_sorted]
             led_sizes = [led['size'].value for led in leds_list_sorted]
-            led_states = [led['led_on'] for led in leds_list_sorted]
+            led_viewing_angles = [led['viewing_angle'].value for led in leds_list_sorted]
+            group_led_states = [led['led_on'] for led in leds_list_sorted]
             
             # Convert rotation angles to direction vectors
             led_rotations = []
@@ -1192,12 +1214,13 @@ def main():
                 'rotation_x': group_rot[0],
                 'rotation_y': group_rot[1],
                 'rotation_z': group_rot[2],
-                'led_states': led_states,
+                'led_states': group_led_states,
                 'is_dynamic': True,
                 'num_leds': num_leds,
                 'led_positions': led_positions_relative,
                 'led_rotations': led_rotations,
                 'led_sizes': led_sizes,
+                'led_viewing_angles': led_viewing_angles,
                 'led_rows': led_rows,
                 'template_name': template_name if template_name != "unnamed" else None,
                 'initial_pos': [0.0, 0.0, 0.0],
@@ -1396,6 +1419,7 @@ def main():
                 group_data['led_positions'] = group_cfg.get('led_positions', [])
                 group_data['led_rotations'] = group_cfg.get('led_rotations', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
+                group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
             else:
                 # Standard 12-LED group
                 group_data = create_custom_group(skip_update_scene=True)
@@ -1460,6 +1484,7 @@ def main():
                     group_data['led_positions'] = group_cfg.get('led_positions', [])
                     group_data['led_rotations'] = group_cfg.get('led_rotations', [])
                     group_data['led_sizes'] = group_cfg.get('led_sizes', [])
+                    group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
                 else:
                     # Standard 12-LED group
                     group_data = create_custom_group(skip_update_scene=True)
@@ -2102,6 +2127,7 @@ def main():
             # 4. Extract LED positions and sizes, convert rotations to direction vectors
             led_positions = [(led.get('pos_x', 0.0), led.get('pos_y', 0.0), led.get('pos_z', 0.0)) for led in sorted_leds]
             led_sizes = [led.get('size', 0.5) for led in sorted_leds]
+            led_viewing_angles = [led.get('viewing_angle', 120) for led in sorted_leds]
             
             # Convert rotation angles to direction vectors (saves correctly for group rotation)
             led_rotations = []
@@ -2155,6 +2181,7 @@ def main():
             group_data['led_positions'] = led_positions
             group_data['led_rotations'] = led_rotations
             group_data['led_sizes'] = led_sizes
+            group_data['led_viewing_angles'] = led_viewing_angles
             
             # Set LED states
             for i, state in enumerate(initial_led_states):
@@ -2500,6 +2527,7 @@ def main():
                             group_cfg['led_positions'] = group.get('led_positions', [])
                             group_cfg['led_rotations'] = group.get('led_rotations', [])
                             group_cfg['led_sizes'] = group.get('led_sizes', [])
+                            group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
                             group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
                         custom_groups_data.append(group_cfg)
                     
@@ -2595,8 +2623,8 @@ def main():
             "Show rays in output", initial_value=False
         )
         show_led_markers = server.gui.add_checkbox(
-            "Show LED markers", initial_value=False
-        )
+            "Show LED markers", initial_value=True
+        ) 
         show_intensity_map = server.gui.add_checkbox(
             "Show intensity on wall", initial_value=False
         )
@@ -2990,7 +3018,7 @@ def main():
         stl_wireframe.on_update(safe_update_stl)
         stl_absorber_enable.on_update(safe_update_stl_absorber)
 
-    # Room Mode - Cubic room with 5 walls (no back wall behind LEDs)
+    # Room Mode - Cubic room with 5 or 6 walls (back wall optional)
     with server.gui.add_folder("Room Mode"):
         room_mode_enable = server.gui.add_checkbox("Enable Room Mode", initial_value=False)
         show_room_walls = server.gui.add_checkbox("Show Room Walls", initial_value=True)
@@ -3003,6 +3031,10 @@ def main():
         )
         room_top_bottom_dist = server.gui.add_slider(
             "Top/Bottom walls distance (cm)", min=50, max=300, step=10, initial_value=150
+        )
+        show_back_wall = server.gui.add_checkbox("Show Back Wall", initial_value=False)
+        room_back_dist = server.gui.add_slider(
+            "Back wall distance (cm)", min=10, max=100, step=5, initial_value=50
         )
         room_grid_size = server.gui.add_slider(
             "Room walls grid resolution", min=10, max=50, step=5, initial_value=20
@@ -3433,11 +3465,13 @@ def main():
                 led_positions = group_cfg.get('led_positions', [(0, 0, 0)] * num_leds)
                 led_rotations = group_cfg.get('led_rotations', [(1, 0, 0)] * num_leds)
                 led_sizes = group_cfg.get('led_sizes', [0.5] * num_leds)
+                led_viewing_angles = group_cfg.get('led_viewing_angles', [120] * num_leds)
             else:
                 # Static group - generate positions based on rows
                 led_positions = []
                 led_rotations = []
                 led_sizes = []
+                led_viewing_angles = []
                 
                 for row_idx, led_indices in enumerate(led_rows):
                     y_pos = 0.0
@@ -3447,6 +3481,7 @@ def main():
                         led_positions.append((x_pos, y_pos, z_pos))
                         led_rotations.append((1, 0, 0))  # Forward direction
                         led_sizes.append(0.5)
+                        led_viewing_angles.append(120)
             
             # Get group position and rotation offset
             # Support both old format (position list) and new format (pos_x/y/z)
@@ -3522,7 +3557,7 @@ def main():
                 led_data['rot_y'].value = float(rot_angles[1])
                 led_data['rot_z'].value = float(rot_angles[2])
                 led_data['size'].value = float(led_sizes[led_idx])
-                led_data['viewing_angle'].value = 120  # Default viewing angle for converted LEDs
+                led_data['viewing_angle'].value = float(led_viewing_angles[led_idx])
                 
                 # Mark as part of this template for potential regrouping
                 led_data['template_source'] = template_name
@@ -3867,9 +3902,9 @@ def main():
         return grid, wall_size
 
     def compute_room_intensity(
-        leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, absorbers=None, stl_mesh_data=None
+        leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, back_dist=None, absorbers=None, stl_mesh_data=None
     ):
-        """Trace rays and compute intensity grids on all 5 room walls using multiprocessing."""
+        """Trace rays and compute intensity grids on all room walls (5 or 6 with optional back wall) using multiprocessing."""
         
         # Calculate physical dimensions of each wall
         wall_width_x = front_dist + abs(circle_center_slider.value)  # Base depth
@@ -3904,6 +3939,10 @@ def main():
             'bottom': np.zeros((topbottom_grid_y, topbottom_grid_x))  # XY plane: [Y, X]
         }
         
+        # Add back wall if enabled
+        if back_dist is not None:
+            grids['back'] = np.zeros((front_grid_z, front_grid_y))  # YZ plane: [Z, Y] (same as front)
+        
         # Wall dimensions for grid mapping (each wall needs proper size and range)
         # For extended side/top/bottom walls: x_min is the back edge (front_dist - depth)
         extended_x_min = front_dist - side_topbottom_depth_x  # Back edge of extended walls
@@ -3921,6 +3960,11 @@ def main():
                       'grid_x': topbottom_grid_x, 'grid_y': topbottom_grid_y, 'cell_size': cell_size}
         }
         
+        # Add back wall specs if enabled
+        if back_dist is not None:
+            wall_specs['back'] = {'size_y': wall_width_y, 'size_z': wall_height_z, 'dims': ('y', 'z'),
+                                 'grid_y': front_grid_y, 'grid_z': front_grid_z, 'cell_size': cell_size}
+        
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
         if num_active_leds == 0:
@@ -3929,11 +3973,16 @@ def main():
         print(f"\n=== ROOM MODE ===")
         print(f"Front wall: x={front_dist}cm, Left: y={-side_dist}cm, Right: y={+side_dist}cm")
         print(f"Top: z={+top_bottom_dist}cm, Bottom: z={-top_bottom_dist}cm")
+        if back_dist is not None:
+            back_x_pos = circle_center_slider.value - back_dist
+            print(f"Back wall: x={back_x_pos}cm")
         print(f"Uniform cell size: {cell_size:.2f}cm")
         print(f"Grid resolutions: Front {front_grid_y}×{front_grid_z}, Side {side_grid_x}×{side_grid_z}, Top/Bottom {topbottom_grid_x}×{topbottom_grid_y}")
         
         # Track ray hits per wall for debugging
         ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+        if back_dist is not None:
+            ray_hits['back'] = 0
         total_rays = 0
         
         # MULTIPROCESSING: Prepare parameters for worker processes
@@ -3953,12 +4002,16 @@ def main():
             'top': grids['top'].shape,
             'bottom': grids['bottom'].shape
         }
+        if back_dist is not None:
+            grid_shapes['back'] = grids['back'].shape
         
         # Package parameters for workers
         worker_params = {
             'front_dist': front_dist,
             'side_dist': side_dist,
             'top_bottom_dist': top_bottom_dist,
+            'back_dist': back_dist,
+            'led_x_center': circle_center_slider.value,
             'num_rays_per_led': num_rays_per_led,
             'grid_size': grid_size,
             'lumens_per_led': lumens_per_led,
@@ -4144,6 +4197,7 @@ def main():
                 config['led_positions'] = rotated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
+                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -4711,7 +4765,7 @@ def main():
                 
                 config['led_positions'] = rotated_positions
                 config['led_rotations'] = rotated_directions
-                config['led_sizes'] = group.get('led_sizes', [])
+                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -4727,6 +4781,7 @@ def main():
                 'rot_y': led['rot_y'].value,
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
+                'viewing_angle': led['viewing_angle'].value,
             }
             individual_leds_configs.append(config)
         
@@ -5043,6 +5098,21 @@ def main():
             position=(top_center_x, 0, -top_bottom_dist / 100.0),
         )
         room_wall_handles.append(handle)
+        
+        # Back wall (YZ plane at x=back_dist behind LEDs) - optional
+        if show_back_wall.value:
+            back_dist = room_back_dist.value
+            back_width = 2 * side_dist / 100.0  # Y direction
+            back_height = 2 * top_bottom_dist / 100.0  # Z direction
+            # Back wall is behind the LEDs (negative X direction)
+            back_x_pos = led_x_min / 100.0 - back_dist / 100.0
+            handle = server.scene.add_box(
+                "/room_walls/back",
+                dimensions=(0.01, back_width, back_height),
+                color=wall_color,
+                position=(back_x_pos, 0, 0),
+            )
+            room_wall_handles.append(handle)
     
     def update_room_intensity_map():
         """Update intensity map for all 5 room walls."""
@@ -5215,7 +5285,9 @@ def main():
             print(f"STL mesh enabled as light absorber ({len(mesh.faces)} triangles)")
         
         grids, wall_specs = compute_room_intensity(
-            leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
+            leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, 
+            back_dist=room_back_dist.value if show_back_wall.value else None,
+            absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
         )
         
         # Find max lux across all walls for color normalization
@@ -5227,7 +5299,7 @@ def main():
             cells_with_intensity = np.count_nonzero(grid > 0)
             # Convert lux to lumens: multiply by cell area for that wall
             wall_spec = wall_specs[wall_name]
-            if wall_name == 'front':
+            if wall_name in ('front', 'back'):
                 cell_area_cm2 = (wall_spec['size_y']/wall_spec['grid_y']) * (wall_spec['size_z']/wall_spec['grid_z'])
             elif wall_name in ('left', 'right'):
                 cell_area_cm2 = (wall_spec['size_x']/wall_spec['grid_x']) * (wall_spec['size_z']/wall_spec['grid_z'])
@@ -5239,6 +5311,8 @@ def main():
         
         # Visualize each wall
         cells_created = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+        if show_back_wall.value and 'back' in grids:
+            cells_created['back'] = 0
         for wall_name, intensity_grid in grids.items():
             wall_spec = wall_specs[wall_name]
             grid_shape = intensity_grid.shape  # Get actual grid dimensions for this wall
@@ -5319,6 +5393,23 @@ def main():
                         y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
                         z_pos = -top_bottom_dist / 100.0
                         dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
+                    
+                    elif wall_name == 'back':
+                        # YZ plane at x=back_x_pos (behind LEDs)
+                        size_y = wall_spec['size_y']
+                        size_z = wall_spec['size_z']
+                        grid_y = wall_spec['grid_y']
+                        grid_z = wall_spec['grid_z']
+                        cell_size_y = size_y / grid_y
+                        cell_size_z = size_z / grid_z
+                        led_x_center = circle_center_slider.value
+                        back_x_pos = led_x_center - room_back_dist.value
+                        x_pos = back_x_pos / 100.0
+                        y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
+                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        dims = (0.01, cell_size_y / 100.0 * 0.98, cell_size_z / 100.0 * 0.98)
+                    else:
+                        continue
                     
                     handle = server.scene.add_box(
                         f"/room_intensity/{wall_name}/cell_{gi}_{gj}",
@@ -5537,6 +5628,7 @@ def main():
                 config['led_positions'] = rotated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
+                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -5552,6 +5644,7 @@ def main():
                 'rot_y': led['rot_y'].value,
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
+                'viewing_angle': led['viewing_angle'].value,
             }
             individual_leds_configs.append(config)
         
@@ -5925,7 +6018,7 @@ def main():
                     for k in range(num_random_rays):
                         # Random direction within viewing cone using cosine power distribution
                         u1, u2 = np.random.uniform(0, 1, 2)
-                        max_theta = np.radians(viewing_angle / 2.0)  # Half-angle for proper cone
+                        max_theta = np.radians(led.viewing_angle / 2.0)  # Half-angle for proper cone - use LED's specific viewing angle
                         
                         uniformity = float(ray_uniformity_slider.value)
                         n = 1.0 + uniformity * 3.0  # Exponent from 1 to 4
@@ -6267,6 +6360,8 @@ def main():
     room_front_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     room_side_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     room_top_bottom_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
+    show_back_wall.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
+    room_back_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     wall_view_size.on_update(lambda _: None)  # No auto-update for expensive params
     wall_dist_slider.on_update(lambda _: (update_wall(), update_scene()))
     
