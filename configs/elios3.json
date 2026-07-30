@@ -1,4 +1,6 @@
 {
+    "name": "Elios 3",
+    "description": "Configurazione standard: front +/-, side +/-",
     "viewing_angle": 120,
     "radius": 35,
     "circle_center_x": -35,
@@ -37,10 +39,10 @@
         ]
     ],
     "row_enabled": [
+        false,
         true,
         true,
-        true,
-        true
+        false
     ],
     "led_states": [
         true,
@@ -92,50 +94,5 @@
         true,
         true
     ],
-    "custom_groups": [],
-    "individual_leds": [],
-    "absorbers": {
-        "enabled": true,
-        "abs0": {
-            "x": -1.0,
-            "y": 2.5,
-            "z": 0.0
-        },
-        "abs1": {
-            "x": -1.0,
-            "y": -2.5,
-            "z": 0.0
-        },
-        "abs2": {
-            "x": -1.8,
-            "y": -10.5,
-            "z": 0.0,
-            "rot_z": -14
-        },
-        "abs3": {
-            "x": -1.8,
-            "y": 10.5,
-            "z": 0.0,
-            "rot_z": 14
-        }
-    },
-    "stl_model": {
-        "file_path": "C:\\Users\\gianmatteo.marietti_\\Downloads\\109045 E3 CAGE ASSEMBLY_Coarse.STL",
-        "absorber_enable": true,
-        "visible": true,
-        "scale": 0.1,
-        "position": [
-            -22,
-            0,
-            0
-        ],
-        "rotation": [
-            0,
-            0,
-            -150
-        ],
-        "opacity": 0.8,
-        "wireframe": false
-    },
-    "name": "elios3"
+    "custom_groups": []
 }

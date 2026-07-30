@@ -1,0 +1,70 @@
+{
+    "name": "Bottom_led",
+    "groups": [],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -1.5,
+            "pos_y": -5.5,
+            "pos_z": -3.5,
+            "rot_x": -20,
+            "rot_y": 90,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -1.5,
+            "pos_y": -8.5,
+            "pos_z": -3.0,
+            "rot_x": -45,
+            "rot_y": 90,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -1.5,
+            "pos_y": 8.5,
+            "pos_z": -3.0,
+            "rot_x": 45,
+            "rot_y": 90,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": -1.5,
+            "pos_y": 5.5,
+            "pos_z": -3.5,
+            "rot_x": 20,
+            "rot_y": 90,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        }
+    ]
+}

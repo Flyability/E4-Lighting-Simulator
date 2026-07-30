@@ -1,25 +1,33 @@
 {
-    "name": "Elios3 Pannel",
-    "enabled": true,
-    "position": [
-        0.0,
-        0.0,
-        0.0
+    "name": "ELIOS3_PANNEL",
+    "groups": [
+        {
+            "enabled": true,
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation_x": 0,
+            "rotation_y": 0,
+            "rotation_z": 0,
+            "led_states": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+            ],
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        }
     ],
-    "rotation_y": 0,
-    "rotation_z": 0,
-    "led_states": [
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true
-    ]
+    "individual_leds": []
 }

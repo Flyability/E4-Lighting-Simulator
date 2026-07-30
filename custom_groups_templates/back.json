@@ -1,5 +1,5 @@
 {
-    "name": "back3",
+    "name": "back",
     "groups": [],
     "individual_leds": [
         {
@@ -9,10 +9,14 @@
             "pos_y": 1.0,
             "pos_z": 0.5,
             "rot_x": 30,
-            "rot_y": 0,
+            "rot_y": -30,
             "rot_z": 60,
             "size": 0.5,
-            "viewing_angle": 120
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
         },
         {
             "enabled": true,
@@ -20,11 +24,15 @@
             "pos_x": 0.0,
             "pos_y": -1.0,
             "pos_z": 0.5,
-            "rot_x": 0,
+            "rot_x": -30,
             "rot_y": -30,
             "rot_z": -60,
             "size": 0.5,
-            "viewing_angle": 120
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
         },
         {
             "enabled": true,
@@ -36,7 +44,11 @@
             "rot_y": 30,
             "rot_z": -60,
             "size": 0.5,
-            "viewing_angle": 120
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
         },
         {
             "enabled": true,
@@ -48,7 +60,11 @@
             "rot_y": 30,
             "rot_z": 60,
             "size": 0.5,
-            "viewing_angle": 120
+            "viewing_angle": 120,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
         }
     ]
 }

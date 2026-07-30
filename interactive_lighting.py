@@ -3,15 +3,40 @@ Interactive lighting design tool using Viser.
 Allows real-time adjustment of LED parameters with sliders.
 """
 
+import sys, io
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+else:
+    # Force line-buffered output so print() messages appear immediately in terminals
+    if not sys.stdout.line_buffering:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding=sys.stdout.encoding, errors='replace', line_buffering=True)
+    if not sys.stderr.line_buffering:
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding=sys.stderr.encoding, errors='replace', line_buffering=True)
+
 import numpy as np
+import warnings
 import viser
 import viser.transforms as tf
 import time
 import multiprocessing
 import json
 import os
+import hashlib
 from functools import partial
 import trimesh
+
+# GPU acceleration (NVIDIA CUDA via CuPy) — lazy init, no CUDA loaded at import time
+try:
+    from gpu_raytrace import gpu_process_led_wall_batch, gpu_process_room_batch
+    from gpu_raytrace import GPU_AVAILABLE as _GPU_OK, _ensure_gpu_init
+    _HAS_GPU_MODULE = True
+except ImportError:
+    _HAS_GPU_MODULE = False
+    print("[GPU] gpu_raytrace module not found, using CPU multiprocessing")
+
+# Suppress viser warnings about removing already-removed nodes
+warnings.filterwarnings("ignore", message="Attempted to remove already removed node")
 
 
 class LED:
@@ -271,6 +296,7 @@ def create_leds(
                     led.enabled = is_row_enabled and is_led_enabled
                     led.led_index = led_index  # Store the global index
                     led.row_direction = rotated_row_dir.copy()  # Store rotated row direction for consistent square orientation
+                    led.lumens = None  # No per-LED lumens override for base groups
                     leds.append(led)
                     led_index += 1
 
@@ -290,6 +316,7 @@ def create_leds(
             led_sizes = custom_group_config.get('led_sizes', [])
             led_viewing_angles = custom_group_config.get('led_viewing_angles', [])
             led_row_dirs = custom_group_config.get('led_row_directions', [])
+            led_beam_tilts = custom_group_config.get('led_beam_tilts', [])
             num_leds = custom_group_config.get('num_leds', 0)
             
             custom_color = (1.0, 0.0, 1.0)  # Magenta for custom group
@@ -321,18 +348,31 @@ def create_leds(
                         row_dir = np.cross(direction, [0, 1, 0])
                     row_dir = row_dir / np.linalg.norm(row_dir)
                 
+                # Apply beam_tilt: tilt beam direction relative to square surface
+                # (same as individual LED path - Rodrigues rotation around row_dir)
+                beam_tilt_deg = led_beam_tilts[i] if i < len(led_beam_tilts) else 0.0
+                if abs(beam_tilt_deg) > 0.01:
+                    bt_rad = np.radians(beam_tilt_deg)
+                    k_bt = row_dir / np.linalg.norm(row_dir)
+                    beam_direction = direction * np.cos(bt_rad) + np.cross(k_bt, direction) * np.sin(bt_rad) + k_bt * np.dot(k_bt, direction) * (1 - np.cos(bt_rad))
+                    beam_direction = beam_direction / np.linalg.norm(beam_direction)
+                else:
+                    beam_direction = direction
+                
                 led = LED(
                     width=size,
                     viewing_angle=led_view_angle,
                     position=(pos_x, pos_y, pos_z),
-                    direction=tuple(direction),
+                    direction=tuple(beam_direction),
                     color=custom_color,
                 )
                 led.enabled = is_led_on
                 led.led_index = led_index
                 led.row_direction = row_dir
+                led.square_normal = direction  # Store original direction for square mesh orientation
                 led.is_custom = True  # Mark as custom group LED
                 led.is_dynamic_group = True  # Mark as dynamic group LED
+                led.lumens = custom_group_config.get('lumens_override', None)  # Per-group lumens override
                 leds.append(led)
                 led_index += 1
         else:
@@ -479,6 +519,7 @@ def create_leds(
                     led.led_index = led_index
                     led.row_direction = rotated_row_dir.copy()
                     led.is_custom = True  # Mark as custom group LED
+                    led.lumens = custom_group_config.get('lumens_override', None)  # Per-group lumens override
                     leds.append(led)
                     led_index += 1
 
@@ -558,19 +599,39 @@ def create_leds(
         else:
             row_dir = default_row_dir
         
-        # Create LED
+        # Apply beam_tilt: tilt beam direction relative to square surface
+        # Rotate direction around row_dir axis by beam_tilt angle (Rodrigues)
+        beam_tilt_deg = individual_led_config.get('beam_tilt', 0.0)
+        if abs(beam_tilt_deg) > 0.01:
+            bt_rad = np.radians(beam_tilt_deg)
+            k_bt = row_dir / np.linalg.norm(row_dir)
+            beam_direction = direction * np.cos(bt_rad) + np.cross(k_bt, direction) * np.sin(bt_rad) + k_bt * np.dot(k_bt, direction) * (1 - np.cos(bt_rad))
+            beam_direction = beam_direction / np.linalg.norm(beam_direction)
+        else:
+            beam_direction = direction
+        
+        # Create LED - square orientation uses original direction, beam uses tilted direction
         individual_color = (0.0, 1.0, 1.0)  # Cyan for individual LEDs
         led = LED(
             width=size,
             viewing_angle=led_viewing_angle,
             position=(pos_x, pos_y, pos_z),
-            direction=tuple(direction),
+            direction=tuple(beam_direction),
             color=individual_color,
         )
         led.enabled = led_is_on  # LED is active only if turned on
         led.led_index = led_index
         led.row_direction = row_dir
+        led.square_normal = direction  # Store original direction for square mesh orientation
         led.is_individual = True  # Mark as individual LED
+        led.lumens = individual_led_config.get('lumens_override', None)  # Per-LED lumens override
+        # Apply external collimating lens (per-LED)
+        ext_lens_angle = individual_led_config.get('ext_lens_angle', None)
+        if ext_lens_angle is not None:
+            ext_lens_eff = individual_led_config.get('ext_lens_efficiency', 1.0)
+            led.ext_lens_angle = ext_lens_angle  # Store for n calculation (cone stays wide)
+            if led.lumens is not None:
+                led.lumens = led.lumens * ext_lens_eff
         leds.append(led)
         led_index += 1
 
@@ -612,6 +673,190 @@ def _ray_triangle_intersection(ray_origin, ray_direction, v0, v1, v2):
     
     return None
 
+def _prepare_mesh_ray_accelerator(mesh_data):
+    """
+    Pre-build a trimesh ray accelerator and inverse transform for batch ray testing.
+    Call once before tracing, then use _batch_ray_mesh_intersection for all rays.
+    
+    Returns: dict with 'mesh', 'inv_transform', 'inv_rot' or None if no mesh.
+    """
+    if mesh_data is None:
+        return None
+    
+    import trimesh as _trimesh
+    
+    # Build trimesh object with BVH (cached on mesh_data dict)
+    if 'trimesh_obj' not in mesh_data:
+        mesh_data['trimesh_obj'] = _trimesh.Trimesh(
+            vertices=mesh_data['vertices'],
+            faces=mesh_data['faces'],
+            process=False
+        )
+    
+    mesh = mesh_data['trimesh_obj']
+    transform = mesh_data.get('transform', np.eye(4))
+    
+    try:
+        inv_transform = np.linalg.inv(transform)
+    except np.linalg.LinAlgError:
+        inv_transform = np.eye(4)
+    
+    # Force BVH construction now (so it's not built lazily during first query)
+    _ = mesh.ray
+    
+    return {
+        'mesh': mesh,
+        'inv_transform': inv_transform,
+        'inv_rot': inv_transform[:3, :3],
+        'transform': transform,
+    }
+
+# Thread pool for parallel mesh intersection (Embree releases the GIL)
+_mesh_intersection_pool = None
+
+import atexit as _atexit
+def _cleanup_mesh_pool():
+    global _mesh_intersection_pool
+    if _mesh_intersection_pool is not None:
+        try:
+            _mesh_intersection_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        _mesh_intersection_pool = None
+_atexit.register(_cleanup_mesh_pool)
+
+
+def _intersect_chunk_thread(mesh, origins, dirs):
+    """Worker function for ThreadPoolExecutor — runs Embree without GIL."""
+    N = len(origins)
+    if N == 0:
+        return np.zeros(0, dtype=bool)
+    index_tri, index_ray = mesh.ray.intersects_id(
+        ray_origins=origins, ray_directions=dirs, multiple_hits=False,
+    )
+    chunk_hits = np.zeros(N, dtype=bool)
+    if len(index_ray) > 0:
+        face_normals = mesh.face_normals[index_tri]
+        hit_ray_dirs = dirs[index_ray]
+        dots = np.sum(hit_ray_dirs * face_normals, axis=1)
+        chunk_hits[index_ray[dots < 0]] = True
+    return chunk_hits
+
+
+def _batch_ray_mesh_intersection(ray_origins, ray_directions, accel):
+    """
+    Test multiple rays against mesh in a single batched call.
+    Uses AABB pre-filter to skip rays that can't hit the mesh,
+    then parallelizes across CPU cores for large batches.
+    Only counts front-face hits (ray hitting the outer surface of the mesh).
+    
+    Args:
+        ray_origins: (N, 3) array of ray origins
+        ray_directions: (N, 3) array of ray directions (normalized)
+        accel: accelerator dict from _prepare_mesh_ray_accelerator
+    
+    Returns:
+        boolean array of shape (N,) — True where ray hits the mesh front face
+    """
+    global _mesh_intersection_pool, _mesh_pool_key
+    
+    if accel is None:
+        return np.zeros(len(ray_origins), dtype=bool)
+    
+    N = len(ray_origins)
+    if N == 0:
+        return np.zeros(0, dtype=bool)
+    
+    mesh = accel['mesh']
+    inv_transform = accel['inv_transform']
+    inv_rot = accel['inv_rot']
+    
+    # Transform all ray origins to mesh local space
+    origins_h = np.hstack([ray_origins, np.ones((N, 1))])  # (N, 4)
+    origins_local = (inv_transform @ origins_h.T).T[:, :3]  # (N, 3)
+    
+    # Transform ray directions (rotation only, then normalize)
+    dirs_local = (inv_rot @ ray_directions.T).T  # (N, 3)
+    norms = np.linalg.norm(dirs_local, axis=1, keepdims=True)
+    norms[norms < 1e-10] = 1.0
+    dirs_local = dirs_local / norms
+    
+    # ---- AABB pre-filter ----
+    # Skip rays that can't possibly hit the mesh bounding box (very fast, pure numpy)
+    bbox = mesh.bounds  # (2, 3): [[xmin,ymin,zmin],[xmax,ymax,zmax]]
+    pad = np.maximum((bbox[1] - bbox[0]) * 0.001, 1e-6)
+    bmin = bbox[0] - pad
+    bmax = bbox[1] + pad
+    
+    eps = 1e-10
+    safe_dirs = np.where(np.abs(dirs_local) < eps,
+                         np.copysign(eps, dirs_local + 1e-30), dirs_local)
+    inv_d = 1.0 / safe_dirs
+    t1 = (bmin - origins_local) * inv_d
+    t2 = (bmax - origins_local) * inv_d
+    t_enter = np.max(np.minimum(t1, t2), axis=1)
+    t_exit = np.min(np.maximum(t1, t2), axis=1)
+    can_hit = (t_enter <= t_exit) & (t_exit > 0)
+    
+    candidates = np.where(can_hit)[0]
+    n_cand = len(candidates)
+    
+    hits = np.zeros(N, dtype=bool)
+    if n_cand == 0:
+        return hits
+    
+    print(f"    AABB pre-filter: {N:,} → {n_cand:,} rays ({100*n_cand/N:.0f}%) | mesh: {len(mesh.faces):,} faces")
+    
+    cand_origins = origins_local[candidates]
+    cand_dirs = dirs_local[candidates]
+    
+    # ---- Parallel or single-threaded intersection ----
+    PARALLEL_THRESHOLD = 20000
+    n_cpus = multiprocessing.cpu_count()
+    use_parallel = n_cand >= PARALLEL_THRESHOLD and n_cpus > 1
+    cand_hits = None
+    
+    if use_parallel:
+        n_workers = min(n_cpus, 8)
+        chunk_size = max(2000, (n_cand + n_workers - 1) // n_workers)
+        
+        try:
+            global _mesh_intersection_pool
+            if _mesh_intersection_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _mesh_intersection_pool = ThreadPoolExecutor(max_workers=n_workers)
+                print(f"    Started {n_workers}-thread pool for mesh intersection (Embree releases GIL)")
+            
+            futures = []
+            for i in range(0, n_cand, chunk_size):
+                futures.append(_mesh_intersection_pool.submit(
+                    _intersect_chunk_thread, mesh,
+                    cand_origins[i:i+chunk_size], cand_dirs[i:i+chunk_size]
+                ))
+            
+            results = [f.result() for f in futures]
+            cand_hits = np.concatenate(results)
+        except Exception as e:
+            print(f"    Parallel mesh intersection failed ({e}), falling back to single-thread")
+            cand_hits = None
+    
+    if cand_hits is None:
+        # Single-threaded path (small batch or parallel failed)
+        index_tri, index_ray = mesh.ray.intersects_id(
+            ray_origins=cand_origins,
+            ray_directions=cand_dirs,
+            multiple_hits=False,
+        )
+        cand_hits = np.zeros(n_cand, dtype=bool)
+        if len(index_ray) > 0:
+            face_normals = mesh.face_normals[index_tri]
+            hit_ray_dirs = cand_dirs[index_ray]
+            dots = np.sum(hit_ray_dirs * face_normals, axis=1)
+            cand_hits[index_ray[dots < 0]] = True
+    
+    hits[candidates[cand_hits]] = True
+    return hits
+
 def _ray_mesh_intersection(ray_origin, ray_direction, mesh_data):
     """
     Check if ray intersects with STL mesh using trimesh's optimized BVH ray tracing.
@@ -648,16 +893,25 @@ def _ray_mesh_intersection(ray_origin, ray_direction, mesh_data):
     ray_direction_local = ray_direction_local / np.linalg.norm(ray_direction_local)
     
     # Use trimesh's optimized ray intersection (uses BVH internally)
+    # multiple_hits=False: only get the closest hit (much faster)
     locations, index_ray, index_tri = mesh.ray.intersects_location(
         ray_origins=[ray_origin_local],
         ray_directions=[ray_direction_local],
-        multiple_hits=False  # Only need closest hit
+        multiple_hits=False,
     )
     
     if len(locations) == 0:
         return None
     
-    # Calculate distance in world space
+    # With multiple_hits=False we get only the closest hit — check if it's front-face
+    face_normal = mesh.face_normals[index_tri[0]]
+    dot_product = np.dot(ray_direction_local, face_normal)
+    
+    if dot_product >= 0:
+        # Closest hit is a back face — ray is inside the mesh, don't absorb
+        return None
+    
+    # Calculate distance for the front-face hit
     hit_point_local = locations[0]
     hit_point_world = (transform @ np.append(hit_point_local, 1))[:3]
     distance = np.linalg.norm(hit_point_world - ray_origin)
@@ -709,6 +963,169 @@ def _ray_box_intersection(pos, direction, box):
         return None
     return tmin if tmin > 0 else (tmax if tmax > 0 else None)
 
+def _ray_box_intersection_batch_np(origins, directions, absorbers):
+    """Vectorized ray-box intersection for ALL rays against ALL absorbers (NumPy).
+
+    Mirrors the GPU version ``_gpu_ray_box_intersection_batch`` but runs on CPU
+    using pure NumPy – eliminates the O(rays × absorbers) Python loop.
+
+    Parameters
+    ----------
+    origins : ndarray (N, 3) – ray origin positions
+    directions : ndarray (N, 3) – ray direction vectors (assumed normalised)
+    absorbers : list[dict] – each dict has 'center', 'half_sizes', optional 'rotation'
+
+    Returns
+    -------
+    absorbed : ndarray (N,) bool – True where *any* absorber blocks the ray
+    """
+    N = origins.shape[0]
+    absorbed = np.zeros(N, dtype=bool)
+
+    for box in absorbers:
+        center = np.asarray(box['center'], dtype=np.float32)
+        half = np.asarray(box['half_sizes'], dtype=np.float32)
+        rotation = box.get('rotation', None)
+
+        if rotation is not None:
+            qw, qx, qy, qz = rotation
+            R = np.array([
+                [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
+                [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
+                [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
+            ], dtype=np.float32)
+            R_inv = R.T
+            local_origins = (origins - center[None, :]) @ R_inv.T
+            local_dirs = directions @ R_inv.T
+            local_center = np.zeros(3, dtype=np.float32)
+        else:
+            local_origins = origins - center[None, :]
+            local_dirs = directions
+            local_center = np.zeros(3, dtype=np.float32)
+
+        tmin = np.full(N, -1e30, dtype=np.float32)
+        tmax = np.full(N, 1e30, dtype=np.float32)
+        valid = np.ones(N, dtype=bool)
+
+        for k in range(3):
+            d_k = local_dirs[:, k]
+            o_k = local_origins[:, k]
+            lo = local_center[k] - half[k]
+            hi = local_center[k] + half[k]
+
+            parallel = np.abs(d_k) < 1e-12
+            outside = parallel & ((o_k < lo) | (o_k > hi))
+            valid &= ~outside
+
+            inv_d = np.where(parallel, np.float32(1.0),
+                             np.float32(1.0) / np.where(parallel, np.float32(1.0), d_k))
+            t1 = (lo - o_k) * inv_d
+            t2 = (hi - o_k) * inv_d
+            t_near = np.minimum(t1, t2)
+            t_far = np.maximum(t1, t2)
+
+            mask_np = ~parallel
+            tmin = np.where(mask_np & (t_near > tmin), t_near, tmin)
+            tmax = np.where(mask_np & (t_far < tmax), t_far, tmax)
+
+        box_hit = valid & (tmin <= tmax) & (tmax > 0)
+        absorbed |= box_hit
+
+    return absorbed
+
+
+def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None):
+    """Compute illuminotechnical uniformity metrics from a 2D lux grid.
+
+    If *fov_bounds* is given as (fov_width_cm, fov_height_cm) and
+    *wall_size_cm* is provided, only the sub-grid inside the FOV rectangle
+    (centred on the wall) is analysed.
+
+    Returns an HTML string to be appended below the intensity legend.
+    Metrics computed (excluding zero-lux cells outside the light cone):
+        - U0 = Emin / Eavg   (General Uniformity)
+        - U1 = Emin / Emax   (Overall Uniformity)
+        - CV = sigma / Eavg   (Coefficient of Variation)
+        - deltaEV  (perceptual stop range) with diagnostic classification
+    """
+    # --- Crop to FOV rectangle if requested ---
+    if fov_bounds is not None and wall_size_cm is not None:
+        fov_w_cm, fov_h_cm = fov_bounds
+        gz, gy = grid.shape  # rows=Z, cols=Y
+        cell_cm = wall_size_cm / gy  # square grid assumed (gz == gy)
+        half_wall = wall_size_cm / 2.0
+        # Y-axis limits (columns)
+        y_lo = int(max(0, (half_wall - fov_w_cm / 2.0) / cell_cm))
+        y_hi = int(min(gy, (half_wall + fov_w_cm / 2.0) / cell_cm))
+        # Z-axis limits (rows)
+        z_lo = int(max(0, (half_wall - fov_h_cm / 2.0) / cell_cm))
+        z_hi = int(min(gz, (half_wall + fov_h_cm / 2.0) / cell_cm))
+        grid = grid[z_lo:z_hi, y_lo:y_hi]
+
+    active = grid[grid > 0]
+    if active.size == 0:
+        return ""
+
+    E_max = float(active.max())
+    E_min = float(active.min())
+    E_avg = float(active.mean())
+    sigma = float(active.std())
+
+    U0 = E_min / E_avg if E_avg > 0 else 0.0   # General Uniformity
+    U1 = E_min / E_max if E_max > 0 else 0.0   # Overall Uniformity
+    CV = sigma / E_avg if E_avg > 0 else 0.0    # Coefficient of Variation
+
+    # --- Perceptual (EV / photographic stops) ---
+    # EV = log2(Lux * 0.4)
+    EV_max = np.log2(E_max * 0.4) if E_max * 0.4 > 0 else 0.0
+    EV_min = np.log2(E_min * 0.4) if E_min * 0.4 > 0 else 0.0
+    delta_EV = EV_max - EV_min
+
+    # Classification thresholds
+    if delta_EV < 0.3:
+        ev_label = "Absolute uniformity"
+        ev_detail = "green-screen / archival grade"
+        ev_color = "#4CAF50"  # green
+    elif delta_EV <= 1.0:
+        ev_label = "Soft wall washing"
+        ev_detail = "smooth gradient, great general lighting"
+        ev_color = "#2196F3"  # blue
+    elif delta_EV <= 2.0:
+        ev_label = "Moderate gradient"
+        ev_detail = "visible fall-off, acceptable for most uses"
+        ev_color = "#FF9800"  # orange
+    else:
+        ev_label = "Wall grazing"
+        ev_detail = "dramatic gradient, good for textures"
+        ev_color = "#F44336"  # red
+
+    # Uniformity percentage: U0 expressed as %
+    uniformity_pct = U0 * 100.0
+
+    html = (
+        "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
+        "<div style='font-weight:600;margin-bottom:4px;'>Pattern Uniformity</div>"
+        f"<div style='font-size:22px;font-weight:700;color:{ev_color};margin:2px 0 6px;'>{uniformity_pct:.1f}%</div>"
+        "<table style='font-size:11px;color:#ccc;border-collapse:collapse;width:100%;'>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>E<sub>max</sub></td><td>{E_max:.1f} lx</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>E<sub>min</sub></td><td>{E_min:.1f} lx</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>E<sub>avg</sub></td><td>{E_avg:.1f} lx</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>U<sub>0</sub> (E<sub>min</sub>/E<sub>avg</sub>)</td><td>{U0:.3f}</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>U<sub>1</sub> (E<sub>min</sub>/E<sub>max</sub>)</td><td>{U1:.3f}</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>CV (&sigma;/E<sub>avg</sub>)</td><td>{CV:.3f}</td></tr>"
+        "<tr><td colspan='2' style='padding-top:4px;'></td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>EV<sub>max</sub></td><td>{EV_max:.2f} stops</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>EV<sub>min</sub></td><td>{EV_min:.2f} stops</td></tr>"
+        f"<tr><td style='padding:1px 6px 1px 0;'>&Delta;EV</td><td><b>{delta_EV:.2f} stops</b></td></tr>"
+        "</table>"
+        f"<div style='margin-top:6px;padding:4px 6px;background:{ev_color}22;border-left:3px solid {ev_color};border-radius:2px;'>"
+        f"<span style='font-weight:600;color:{ev_color};'>{ev_label}</span><br/>"
+        f"<span style='font-size:10px;color:#aaa;'>{ev_detail}</span>"
+        "</div></div>"
+    )
+    return html
+
+
 def _calculate_lambertian_exponent(viewing_angle, ray_uniformity):
     """Calculate Lambertian exponent for LED."""
     theta_half = np.radians(viewing_angle / 2.0)
@@ -722,8 +1139,74 @@ def _calculate_lambertian_exponent(viewing_angle, ray_uniformity):
     n = np.clip(n, 0.1, 30.0)
     return n
 
+
+def _get_effective_n(led, ray_uniformity):
+    """Get Lambertian exponent, using ext_lens_angle for sharper concentration if present."""
+    ext_lens_angle = getattr(led, 'ext_lens_angle', None)
+    if ext_lens_angle is not None:
+        return _calculate_lambertian_exponent(ext_lens_angle, ray_uniformity)
+    return _calculate_lambertian_exponent(led.viewing_angle, ray_uniformity)
+
+
+def _lens_efficiency(viewing_angle):
+    """Optical efficiency of an LED collimating lens.
+
+    A bare LED (~120° beam) needs no lens (eta=1.0).  Narrower beams
+    require a lens that redirects Lambertian flux into a tighter cone,
+    incurring losses from Fresnel reflections, absorption & scattering.
+
+    Model: fraction of Lambertian flux that must be redirected determines
+    the loss.  eta = 1 - max_loss * max(0, 1 - sin^2(a/2) / sin^2(60))
+    Typical results: 120->1.00  90->0.93  60->0.87  30->0.82  10->0.80
+    """
+    MAX_LOSS = 0.20
+    sin2_half = np.sin(np.radians(viewing_angle / 2.0)) ** 2
+    SIN2_REF = 0.75  # sin^2(60°) – Lambertian reference
+    frac = max(0.0, 1.0 - sin2_half / SIN2_REF)
+    return 1.0 - MAX_LOSS * frac
+
+# Wall inward normals for room reflection (pointing INTO the room)
+_WALL_INWARD_NORMALS = {
+    'front':  np.array([-1.0,  0.0,  0.0]),
+    'back':   np.array([ 1.0,  0.0,  0.0]),
+    'left':   np.array([ 0.0,  1.0,  0.0]),
+    'right':  np.array([ 0.0, -1.0,  0.0]),
+    'top':    np.array([ 0.0,  0.0, -1.0]),
+    'bottom': np.array([ 0.0,  0.0,  1.0]),
+}
+
+def _sample_cosine_hemisphere(normal):
+    """Sample a cosine-weighted random direction in the hemisphere around normal.
+    
+    Physics: Lambertian (diffuse) reflection. The reflected radiance is uniform
+    in all directions, so sampling proportional to cos(theta) gives correct
+    flux weighting (BRDF = rho/pi, importance-sampled).
+    """
+    u1 = np.random.random()
+    u2 = np.random.random()
+    # Malley's method: project uniform disk sample to hemisphere
+    r = np.sqrt(u1)
+    phi = 2.0 * np.pi * u2
+    x_local = r * np.cos(phi)
+    y_local = r * np.sin(phi)
+    z_local = np.sqrt(max(0.0, 1.0 - u1))
+    # Build tangent frame from normal
+    if abs(normal[2]) < 0.999:
+        tangent = np.cross(normal, np.array([0.0, 0.0, 1.0]))
+    else:
+        tangent = np.cross(normal, np.array([0.0, 1.0, 0.0]))
+    tangent = tangent / np.linalg.norm(tangent)
+    bitangent = np.cross(normal, tangent)
+    # Transform local to world
+    world_dir = x_local * tangent + y_local * bitangent + z_local * normal
+    norm = np.linalg.norm(world_dir)
+    if norm > 1e-10:
+        world_dir /= norm
+    return world_dir
+
 def _process_led_wall_worker(args):
-    """Worker function for single wall ray tracing (multiprocessing)."""
+    """Worker function for single wall ray tracing (multiprocessing).
+    Batches all rays and tests mesh intersection in a single call for performance."""
     led, params = args
     
     # Unpack parameters
@@ -731,7 +1214,7 @@ def _process_led_wall_worker(args):
     rays_per_led = params['rays_per_led']
     grid_size = params['grid_size']
     wall_size = params['wall_size']
-    lumens_per_led = params['lumens_per_led']
+    lumens_per_led = getattr(led, 'lumens', None) or params['lumens_per_led']
     absorbers = params['absorbers']
     ray_uniformity = params['ray_uniformity']
     led_idx = params['led_idx']
@@ -756,75 +1239,184 @@ def _process_led_wall_worker(args):
     y_axis = np.cross(z_axis, x_axis)
     
     # Calculate emission parameters
+    n = _get_effective_n(led, ray_uniformity)
     max_theta = np.radians(led.viewing_angle / 2.0)
-    n = _calculate_lambertian_exponent(led.viewing_angle, ray_uniformity)
-    norm_factor = n + 1.0
+    cos_max = np.cos(max_theta)
     
-    # Trace rays
-    for _ in range(rays_per_led):
-        # Sample direction
-        u1, u2 = np.random.uniform(0, 1, 2)
-        cos_max = np.cos(max_theta)
-        cos_theta = 1.0 - u1 * (1.0 - cos_max)
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-        theta = np.arccos(cos_theta)
-        phi = 2 * np.pi * u2
+    # --- Generate ALL rays at once (vectorized) ---
+    u = np.random.uniform(0, 1, (rays_per_led, 2))
+    cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    phi = 2 * np.pi * u[:, 1]
+    
+    sin_theta = np.sin(theta)
+    local_dirs = np.column_stack([
+        sin_theta * np.cos(phi),
+        sin_theta * np.sin(phi),
+        cos_theta,
+    ])  # (N, 3)
+    
+    # Transform to world coordinates
+    world_dirs = (local_dirs[:, 0:1] * x_axis +
+                  local_dirs[:, 1:2] * y_axis +
+                  local_dirs[:, 2:3] * z_axis)
+    norms = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+    world_dirs = world_dirs / norms  # (N, 3)
+    
+    # Calculate lumens per ray with cone normalization and lens efficiency
+    cos_max_n1 = cos_max ** (n + 1.0)
+    denom = 1.0 - cos_max_n1
+    norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+    cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+    intensity_coefficients = np.power(cos_theta_clamped, n)
+    lumens_per_ray = (lumens_per_led / rays_per_led) * intensity_coefficients * norm_factor  # (N,)
+    
+    # --- Check box absorber intersection (vectorized) ---
+    hit_absorbed = np.zeros(rays_per_led, dtype=bool)
+    if absorbers:
+        ray_origins = np.broadcast_to(led.position, (rays_per_led, 3)).copy().astype(np.float32)
+        hit_absorbed = _ray_box_intersection_batch_np(ray_origins, world_dirs.astype(np.float32), absorbers)
+    
+    # --- Batch STL mesh intersection (single call for all non-absorbed rays) ---
+    stl_mesh_data = params.get('stl_mesh_data')
+    if stl_mesh_data is not None:
+        # Only test rays not already absorbed by boxes
+        not_absorbed_mask = ~hit_absorbed
+        not_absorbed_indices = np.where(not_absorbed_mask)[0]
         
-        local_dir = np.array([
-            np.sin(theta) * np.cos(phi),
-            np.sin(theta) * np.sin(phi),
-            np.cos(theta)
-        ])
+        if len(not_absorbed_indices) > 0:
+            origins = np.tile(led.position, (len(not_absorbed_indices), 1)).astype(np.float64)
+            directions = world_dirs[not_absorbed_indices]
+            
+            accel = _prepare_mesh_ray_accelerator(stl_mesh_data)
+            mesh_hits = _batch_ray_mesh_intersection(origins, directions, accel)
+            hit_absorbed[not_absorbed_indices[mesh_hits]] = True
+    
+    # --- Compute wall hits for non-absorbed rays ---
+    alive = ~hit_absorbed  # rays that weren't absorbed
+    
+    # Only process rays going towards the wall (world_dir[0] > 0)
+    towards_wall = world_dirs[:, 0] > 0
+    valid = alive & towards_wall
+    valid_indices = np.where(valid)[0]
+    
+    if len(valid_indices) > 0:
+        t = (wall_dist - led.position[0]) / world_dirs[valid_indices, 0]
+        pos_t = t > 0
+        vi = valid_indices[pos_t]
+        t = t[pos_t]
         
-        world_dir = (
-            local_dir[0] * x_axis +
-            local_dir[1] * y_axis +
-            local_dir[2] * z_axis
-        )
-        world_dir = world_dir / np.linalg.norm(world_dir)
+        hit_y = led.position[1] + world_dirs[vi, 1] * t
+        hit_z = led.position[2] + world_dirs[vi, 2] * t
         
-        # Calculate lumens for this ray
-        cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
-        intensity_coefficient = np.power(cos_theta_clamped, n)
-        lumens_per_ray = (lumens_per_led / rays_per_led) * intensity_coefficient * norm_factor
+        grid_y = ((hit_y + half_size) / cell_size).astype(int)
+        grid_z = ((hit_z + half_size) / cell_size).astype(int)
         
-        # Check absorber intersection
-        hit_absorbed = False
-        if absorbers:
-            for a in absorbers:
-                t_hit = _ray_box_intersection(led.position, world_dir, a)
-                if t_hit is not None and t_hit > 0:
-                    hit_absorbed = True
-                    break
+        in_bounds = (grid_y >= 0) & (grid_y < grid_size) & (grid_z >= 0) & (grid_z < grid_size)
+        bi = np.where(in_bounds)[0]
         
-        # Check STL mesh intersection
-        if not hit_absorbed and params.get('stl_mesh_data') is not None:
-            t_hit = _ray_mesh_intersection(led.position, world_dir, params['stl_mesh_data'])
-            if t_hit is not None and t_hit > 0:
-                hit_absorbed = True
+        lux_values = lumens_per_ray[vi[bi]] / cell_area_m2
+        np.add.at(local_grid, (grid_z[bi], grid_y[bi]), lux_values)
+    
+    return local_grid
+
+def _process_led_wall_worker_with_accel(args, accel):
+    """Same as _process_led_wall_worker but uses a pre-built BVH accelerator.
+    Thread-safe: uses per-LED RandomState instead of global seed."""
+    led, params = args
+    
+    wall_dist = params['wall_dist']
+    rays_per_led = params['rays_per_led']
+    grid_size = params['grid_size']
+    wall_size = params['wall_size']
+    lumens_per_led = getattr(led, 'lumens', None) or params['lumens_per_led']
+    absorbers = params['absorbers']
+    ray_uniformity = params['ray_uniformity']
+    led_idx = params['led_idx']
+    
+    local_grid = np.zeros((grid_size, grid_size))
+    cell_size = wall_size / grid_size
+    cell_area_m2 = (cell_size * cell_size) / 10000.0
+    half_size = wall_size / 2
+    
+    # Thread-safe RNG (each LED gets its own independent generator)
+    rng = np.random.RandomState((42 + led_idx) % (2**32))
+    
+    z_axis = led.direction
+    if abs(z_axis[2]) < 0.9:
+        x_axis = np.cross(z_axis, [0, 0, 1])
+    else:
+        x_axis = np.cross(z_axis, [0, 1, 0])
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    
+    n = _get_effective_n(led, ray_uniformity)
+    max_theta = np.radians(led.viewing_angle / 2.0)
+    cos_max = np.cos(max_theta)
+    
+    # Generate ALL rays (thread-safe)
+    u = rng.uniform(0, 1, (rays_per_led, 2))
+    cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    phi = 2 * np.pi * u[:, 1]
+    
+    sin_theta = np.sin(theta)
+    local_dirs = np.column_stack([sin_theta * np.cos(phi), sin_theta * np.sin(phi), cos_theta])
+    
+    world_dirs = (local_dirs[:, 0:1] * x_axis + local_dirs[:, 1:2] * y_axis + local_dirs[:, 2:3] * z_axis)
+    norms = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+    world_dirs = world_dirs / norms
+    
+    cos_max_n1 = cos_max ** (n + 1.0)
+    denom = 1.0 - cos_max_n1
+    norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+    cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+    lumens_per_ray = (lumens_per_led / rays_per_led) * np.power(cos_theta_clamped, n) * norm_factor
+    
+    # Check box absorbers (vectorized)
+    hit_absorbed = np.zeros(rays_per_led, dtype=bool)
+    if absorbers:
+        ray_origins = np.broadcast_to(led.position, (rays_per_led, 3)).copy().astype(np.float32)
+        hit_absorbed = _ray_box_intersection_batch_np(ray_origins, world_dirs.astype(np.float32), absorbers)
+    
+    # Batch mesh intersection using PRE-BUILT accelerator (no BVH rebuild!)
+    if accel is not None:
+        not_absorbed_indices = np.where(~hit_absorbed)[0]
+        if len(not_absorbed_indices) > 0:
+            origins = np.tile(led.position, (len(not_absorbed_indices), 1)).astype(np.float64)
+            mesh_hits = _batch_ray_mesh_intersection(origins, world_dirs[not_absorbed_indices], accel)
+            hit_absorbed[not_absorbed_indices[mesh_hits]] = True
+    
+    # Wall hits
+    alive = ~hit_absorbed
+    towards_wall = world_dirs[:, 0] > 0
+    valid_indices = np.where(alive & towards_wall)[0]
+    
+    if len(valid_indices) > 0:
+        t = (wall_dist - led.position[0]) / world_dirs[valid_indices, 0]
+        pos_t = t > 0
+        vi = valid_indices[pos_t]
+        t = t[pos_t]
         
-        if hit_absorbed:
-            continue
+        hit_y = led.position[1] + world_dirs[vi, 1] * t
+        hit_z = led.position[2] + world_dirs[vi, 2] * t
         
-        # Check wall intersection
-        if world_dir[0] > 0:
-            t = (wall_dist - led.position[0]) / world_dir[0]
-            if t > 0:
-                hit_y = led.position[1] + world_dir[1] * t
-                hit_z = led.position[2] + world_dir[2] * t
-                
-                grid_y = int((hit_y + half_size) / cell_size)
-                grid_z = int((hit_z + half_size) / cell_size)
-                
-                if 0 <= grid_y < grid_size and 0 <= grid_z < grid_size:
-                    # Convert lumens to lux (lm/m²)
-                    lux_contribution = lumens_per_ray / cell_area_m2
-                    local_grid[grid_z, grid_y] += lux_contribution
+        grid_y = ((hit_y + half_size) / cell_size).astype(int)
+        grid_z = ((hit_z + half_size) / cell_size).astype(int)
+        
+        in_bounds = (grid_y >= 0) & (grid_y < grid_size) & (grid_z >= 0) & (grid_z < grid_size)
+        bi = np.where(in_bounds)[0]
+        
+        lux_values = lumens_per_ray[vi[bi]] / cell_area_m2
+        np.add.at(local_grid, (grid_z[bi], grid_y[bi]), lux_values)
     
     return local_grid
 
 def _process_led_worker(args):
-    """Worker function to process rays for a single LED (for multiprocessing)."""
+    """Worker function to process rays for a single LED (for multiprocessing).
+    Batches all rays and tests mesh intersection in a single call for performance."""
     led, params = args
     
     # Unpack parameters
@@ -835,12 +1427,14 @@ def _process_led_worker(args):
     led_x_center = params.get('led_x_center', -35)
     num_rays_per_led = params['num_rays_per_led']
     grid_size = params['grid_size']
-    lumens_per_led = params['lumens_per_led']
+    lumens_per_led = getattr(led, 'lumens', None) or params['lumens_per_led']
     absorbers = params['absorbers']
     stl_mesh_data = params.get('stl_mesh_data')
     ray_uniformity = params['ray_uniformity']
     grid_shapes = params['grid_shapes']
     wall_specs = params['wall_specs']
+    max_bounces = params.get('max_bounces', 0)
+    wall_reflectance = params.get('wall_reflectance', 0.0)
     
     # Initialize local grids for this LED (stores lux = lm/m²)
     local_grids = {
@@ -857,8 +1451,6 @@ def _process_led_worker(args):
         local_grids['back'] = np.zeros(grid_shapes['back'])
         local_ray_hits['back'] = 0
     
-    local_total_rays = 0
-    
     # Calculate cell areas for each wall (in m²)
     cell_areas_m2 = {}
     for wall_name, spec in wall_specs.items():
@@ -872,7 +1464,7 @@ def _process_led_worker(args):
             cell_width_cm = spec['size_x'] / spec['grid_x']
             cell_height_cm = spec['size_y'] / spec['grid_y']
         cell_area_cm2 = cell_width_cm * cell_height_cm
-        cell_areas_m2[wall_name] = cell_area_cm2 / 10000.0  # Convert cm² to m²
+        cell_areas_m2[wall_name] = cell_area_cm2 / 10000.0
     
     # Build local coordinate system from LED direction
     z_axis = led.direction
@@ -883,166 +1475,396 @@ def _process_led_worker(args):
     x_axis = x_axis / np.linalg.norm(x_axis)
     y_axis = np.cross(z_axis, x_axis)
     
-    # Calculate rays per LED
+    # Calculate rays per LED and emission parameters
     rays_traced = num_rays_per_led * grid_size * grid_size
+    n = _get_effective_n(led, ray_uniformity)
+    max_theta = np.radians(led.viewing_angle / 2.0)
+    cos_max = np.cos(max_theta)
     
-    for _ in range(rays_traced):
-        local_total_rays += 1
+    # --- Generate ALL rays at once (vectorized) ---
+    u = np.random.uniform(0, 1, (rays_traced, 2))
+    cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    phi = 2 * np.pi * u[:, 1]
+    
+    sin_theta = np.sin(theta)
+    local_dirs = np.column_stack([
+        sin_theta * np.cos(phi),
+        sin_theta * np.sin(phi),
+        cos_theta,
+    ])
+    
+    # Transform to world coordinates
+    world_dirs = (local_dirs[:, 0:1] * x_axis +
+                  local_dirs[:, 1:2] * y_axis +
+                  local_dirs[:, 2:3] * z_axis)
+    norms = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+    world_dirs = world_dirs / norms
+    
+    # Calculate lumens per ray with cone normalization and lens efficiency
+    cos_max_n1 = cos_max ** (n + 1.0)
+    denom = 1.0 - cos_max_n1
+    norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+    cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+    cos_n_theta = np.power(cos_theta_clamped, n)
+    lumens_per_ray = (lumens_per_led / rays_traced) * cos_n_theta * norm_factor
+    
+    # --- Check box absorber intersection (vectorized) ---
+    hit_absorbed = np.zeros(rays_traced, dtype=bool)
+    if absorbers:
+        ray_origins = np.broadcast_to(led.position, (rays_traced, 3)).copy().astype(np.float32)
+        hit_absorbed = _ray_box_intersection_batch_np(ray_origins, world_dirs.astype(np.float32), absorbers)
+    
+    # --- Batch STL mesh intersection ---
+    if stl_mesh_data is not None:
+        not_absorbed_indices = np.where(~hit_absorbed)[0]
+        if len(not_absorbed_indices) > 0:
+            origins = np.tile(led.position, (len(not_absorbed_indices), 1)).astype(np.float64)
+            directions = world_dirs[not_absorbed_indices]
+            accel = _prepare_mesh_ray_accelerator(stl_mesh_data)
+            mesh_hits = _batch_ray_mesh_intersection(origins, directions, accel)
+            hit_absorbed[not_absorbed_indices[mesh_hits]] = True
+    
+    # --- Process wall hits for non-absorbed rays ---
+    local_total_rays = rays_traced
+    alive_indices = np.where(~hit_absorbed)[0]
+    
+    pos = led.position
+    
+    for idx in alive_indices:
+        ray_dir = world_dirs[idx].copy()
+        ray_origin = np.array(pos, dtype=np.float64)
+        ray_flux = lumens_per_ray[idx]
         
-        # Sample rays within viewing angle cone in LED frame
-        u1, u2 = np.random.uniform(0, 1, 2)
-        max_theta = np.radians(led.viewing_angle / 2.0)  # Use full viewing angle
-        cos_max = np.cos(max_theta)
-        cos_theta = 1.0 - u1 * (1.0 - cos_max)
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-        theta = np.arccos(cos_theta)
-        phi = 2 * np.pi * u2
-        
-        # Local direction in LED frame
-        local_dir = np.array([
-            np.sin(theta) * np.cos(phi),
-            np.sin(theta) * np.sin(phi),
-            np.cos(theta)
-        ])
-        
-        # Transform to world coordinates
-        world_dir = (
-            local_dir[0] * x_axis
-            + local_dir[1] * y_axis
-            + local_dir[2] * z_axis
-        )
-        world_dir = world_dir / np.linalg.norm(world_dir)
-        
-        # Calculate lumens for this ray
-        n = _calculate_lambertian_exponent(led.viewing_angle, ray_uniformity)
-        norm_factor = n + 1.0
-        cos_n_theta = cos_theta ** n
-        lumens_per_ray = (lumens_per_led / rays_traced) * cos_n_theta * norm_factor
-        
-        # Check absorber intersection
-        hit_absorbed = False
-        if absorbers:
-            for a in absorbers:
-                t_hit = _ray_box_intersection(led.position, world_dir, a)
-                if t_hit is not None and t_hit > 0:
-                    hit_absorbed = True
-                    break
-        
-        # Check STL mesh intersection
-        if not hit_absorbed and stl_mesh_data is not None:
-            t_hit = _ray_mesh_intersection(led.position, world_dir, stl_mesh_data)
-            if t_hit is not None and t_hit > 0:
-                hit_absorbed = True
-        
-        if hit_absorbed:
-            continue
-        
-        # Calculate intersection with each wall
-        intersections = []
-        
-        # Front wall
-        if world_dir[0] > 0:
-            t = (front_dist - led.position[0]) / world_dir[0]
-            if t > 0:
-                y = led.position[1] + world_dir[1] * t
-                z = led.position[2] + world_dir[2] * t
-                intersections.append(('front', t, y, z))
-        
-        # Left wall
-        if world_dir[1] < 0:
-            t = (-side_dist - led.position[1]) / world_dir[1]
-            if t > 0:
-                x = led.position[0] + world_dir[0] * t
-                z = led.position[2] + world_dir[2] * t
-                intersections.append(('left', t, x, z))
-        
-        # Right wall
-        if world_dir[1] > 0:
-            t = (side_dist - led.position[1]) / world_dir[1]
-            if t > 0:
-                x = led.position[0] + world_dir[0] * t
-                z = led.position[2] + world_dir[2] * t
-                intersections.append(('right', t, x, z))
-        
-        # Top wall
-        if world_dir[2] > 0:
-            t = (top_bottom_dist - led.position[2]) / world_dir[2]
-            if t > 0:
-                x = led.position[0] + world_dir[0] * t
-                y = led.position[1] + world_dir[1] * t
-                intersections.append(('top', t, x, y))
-        
-        # Bottom wall
-        if world_dir[2] < 0:
-            t = (-top_bottom_dist - led.position[2]) / world_dir[2]
-            if t > 0:
-                x = led.position[0] + world_dir[0] * t
-                y = led.position[1] + world_dir[1] * t
-                intersections.append(('bottom', t, x, y))
-        
-        # Back wall (at negative X, symmetric to front wall)
-        if back_dist is not None and world_dir[0] < 0:
-            back_x_pos = -back_dist
-            t = (back_x_pos - led.position[0]) / world_dir[0]
-            if t > 0:
-                y = led.position[1] + world_dir[1] * t
-                z = led.position[2] + world_dir[2] * t
-                intersections.append(('back', t, y, z))
-        
-        if not intersections:
-            continue
-        
-        wall_name, t_min, coord1, coord2 = min(intersections, key=lambda x: x[1])
-        wall_spec = wall_specs[wall_name]
-        
-        # Map coordinates to grid indices
-        if wall_name == 'front' or wall_name == 'back':
-            size_y = wall_spec['size_y']
-            size_z = wall_spec['size_z']
-            grid_size_y = wall_spec['grid_y']
-            grid_size_z = wall_spec['grid_z']
-            y_idx = int((coord1 + size_y/2) / (size_y/grid_size_y))
-            z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
-            grid_i = z_idx
-            grid_j = y_idx
+        for bounce in range(max_bounces + 1):
+            # Calculate intersection with each wall
+            intersections = []
+            
+            if ray_dir[0] > 0:
+                t = (front_dist - ray_origin[0]) / ray_dir[0]
+                if t > 0:
+                    intersections.append(('front', t, ray_origin[1] + ray_dir[1] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if ray_dir[1] < 0:
+                t = (-side_dist - ray_origin[1]) / ray_dir[1]
+                if t > 0:
+                    intersections.append(('left', t, ray_origin[0] + ray_dir[0] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if ray_dir[1] > 0:
+                t = (side_dist - ray_origin[1]) / ray_dir[1]
+                if t > 0:
+                    intersections.append(('right', t, ray_origin[0] + ray_dir[0] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if ray_dir[2] > 0:
+                t = (top_bottom_dist - ray_origin[2]) / ray_dir[2]
+                if t > 0:
+                    intersections.append(('top', t, ray_origin[0] + ray_dir[0] * t, ray_origin[1] + ray_dir[1] * t))
+            
+            if ray_dir[2] < 0:
+                t = (-top_bottom_dist - ray_origin[2]) / ray_dir[2]
+                if t > 0:
+                    intersections.append(('bottom', t, ray_origin[0] + ray_dir[0] * t, ray_origin[1] + ray_dir[1] * t))
+            
+            if back_dist is not None and ray_dir[0] < 0:
+                t = (-back_dist - ray_origin[0]) / ray_dir[0]
+                if t > 0:
+                    intersections.append(('back', t, ray_origin[1] + ray_dir[1] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if not intersections:
+                break
+            
+            wall_name, t_min, coord1, coord2 = min(intersections, key=lambda x: x[1])
+            wall_spec = wall_specs[wall_name]
+            
+            # Map coordinates to grid indices
+            if wall_name in ('front', 'back'):
+                size_y = wall_spec['size_y']
+                size_z = wall_spec['size_z']
+                grid_size_y = wall_spec['grid_y']
+                grid_size_z = wall_spec['grid_z']
+                y_idx = int((coord1 + size_y/2) / (size_y/grid_size_y))
+                z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
+                grid_i = z_idx
+                grid_j = y_idx
+            elif wall_name in ['left', 'right']:
+                size_x = wall_spec['size_x']
+                size_z = wall_spec['size_z']
+                grid_size_x = wall_spec['grid_x']
+                grid_size_z = wall_spec['grid_z']
+                x_min = wall_spec['x_min']
+                x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
+                z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
+                grid_i = z_idx
+                grid_j = x_idx
+            else:  # top, bottom
+                size_x = wall_spec['size_x']
+                size_y = wall_spec['size_y']
+                grid_size_x = wall_spec['grid_x']
+                grid_size_y = wall_spec['grid_y']
+                x_min = wall_spec['x_min']
+                x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
+                y_idx = int((coord2 + size_y/2) / (size_y/grid_size_y))
+                grid_i = y_idx
+                grid_j = x_idx
+            
+            # Clamp indices to grid bounds
+            grid_shape = local_grids[wall_name].shape
+            grid_i = max(0, min(grid_shape[0] - 1, grid_i))
+            grid_j = max(0, min(grid_shape[1] - 1, grid_j))
+            
+            lux_contribution = ray_flux / cell_areas_m2[wall_name]
+            local_grids[wall_name][grid_i, grid_j] += lux_contribution
+            local_ray_hits[wall_name] += 1
+            
+            # Check if we should generate a reflected bounce
+            if bounce >= max_bounces or wall_reflectance <= 0:
+                break
+            ray_flux *= wall_reflectance
+            if ray_flux < 1e-8:  # negligible flux
+                break
+            # Update ray origin to hit point + small offset along wall normal
+            hit_point = ray_origin + ray_dir * t_min
+            normal = _WALL_INWARD_NORMALS[wall_name]
+            ray_origin = hit_point + normal * 0.01  # 0.01cm offset to avoid self-intersection
+            ray_dir = _sample_cosine_hemisphere(normal)
+    
+    return local_grids, local_ray_hits, local_total_rays
+
+
+def _process_led_worker_with_accel(args, accel):
+    """Same as _process_led_worker but uses a pre-built BVH accelerator.
+    Avoids rebuilding BVH per LED in single-process mode."""
+    led, params = args
+    
+    front_dist = params['front_dist']
+    side_dist = params['side_dist']
+    top_bottom_dist = params['top_bottom_dist']
+    back_dist = params.get('back_dist')
+    led_x_center = params.get('led_x_center', -35)
+    num_rays_per_led = params['num_rays_per_led']
+    grid_size = params['grid_size']
+    lumens_per_led = getattr(led, 'lumens', None) or params['lumens_per_led']
+    absorbers = params['absorbers']
+    ray_uniformity = params['ray_uniformity']
+    grid_shapes = params['grid_shapes']
+    wall_specs = params['wall_specs']
+    max_bounces = params.get('max_bounces', 0)
+    wall_reflectance = params.get('wall_reflectance', 0.0)
+    
+    local_grids = {
+        'front': np.zeros(grid_shapes['front']),
+        'left': np.zeros(grid_shapes['left']),
+        'right': np.zeros(grid_shapes['right']),
+        'top': np.zeros(grid_shapes['top']),
+        'bottom': np.zeros(grid_shapes['bottom'])
+    }
+    local_ray_hits = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+    
+    if back_dist is not None:
+        local_grids['back'] = np.zeros(grid_shapes['back'])
+        local_ray_hits['back'] = 0
+    
+    cell_areas_m2 = {}
+    for wall_name, spec in wall_specs.items():
+        if wall_name in ('front', 'back'):
+            cell_width_cm = spec['size_y'] / spec['grid_y']
+            cell_height_cm = spec['size_z'] / spec['grid_z']
         elif wall_name in ['left', 'right']:
-            size_x = wall_spec['size_x']
-            size_z = wall_spec['size_z']
-            grid_size_x = wall_spec['grid_x']
-            grid_size_z = wall_spec['grid_z']
-            x_min = wall_spec['x_min']
-            x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
-            z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
-            grid_i = z_idx
-            grid_j = x_idx
-        else:  # top, bottom
-            size_x = wall_spec['size_x']
-            size_y = wall_spec['size_y']
-            grid_size_x = wall_spec['grid_x']
-            grid_size_y = wall_spec['grid_y']
-            x_min = wall_spec['x_min']
-            x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
-            y_idx = int((coord2 + size_y/2) / (size_y/grid_size_y))
-            grid_i = y_idx
-            grid_j = x_idx
+            cell_width_cm = spec['size_x'] / spec['grid_x']
+            cell_height_cm = spec['size_z'] / spec['grid_z']
+        else:
+            cell_width_cm = spec['size_x'] / spec['grid_x']
+            cell_height_cm = spec['size_y'] / spec['grid_y']
+        cell_areas_m2[wall_name] = (cell_width_cm * cell_height_cm) / 10000.0
+    
+    # Thread-safe RNG (each LED gets its own independent generator)
+    rng = np.random.RandomState((42 + int(getattr(led, 'led_idx', id(led)))) % (2**32))
+    
+    z_axis = led.direction
+    if abs(z_axis[2]) < 0.9:
+        x_axis = np.cross(z_axis, [0, 0, 1])
+    else:
+        x_axis = np.cross(z_axis, [0, 1, 0])
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    
+    rays_traced = num_rays_per_led * grid_size * grid_size
+    n = _get_effective_n(led, ray_uniformity)
+    max_theta = np.radians(led.viewing_angle / 2.0)
+    cos_max = np.cos(max_theta)
+    
+    u = rng.uniform(0, 1, (rays_traced, 2))
+    cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    phi = 2 * np.pi * u[:, 1]
+    
+    sin_theta = np.sin(theta)
+    local_dirs = np.column_stack([sin_theta * np.cos(phi), sin_theta * np.sin(phi), cos_theta])
+    
+    world_dirs = (local_dirs[:, 0:1] * x_axis + local_dirs[:, 1:2] * y_axis + local_dirs[:, 2:3] * z_axis)
+    norms = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+    world_dirs = world_dirs / norms
+    
+    cos_max_n1 = cos_max ** (n + 1.0)
+    denom = 1.0 - cos_max_n1
+    norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+    cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+    cos_n_theta = np.power(cos_theta_clamped, n)
+    lumens_per_ray = (lumens_per_led / rays_traced) * cos_n_theta * norm_factor
+    
+    hit_absorbed = np.zeros(rays_traced, dtype=bool)
+    if absorbers:
+        ray_origins = np.broadcast_to(led.position, (rays_traced, 3)).copy().astype(np.float32)
+        hit_absorbed = _ray_box_intersection_batch_np(ray_origins, world_dirs.astype(np.float32), absorbers)
+    
+    # Batch mesh intersection using PRE-BUILT accelerator (no BVH rebuild!)
+    if accel is not None:
+        not_absorbed_indices = np.where(~hit_absorbed)[0]
+        if len(not_absorbed_indices) > 0:
+            origins = np.tile(led.position, (len(not_absorbed_indices), 1)).astype(np.float64)
+            mesh_hits = _batch_ray_mesh_intersection(origins, world_dirs[not_absorbed_indices], accel)
+            hit_absorbed[not_absorbed_indices[mesh_hits]] = True
+    
+    local_total_rays = rays_traced
+    alive_indices = np.where(~hit_absorbed)[0]
+    pos = led.position
+    
+    for idx in alive_indices:
+        ray_dir = world_dirs[idx].copy()
+        ray_origin = np.array(pos, dtype=np.float64)
+        ray_flux = lumens_per_ray[idx]
         
-        # Clamp indices to grid bounds
-        grid_shape = local_grids[wall_name].shape
-        grid_i = max(0, min(grid_shape[0] - 1, grid_i))
-        grid_j = max(0, min(grid_shape[1] - 1, grid_j))
-        
-        # Convert lumens to lux (lm/m²)
-        lux_contribution = lumens_per_ray / cell_areas_m2[wall_name]
-        local_grids[wall_name][grid_i, grid_j] += lux_contribution
-        local_ray_hits[wall_name] += 1
+        for bounce in range(max_bounces + 1):
+            intersections = []
+            
+            if ray_dir[0] > 0:
+                t = (front_dist - ray_origin[0]) / ray_dir[0]
+                if t > 0:
+                    intersections.append(('front', t, ray_origin[1] + ray_dir[1] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if ray_dir[1] < 0:
+                t = (-side_dist - ray_origin[1]) / ray_dir[1]
+                if t > 0:
+                    intersections.append(('left', t, ray_origin[0] + ray_dir[0] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if ray_dir[1] > 0:
+                t = (side_dist - ray_origin[1]) / ray_dir[1]
+                if t > 0:
+                    intersections.append(('right', t, ray_origin[0] + ray_dir[0] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if ray_dir[2] > 0:
+                t = (top_bottom_dist - ray_origin[2]) / ray_dir[2]
+                if t > 0:
+                    intersections.append(('top', t, ray_origin[0] + ray_dir[0] * t, ray_origin[1] + ray_dir[1] * t))
+            
+            if ray_dir[2] < 0:
+                t = (-top_bottom_dist - ray_origin[2]) / ray_dir[2]
+                if t > 0:
+                    intersections.append(('bottom', t, ray_origin[0] + ray_dir[0] * t, ray_origin[1] + ray_dir[1] * t))
+            
+            if back_dist is not None and ray_dir[0] < 0:
+                t = (-back_dist - ray_origin[0]) / ray_dir[0]
+                if t > 0:
+                    intersections.append(('back', t, ray_origin[1] + ray_dir[1] * t, ray_origin[2] + ray_dir[2] * t))
+            
+            if not intersections:
+                break
+            
+            wall_name, t_min, coord1, coord2 = min(intersections, key=lambda x: x[1])
+            wall_spec = wall_specs[wall_name]
+            
+            if wall_name in ('front', 'back'):
+                size_y = wall_spec['size_y']
+                size_z = wall_spec['size_z']
+                grid_size_y = wall_spec['grid_y']
+                grid_size_z = wall_spec['grid_z']
+                y_idx = int((coord1 + size_y/2) / (size_y/grid_size_y))
+                z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
+                grid_i = z_idx
+                grid_j = y_idx
+            elif wall_name in ['left', 'right']:
+                size_x = wall_spec['size_x']
+                size_z = wall_spec['size_z']
+                grid_size_x = wall_spec['grid_x']
+                grid_size_z = wall_spec['grid_z']
+                x_min = wall_spec['x_min']
+                x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
+                z_idx = int((coord2 + size_z/2) / (size_z/grid_size_z))
+                grid_i = z_idx
+                grid_j = x_idx
+            else:
+                size_x = wall_spec['size_x']
+                size_y = wall_spec['size_y']
+                grid_size_x = wall_spec['grid_x']
+                grid_size_y = wall_spec['grid_y']
+                x_min = wall_spec['x_min']
+                x_idx = int((coord1 - x_min) / (size_x/grid_size_x))
+                y_idx = int((coord2 + size_y/2) / (size_y/grid_size_y))
+                grid_i = y_idx
+                grid_j = x_idx
+            
+            grid_shape = local_grids[wall_name].shape
+            grid_i = max(0, min(grid_shape[0] - 1, grid_i))
+            grid_j = max(0, min(grid_shape[1] - 1, grid_j))
+            
+            lux_contribution = ray_flux / cell_areas_m2[wall_name]
+            local_grids[wall_name][grid_i, grid_j] += lux_contribution
+            local_ray_hits[wall_name] += 1
+            
+            # Check if we should generate a reflected bounce
+            if bounce >= max_bounces or wall_reflectance <= 0:
+                break
+            ray_flux *= wall_reflectance
+            if ray_flux < 1e-8:
+                break
+            hit_point = ray_origin + ray_dir * t_min
+            normal = _WALL_INWARD_NORMALS[wall_name]
+            ray_origin = hit_point + normal * 0.01
+            ray_dir = _sample_cosine_hemisphere(normal)
     
     return local_grids, local_ray_hits, local_total_rays
 
 
 def main():
-    # Create Viser server
-    server = viser.ViserServer()
-    print(f"Viser server running at: http://localhost:8080")
+    # Create Viser server — bind to 0.0.0.0 so other computers on the LAN can connect
+    server = viser.ViserServer(host="0.0.0.0", port=8080)
+    
+    # Allow users to collapse/hide the control panel
+    server.gui.configure_theme(control_layout="collapsible", dark_mode=True)
+    
+    # Get local IP for LAN access
+    import socket as _socket
+    _local_ip = "127.0.0.1"
+    try:
+        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        _s.connect(("8.8.8.8", 80))
+        _local_ip = _s.getsockname()[0]
+        _s.close()
+    except Exception:
+        pass
+    
+    # Try to add Windows Firewall rule for LAN access (requires admin, fails silently)
+    try:
+        import subprocess as _sp
+        _sp.run(
+            ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+             'name=LightingSim', 'dir=in', 'action=allow',
+             'protocol=TCP', 'localport=8080'],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass
+    
+    # Auto-open browser
+    import webbrowser as _wb
+    _wb.open("http://localhost:8080")
+    
+    print(f"\n  🖥️  Local:   http://localhost:8080")
+    print(f"  🌐  Network: http://{_local_ip}:8080")
+    print(f"\n  ⚠️  Se la connessione da rete non funziona, eseguire come Amministratore")
+    print(f"      oppure aprire manualmente porta 8080 nel Windows Firewall.")
     print("\n" + "="*60)
     print("  LED Lighting Simulation - Interactive Tool")
     print("="*60)
@@ -1104,6 +1926,10 @@ def main():
     # Template folders - track loaded templates with master controls
     template_folders = []  # List of template folder handles to remove on new project/load
     
+    # Panel Configurator state (populated later when UI is created)
+    _panel_slot_data = [None, None, None, None]
+    _panel_dropdowns = []
+    
     # Store button handles for LED control
     led_buttons = {}
     row_buttons = {}
@@ -1117,16 +1943,20 @@ def main():
         # Save custom groups
         custom_groups_data = []
         for group in custom_groups:
+            # For panel slot groups, save actual rotation slider values (not baked)
+            is_panel_slot = group.get('panel_slot') is not None
             group_cfg = {
                 'enabled': group['enable'].value,
                 'position': [group['pos_x'].value, group['pos_y'].value, group['pos_z'].value],
-                'rotation_x': 0.0,  # Rotations are baked into led_positions/led_rotations
-                'rotation_y': 0.0,
-                'rotation_z': 0.0,
+                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0.0,
+                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0.0,
+                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0.0,
                 'led_states': group['led_states'][:],
                 'template_name': group.get('template_name'),  # Save template association
                 'initial_pos': group.get('initial_pos', [0.0, 0.0, 0.0]),  # Save initial position
                 'initial_rot': group.get('initial_rot', [0, 0, 0]),  # Save initial rotation
+                'panel_slot': group.get('panel_slot'),  # Save panel slot index
+                'panel_slot_name': group.get('panel_slot_name'),  # Save panel slot name
             }
             # Save dynamic group properties if present
             if group.get('is_dynamic', False):
@@ -1140,6 +1970,10 @@ def main():
                 group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
                 group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
                 group_cfg['led_euler_angles'] = group.get('led_euler_angles', [])
+                group_cfg['led_beam_tilts'] = group.get('led_beam_tilts', [])
+            # Save lumens override settings for custom group
+            group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
+            group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
             custom_groups_data.append(group_cfg)
         
         # Process individual LEDs: separate template-sourced from standalone
@@ -1177,6 +2011,7 @@ def main():
             # Convert rotation angles to direction vectors
             led_rotations = []
             led_euler_angles = []  # Store original Euler angles for lossless roundtrip
+            led_beam_tilts = []  # Store beam tilt angles for lossless roundtrip
             for led in leds_list_sorted:
                 rot_x = np.radians(led['rot_x'].value)
                 rot_y = np.radians(led['rot_y'].value)
@@ -1184,6 +2019,7 @@ def main():
                 
                 # Store original Euler angles
                 led_euler_angles.append((led['rot_x'].value, led['rot_y'].value, led['rot_z'].value))
+                led_beam_tilts.append(led['beam_tilt'].value)
                 
                 # Apply rotations sequentially: Rz first, then Ry, then Rx (matches rendering)
                 direction = np.array([1.0, 0.0, 0.0])
@@ -1233,7 +2069,6 @@ def main():
             # If we have original group position, use it; otherwise calculate average
             if original_pos is not None:
                 group_pos = original_pos
-                group_rot = original_rot if original_rot is not None else [0, 0, 0]
             else:
                 # Calculate average position (center of group)
                 group_pos = [
@@ -1241,37 +2076,12 @@ def main():
                     sum(p[1] for p in led_positions) / num_leds,
                     sum(p[2] for p in led_positions) / num_leds
                 ]
-                group_rot = [0, 0, 0]
             
-            # Convert LED positions to relative (from group center)
-            # If we have original rotation, need to reverse it
-            if original_rot is not None and any(original_rot):
-                # Build inverse rotation matrix
-                rot_x_rad = np.radians(group_rot[0])
-                rot_y_rad = np.radians(group_rot[1])
-                rot_z_rad = np.radians(group_rot[2])
-                
-                Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
-                Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
-                Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
-                R_group = Rz @ Ry @ Rx
-                R_group_inv = R_group.T  # Inverse is transpose for rotation matrices
-                
-                # Convert positions to relative by removing group offset and rotation
-                led_positions_relative = []
-                for pos in led_positions:
-                    pos_offset = np.array([pos[0] - group_pos[0], pos[1] - group_pos[1], pos[2] - group_pos[2]])
-                    pos_local = R_group_inv @ pos_offset
-                    led_positions_relative.append(tuple(pos_local))
-                
-                # Also reverse-transform the direction vectors
-                led_rotations_original = []
-                for direction in led_rotations:
-                    dir_local = R_group_inv @ np.array(direction)
-                    led_rotations_original.append(tuple(dir_local))
-                led_rotations = led_rotations_original
-            else:
-                led_positions_relative = [(p[0] - group_pos[0], p[1] - group_pos[1], p[2] - group_pos[2]) for p in led_positions]
+            # ALWAYS save in world-space with zero group rotation.
+            # This avoids error-prone inverse rotation transforms.
+            # On reload, R_group=identity ⇒ data is used as-is.
+            group_rot = [0, 0, 0]
+            led_positions_relative = [(p[0] - group_pos[0], p[1] - group_pos[1], p[2] - group_pos[2]) for p in led_positions]
             
             # Compute row directions from direction vectors, applying square_roll
             led_row_directions = []
@@ -1313,10 +2123,22 @@ def main():
                 'led_viewing_angles': led_viewing_angles,
                 'led_rows': led_rows,
                 'led_euler_angles': led_euler_angles,
+                'led_beam_tilts': led_beam_tilts,
                 'template_name': template_name if template_name != "unnamed" else None,
                 'initial_pos': [0.0, 0.0, 0.0],
                 'initial_rot': [0, 0, 0]
             }
+            # Save lumens override from individual LEDs in this template group
+            # Check if any LED in the group had lumens override enabled
+            any_lumens_override = False
+            lumens_val = 100
+            for led_item in leds_list_sorted:
+                if led_item.get('lumens_override') and led_item['lumens_override'].value:
+                    any_lumens_override = True
+                    lumens_val = led_item['lumens_value'].value if led_item.get('lumens_value') else 100
+                    break
+            group_cfg['lumens_override_enabled'] = any_lumens_override
+            group_cfg['lumens_value'] = lumens_val
             
             custom_groups_data.append(group_cfg)
         
@@ -1334,7 +2156,13 @@ def main():
                 'rot_z': led['rot_z'].value,
                 'size': led['size'].value,
                 'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value
+                'square_roll': led['square_roll'].value,
+                'beam_tilt': led['beam_tilt'].value,
+                'lumens_override_enabled': led.get('lumens_override') and led['lumens_override'].value,
+                'lumens_value': led['lumens_value'].value if led.get('lumens_value') else 100,
+                'ext_lens_enabled': led.get('ext_lens_enable') and led['ext_lens_enable'].value,
+                'ext_lens_angle': led['ext_lens_angle'].value if led.get('ext_lens_angle') else 30,
+                'ext_lens_efficiency': led['ext_lens_efficiency'].value if led.get('ext_lens_efficiency') else 80,
             })
         
         return {
@@ -1361,6 +2189,10 @@ def main():
             ],
             "row_enabled": [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             "led_states": led_states[:],
+            "global_rotation_z": global_rotation_z_slider.value,
+            "global_pos_x": global_pos_x_slider.value,
+            "global_pos_y": global_pos_y_slider.value,
+            "global_pos_z": global_pos_z_slider.value,
             "custom_groups": custom_groups_data,
             "individual_leds": individual_leds_data,
             "absorbers": {
@@ -1427,6 +2259,15 @@ def main():
             except (KeyError, AttributeError):
                 pass
         template_folders.clear()
+        # Reset panel configurator slots
+        for si in range(len(_panel_slot_data)):
+            _panel_slot_data[si] = None
+        # Reset panel configurator dropdowns (if already created)
+        for dd in _panel_dropdowns:
+            try:
+                dd.value = "-- Nessuno --"
+            except Exception:
+                pass
     
     def apply_config(cfg):
         """Update GUI elements with values from config."""
@@ -1440,6 +2281,10 @@ def main():
         viewing_angle_slider.value = cfg.get("viewing_angle", 120)
         radius_slider.value = cfg.get("radius", 35)
         circle_center_slider.value = cfg.get("circle_center_x", -35)
+        global_rotation_z_slider.value = cfg.get("global_rotation_z", 0)
+        global_pos_x_slider.value = cfg.get("global_pos_x", 0)
+        global_pos_y_slider.value = cfg.get("global_pos_y", 0)
+        global_pos_z_slider.value = cfg.get("global_pos_z", 0)
         
         rots = cfg.get("group_rotations", [0.7, -0.7, 18, -18])
         rot_front_pos.value = rots[0]
@@ -1485,16 +2330,13 @@ def main():
             print(f"Recreating {len(custom_groups_data)} custom group(s)...")
         
         # Group by template_name to recreate master folders
+        # NOTE: Every group is treated as standalone so each gets its own
+        # independent position/rotation/lumens controls. No shared master folder.
         groups_by_template = {}
         standalone_groups = []
         for group_cfg in custom_groups_data:
-            template_name = group_cfg.get('template_name')
-            if template_name:
-                if template_name not in groups_by_template:
-                    groups_by_template[template_name] = []
-                groups_by_template[template_name].append(group_cfg)
-            else:
-                standalone_groups.append(group_cfg)
+            # All groups are standalone — each gets its own independent controls
+            standalone_groups.append(group_cfg)
         
         # Create standalone groups (no template)
         for group_cfg in standalone_groups:
@@ -1512,6 +2354,7 @@ def main():
                 group_data['led_rotations'] = group_cfg.get('led_rotations', [])
                 group_data['led_row_directions'] = group_cfg.get('led_row_directions', [])
                 group_data['led_euler_angles'] = group_cfg.get('led_euler_angles', [])
+                group_data['led_beam_tilts'] = group_cfg.get('led_beam_tilts', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
                 group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
                 # IMPORTANT: Positions in saved config are already RELATIVE
@@ -1535,13 +2378,25 @@ def main():
             group_data['pos_x'].value = pos[0]
             group_data['pos_y'].value = pos[1]
             group_data['pos_z'].value = pos[2]
-            # Rotations are always 0 (transformations are baked into led_positions/led_rotations)
-            if 'rot_tilt_lr' in group_data:
-                group_data['rot_tilt_lr'].value = 0
-            if 'rot_tilt_ud' in group_data:
-                group_data['rot_tilt_ud'].value = 0
-            if 'rot_roll' in group_data:
-                group_data['rot_roll'].value = 0
+            # For panel slot groups, restore actual rotation values;
+            # for others, rotations are baked into led_positions/led_rotations
+            if group_cfg.get('panel_slot') is not None:
+                if 'rot_tilt_lr' in group_data:
+                    group_data['rot_tilt_lr'].value = int(round(group_cfg.get('rotation_z', 0)))
+                if 'rot_tilt_ud' in group_data:
+                    group_data['rot_tilt_ud'].value = int(round(group_cfg.get('rotation_y', 0)))
+                if 'rot_roll' in group_data:
+                    group_data['rot_roll'].value = int(round(group_cfg.get('rotation_x', 0)))
+                # Preserve panel slot metadata
+                group_data['panel_slot'] = group_cfg.get('panel_slot')
+                group_data['panel_slot_name'] = group_cfg.get('panel_slot_name')
+            else:
+                if 'rot_tilt_lr' in group_data:
+                    group_data['rot_tilt_lr'].value = 0
+                if 'rot_tilt_ud' in group_data:
+                    group_data['rot_tilt_ud'].value = 0
+                if 'rot_roll' in group_data:
+                    group_data['rot_roll'].value = 0
             
             # Load LED states BEFORE enabling the group
             led_states_cfg = group_cfg.get('led_states', [])
@@ -1552,6 +2407,11 @@ def main():
             # Update button colors to match loaded LED states
             if 'update_button_colors' in group_data and group_data['update_button_colors']:
                 group_data['update_button_colors']()
+            
+            # Restore lumens override settings
+            if group_data.get('lumens_override') and group_cfg.get('lumens_override_enabled'):
+                group_data['lumens_override'].value = True
+                group_data['lumens_value'].value = group_cfg.get('lumens_value', 100)
             
             # Enable the group AFTER all parameters are loaded
             group_data['enable'].value = group_cfg.get('enabled', True)
@@ -1574,12 +2434,17 @@ def main():
                 master_rot_x = server.gui.add_slider("Master Rotation X (°)", min=-180, max=180, step=1, initial_value=0)
                 master_rot_y = server.gui.add_slider("Master Rotation Y (°)", min=-180, max=180, step=1, initial_value=0)
                 master_rot_z = server.gui.add_slider("Master Rotation Z (°)", min=-180, max=180, step=1, initial_value=0)
+                server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>")
+                master_lumens_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
+                master_lumens_slider = server.gui.add_slider("Lumens per LED (lm)", min=1, max=900000, step=1, initial_value=100)
                 server.gui.add_html("<hr style='margin:8px 0;'>")
                 remove_template_btn = server.gui.add_button(f"Remove All ({len(template_groups_cfg)} groups)", color="red")
             
             # Create all groups from this template
             created_groups = []
             for group_cfg in template_groups_cfg:
+                # Extract position early so it's available for both dynamic and standard groups
+                pos = group_cfg.get('position', [0, 0, 0])
                 # Check if this is a dynamic group
                 if group_cfg.get('is_dynamic', False):
                     # Create dynamic group with saved properties
@@ -1594,16 +2459,12 @@ def main():
                     group_data['led_rotations'] = group_cfg.get('led_rotations', [])
                     group_data['led_row_directions'] = group_cfg.get('led_row_directions', [])
                     group_data['led_euler_angles'] = group_cfg.get('led_euler_angles', [])
+                    group_data['led_beam_tilts'] = group_cfg.get('led_beam_tilts', [])
                     group_data['led_sizes'] = group_cfg.get('led_sizes', [])
                     group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
-                    # IMPORTANT: Save RELATIVE positions as originals (subtract group offset)
-                    # The config contains absolute positions, we need relative ones
-                    group_offset = np.array([pos[0], pos[1], pos[2]])
-                    relative_positions = []
-                    for led_pos in group_data['led_positions']:
-                        relative_pos = np.array(led_pos) - group_offset
-                        relative_positions.append(tuple(relative_pos))
-                    group_data['original_led_positions'] = relative_positions
+                    # IMPORTANT: Positions in saved config are already RELATIVE
+                    # They were saved from original_led_positions, so use them directly
+                    group_data['original_led_positions'] = [tuple(pos) for pos in group_data['led_positions']]
                     group_data['original_led_rotations'] = [tuple(rot) for rot in group_data['led_rotations']]
                     if group_data['led_row_directions']:
                         group_data['original_led_row_directions'] = [tuple(rd) for rd in group_data['led_row_directions']]
@@ -1618,17 +2479,16 @@ def main():
                     group_data = create_custom_group(skip_update_scene=True)
                 
                 # Apply saved position and rotation values
-                pos = group_cfg.get('position', [0, 0, 0])
                 group_data['pos_x'].value = pos[0]
                 group_data['pos_y'].value = pos[1]
                 group_data['pos_z'].value = pos[2]
-                # Rotations are always 0 (transformations are baked into led_positions/led_rotations)
+                # Restore saved rotation values
                 if 'rot_tilt_lr' in group_data:
-                    group_data['rot_tilt_lr'].value = 0
+                    group_data['rot_tilt_lr'].value = int(round(group_cfg.get('rotation_z', 0)))
                 if 'rot_tilt_ud' in group_data:
-                    group_data['rot_tilt_ud'].value = 0
+                    group_data['rot_tilt_ud'].value = int(round(group_cfg.get('rotation_y', 0)))
                 if 'rot_roll' in group_data:
-                    group_data['rot_roll'].value = 0
+                    group_data['rot_roll'].value = int(round(group_cfg.get('rotation_x', 0)))
                 
                 # Load LED states
                 led_states_cfg = group_cfg.get('led_states', [])
@@ -1639,6 +2499,11 @@ def main():
                 # Update button colors
                 if 'update_button_colors' in group_data and group_data['update_button_colors']:
                     group_data['update_button_colors']()
+                
+                # Restore lumens override settings
+                if group_data.get('lumens_override') and group_cfg.get('lumens_override_enabled'):
+                    group_data['lumens_override'].value = True
+                    group_data['lumens_value'].value = group_cfg.get('lumens_value', 100)
                 
                 # Enable the group
                 group_data['enable'].value = group_cfg.get('enabled', True)
@@ -1653,21 +2518,63 @@ def main():
                 
                 created_groups.append(group_data)
             
+            # Restore master lumens from first group that has it enabled
+            for group_cfg_check in template_groups_cfg:
+                if group_cfg_check.get('lumens_override_enabled'):
+                    master_lumens_chk.value = True
+                    master_lumens_slider.value = group_cfg_check.get('lumens_value', 100)
+                    break
+            
             # Add LED controls in master folder for each group
             with template_folder:
                 server.gui.add_html("<hr style='margin:8px 0;'><b>LED Controls:</b>")
                 
                 # Store button references for dynamic color updates
                 master_led_buttons = []  # List of dicts with button references per group
+                per_group_lumens_controls = []  # Per-group lumens UI controls
+                per_group_pos_rot_controls = []  # Per-group position/rotation UI controls
                 
                 for group_idx, group in enumerate(created_groups):
-                    with server.gui.add_folder(f"Group {group_idx + 1} LEDs"):
+                    with server.gui.add_folder(f"Group {group_idx + 1}"):
                         # Store button references for this group
                         group_buttons = {
                             'all_btn': None,
                             'row_btns': {},
                             'led_btns': {}
                         }
+                        
+                        # Per-group enable checkbox
+                        _grp_enable_init = group['enable'].value
+                        grp_enable_chk = server.gui.add_checkbox("Enable", initial_value=_grp_enable_init)
+                        
+                        # Per-group position sliders
+                        server.gui.add_html("<b>Position:</b>")
+                        grp_pos_x = server.gui.add_slider("Pos X (cm)", min=-100, max=100, step=0.1, initial_value=group['pos_x'].value)
+                        grp_pos_y = server.gui.add_slider("Pos Y (cm)", min=-100, max=100, step=0.1, initial_value=group['pos_y'].value)
+                        grp_pos_z = server.gui.add_slider("Pos Z (cm)", min=-100, max=100, step=0.1, initial_value=group['pos_z'].value)
+                        
+                        # Per-group rotation sliders
+                        server.gui.add_html("<b>Rotation:</b>")
+                        grp_rot_lr = server.gui.add_slider("Sinistra/Destra (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0)
+                        grp_rot_ud = server.gui.add_slider("Alto/Basso (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0)
+                        grp_rot_roll = server.gui.add_slider("Roll (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_roll'].value if 'rot_roll' in group else 0)
+                        
+                        per_group_pos_rot_controls.append({
+                            'group': group,
+                            'enable': grp_enable_chk,
+                            'pos_x': grp_pos_x, 'pos_y': grp_pos_y, 'pos_z': grp_pos_z,
+                            'rot_lr': grp_rot_lr, 'rot_ud': grp_rot_ud, 'rot_roll': grp_rot_roll
+                        })
+                        
+                        # Per-group lumens controls
+                        server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens:</b>")
+                        _grp_lum_init = group['lumens_override'].value if group.get('lumens_override') else False
+                        _grp_lum_val = group['lumens_value'].value if group.get('lumens_value') else 100
+                        grp_lumens_chk = server.gui.add_checkbox("Custom lumens", initial_value=_grp_lum_init)
+                        grp_lumens_slider = server.gui.add_slider("Lumens (lm)", min=1, max=900000, step=1, initial_value=_grp_lum_val)
+                        per_group_lumens_controls.append({'chk': grp_lumens_chk, 'slider': grp_lumens_slider, 'group': group})
+                        
+                        server.gui.add_html("<hr style='margin:4px 0;'>")
                         
                         # ALL button for this group
                         group_all_btn = server.gui.add_button("ALL LEDs", color="#666666")
@@ -1790,20 +2697,68 @@ def main():
                 
                 # Initial color update
                 update_master_led_button_colors()
+                
+                # Wire per-group lumens handlers
+                def make_group_lumens_handler(grp, chk, slider):
+                    def handler(_):
+                        if loading_in_progress[0]:
+                            return
+                        if grp.get('lumens_override'):
+                            grp['lumens_override'].value = chk.value
+                        if grp.get('lumens_value'):
+                            grp['lumens_value'].value = slider.value
+                        update_scene()
+                    return handler
+                
+                for pg_ctrl in per_group_lumens_controls:
+                    _h = make_group_lumens_handler(pg_ctrl['group'], pg_ctrl['chk'], pg_ctrl['slider'])
+                    pg_ctrl['chk'].on_update(_h)
+                    pg_ctrl['slider'].on_update(_h)
+                
+                # Wire per-group position/rotation handlers
+                def make_group_pos_rot_handler(grp, ctrl):
+                    def handler(_):
+                        if loading_in_progress[0]:
+                            return
+                        grp['enable'].value = ctrl['enable'].value
+                        grp['pos_x'].value = ctrl['pos_x'].value
+                        grp['pos_y'].value = ctrl['pos_y'].value
+                        grp['pos_z'].value = ctrl['pos_z'].value
+                        if 'rot_tilt_lr' in grp:
+                            grp['rot_tilt_lr'].value = int(ctrl['rot_lr'].value)
+                        if 'rot_tilt_ud' in grp:
+                            grp['rot_tilt_ud'].value = int(ctrl['rot_ud'].value)
+                        if 'rot_roll' in grp:
+                            grp['rot_roll'].value = int(ctrl['rot_roll'].value)
+                        # Apply rotation if group supports it
+                        if grp.get('apply_rotation'):
+                            grp['apply_rotation']()
+                        update_scene()
+                    return handler
+                
+                for pg_ctrl in per_group_pos_rot_controls:
+                    _h = make_group_pos_rot_handler(pg_ctrl['group'], pg_ctrl)
+                    pg_ctrl['enable'].on_update(_h)
+                    pg_ctrl['pos_x'].on_update(_h)
+                    pg_ctrl['pos_y'].on_update(_h)
+                    pg_ctrl['pos_z'].on_update(_h)
+                    pg_ctrl['rot_lr'].on_update(_h)
+                    pg_ctrl['rot_ud'].on_update(_h)
+                    pg_ctrl['rot_roll'].on_update(_h)
             
             # Setup master control callbacks
-            def make_update_handler(groups_list):
+            def make_update_handler(groups_list, m_enable, m_pos_x, m_pos_y, m_pos_z, m_rot_x, m_rot_y, m_rot_z, pg_pr_controls):
                 def update_all_from_master(_):
                     if loading_in_progress[0]:
                         return
                     loading_in_progress[0] = True
                     
-                    master_pos_offset = np.array([master_pos_x.value, master_pos_y.value, master_pos_z.value])
+                    master_pos_offset = np.array([m_pos_x.value, m_pos_y.value, m_pos_z.value])
                     
                     # Build master rotation matrix (extrinsic X-Y-Z)
-                    roll_rad = np.radians(master_rot_x.value)
-                    pitch_rad = np.radians(master_rot_y.value)
-                    yaw_rad = np.radians(master_rot_z.value)
+                    roll_rad = np.radians(m_rot_x.value)
+                    pitch_rad = np.radians(m_rot_y.value)
+                    yaw_rad = np.radians(m_rot_z.value)
                     Rx = np.array([[1,0,0],[0,np.cos(roll_rad),-np.sin(roll_rad)],[0,np.sin(roll_rad),np.cos(roll_rad)]])
                     Ry = np.array([[np.cos(pitch_rad),0,np.sin(pitch_rad)],[0,1,0],[-np.sin(pitch_rad),0,np.cos(pitch_rad)]])
                     Rz = np.array([[np.cos(yaw_rad),-np.sin(yaw_rad),0],[np.sin(yaw_rad),np.cos(yaw_rad),0],[0,0,1]])
@@ -1813,9 +2768,9 @@ def main():
                     all_init_pos = [np.array(g.get('initial_pos', [0.0, 0.0, 0.0])) for g in groups_list]
                     template_center = np.mean(all_init_pos, axis=0) if all_init_pos else np.zeros(3)
                     
-                    for group in groups_list:
-                        group['enable'].value = master_enable.value
-                        if master_enable.value:
+                    for gi, group in enumerate(groups_list):
+                        group['enable'].value = m_enable.value
+                        if m_enable.value:
                             init_pos = np.array(group.get('initial_pos', [0.0, 0.0, 0.0]))
                             init_rot = np.array(group.get('initial_rot', [0, 0, 0]))
                             
@@ -1829,6 +2784,16 @@ def main():
                             group['rot_roll'].value = int(init_rot[0])
                             group['rot_tilt_ud'].value = int(init_rot[1])
                             group['rot_tilt_lr'].value = int(init_rot[2])
+                            
+                            # Sync per-group UI sliders
+                            if gi < len(pg_pr_controls):
+                                pg_pr_controls[gi]['enable'].value = m_enable.value
+                                pg_pr_controls[gi]['pos_x'].value = float(rotated_pos[0])
+                                pg_pr_controls[gi]['pos_y'].value = float(rotated_pos[1])
+                                pg_pr_controls[gi]['pos_z'].value = float(rotated_pos[2])
+                                pg_pr_controls[gi]['rot_roll'].value = int(init_rot[0])
+                                pg_pr_controls[gi]['rot_ud'].value = int(init_rot[1])
+                                pg_pr_controls[gi]['rot_lr'].value = int(init_rot[2])
                             
                             # RIGID BODY: rotate internal LED geometry with R_master
                             # Same approach as apply_rotation_transform in elios3_pannel
@@ -1885,8 +2850,29 @@ def main():
                     update_scene()
                 return remove_all
             
-            update_handler = make_update_handler(created_groups)
             remove_handler = make_remove_handler(created_groups, template_folder)
+            
+            # Lumens override callback: propagate master lumens to all sub-groups
+            def make_lumens_handler(groups_list, m_lumens_chk, m_lumens_slider, pg_controls):
+                def update_lumens(_):
+                    if loading_in_progress[0]:
+                        return
+                    loading_in_progress[0] = True
+                    for i, group in enumerate(groups_list):
+                        if group.get('lumens_override'):
+                            group['lumens_override'].value = m_lumens_chk.value
+                        if group.get('lumens_value'):
+                            group['lumens_value'].value = m_lumens_slider.value
+                        # Sync per-group UI controls
+                        if i < len(pg_controls):
+                            pg_controls[i]['chk'].value = m_lumens_chk.value
+                            pg_controls[i]['slider'].value = m_lumens_slider.value
+                    loading_in_progress[0] = False
+                    update_scene()
+                return update_lumens
+            
+            update_handler = make_update_handler(created_groups, master_enable, master_pos_x, master_pos_y, master_pos_z, master_rot_x, master_rot_y, master_rot_z, per_group_pos_rot_controls)
+            lumens_handler = make_lumens_handler(created_groups, master_lumens_chk, master_lumens_slider, per_group_lumens_controls)
             
             master_enable.on_update(update_handler)
             master_pos_x.on_update(update_handler)
@@ -1895,6 +2881,8 @@ def main():
             master_rot_x.on_update(update_handler)
             master_rot_y.on_update(update_handler)
             master_rot_z.on_update(update_handler)
+            master_lumens_chk.on_update(lumens_handler)
+            master_lumens_slider.on_update(lumens_handler)
             remove_template_btn.on_click(remove_handler)
             
             # Store template folder data
@@ -1989,6 +2977,16 @@ def main():
             led_data['size'].value = led_cfg.get('size', 0.5)
             led_data['viewing_angle'].value = led_cfg.get('viewing_angle', 120)
             led_data['square_roll'].value = led_cfg.get('square_roll', 0)
+            led_data['beam_tilt'].value = led_cfg.get('beam_tilt', 0)
+            # Restore lumens override settings for individual LED
+            if led_data.get('lumens_override') and led_cfg.get('lumens_override_enabled'):
+                led_data['lumens_override'].value = True
+                led_data['lumens_value'].value = led_cfg.get('lumens_value', 100)
+            # Restore external lens settings
+            if led_data.get('ext_lens_enable') and led_cfg.get('ext_lens_enabled'):
+                led_data['ext_lens_enable'].value = True
+                led_data['ext_lens_angle'].value = led_cfg.get('ext_lens_angle', 30)
+                led_data['ext_lens_efficiency'].value = led_cfg.get('ext_lens_efficiency', 80)
         
         # Re-enable callbacks and do final scene update
         loading_in_progress[0] = False
@@ -2051,6 +3049,10 @@ def main():
         viewing_angle_slider.value = 120
         radius_slider.value = 35
         circle_center_slider.value = -35
+        global_rotation_z_slider.value = 0
+        global_pos_x_slider.value = 0
+        global_pos_y_slider.value = 0
+        global_pos_z_slider.value = 0
         
         # Reset all group rotations to 0
         rot_front_pos.value = 0.0
@@ -2191,6 +3193,9 @@ def main():
             master_rot_x = server.gui.add_slider("Master Rotation X (°)", min=-180, max=180, step=1, initial_value=0)
             master_rot_y = server.gui.add_slider("Master Rotation Y (°)", min=-180, max=180, step=1, initial_value=0)
             master_rot_z = server.gui.add_slider("Master Rotation Z (°)", min=-180, max=180, step=1, initial_value=0)
+            server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>")
+            master_lumens_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
+            master_lumens_slider = server.gui.add_slider("Lumens per LED (lm)", min=1, max=900000, step=1, initial_value=100)
             server.gui.add_html("<hr style='margin:8px 0;'>")
             remove_template_btn = server.gui.add_button("Remove Template", color="red")
         
@@ -2218,13 +3223,13 @@ def main():
             group_data['pos_x'].value = pos[0]
             group_data['pos_y'].value = pos[1]
             group_data['pos_z'].value = pos[2]
-            # Rotations are always 0 (transformations are baked into led_positions/led_rotations)
+            # Rotations: restore from template config (may be non-zero now)
             if 'rot_tilt_lr' in group_data:
-                group_data['rot_tilt_lr'].value = 0
+                group_data['rot_tilt_lr'].value = int(round(group_cfg.get('rotation_z', 0)))
             if 'rot_tilt_ud' in group_data:
-                group_data['rot_tilt_ud'].value = 0
+                group_data['rot_tilt_ud'].value = int(round(group_cfg.get('rotation_y', 0)))
             if 'rot_roll' in group_data:
-                group_data['rot_roll'].value = 0
+                group_data['rot_roll'].value = int(round(group_cfg.get('rotation_x', 0)))
             
             # Load dynamic group properties if present
             if group_cfg.get('is_dynamic', False):
@@ -2233,6 +3238,7 @@ def main():
                 group_data['led_rotations'] = group_cfg.get('led_rotations', [])
                 group_data['led_row_directions'] = group_cfg.get('led_row_directions', [])
                 group_data['led_euler_angles'] = group_cfg.get('led_euler_angles', [])
+                group_data['led_beam_tilts'] = group_cfg.get('led_beam_tilts', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
                 # IMPORTANT: Positions in template are already RELATIVE (not absolute!)
                 # They were saved with original_led_positions, so use them directly
@@ -2250,6 +3256,14 @@ def main():
             # Update button colors to match loaded LED states
             if 'update_button_colors' in group_data and group_data['update_button_colors']:
                 group_data['update_button_colors']()
+            
+            # Restore lumens override settings
+            if group_data.get('lumens_override') and group_cfg.get('lumens_override_enabled'):
+                group_data['lumens_override'].value = True
+                group_data['lumens_value'].value = group_cfg.get('lumens_value', 100)
+                # Also set master lumens controls to match
+                master_lumens_chk.value = True
+                master_lumens_slider.value = group_cfg.get('lumens_value', 100)
             
             # Enable the group AFTER all parameters are loaded
             group_data['enable'].value = group_cfg.get('enabled', True)
@@ -2393,6 +3407,9 @@ def main():
             # Store original Euler angles for lossless roundtrip
             led_euler_angles = [(led.get('rot_x', 0.0), led.get('rot_y', 0.0), led.get('rot_z', 0.0)) for led in sorted_leds]
             group_data['led_euler_angles'] = led_euler_angles
+            # Store beam tilt angles for lossless roundtrip
+            led_beam_tilts = [led.get('beam_tilt', 0.0) for led in sorted_leds]
+            group_data['led_beam_tilts'] = led_beam_tilts
             # Calculate rotation center
             if led_positions:
                 positions_array = np.array(led_positions)
@@ -2432,15 +3449,50 @@ def main():
             
             # Store button references for dynamic color updates
             master_led_buttons = []  # List of dicts with button references per group
+            per_group_lumens_controls = []  # Per-group lumens UI controls
+            per_group_pos_rot_controls = []  # Per-group position/rotation UI controls
             
             for group_idx, group in enumerate(created_groups):
-                with server.gui.add_folder(f"Group {group_idx + 1} LEDs"):
+                with server.gui.add_folder(f"Group {group_idx + 1}"):
                     # Store button references for this group
                     group_buttons = {
                         'all_btn': None,
                         'row_btns': {},
                         'led_btns': {}
                     }
+                    
+                    # Per-group enable checkbox
+                    _grp_enable_init = group['enable'].value
+                    grp_enable_chk = server.gui.add_checkbox("Enable", initial_value=_grp_enable_init)
+                    
+                    # Per-group position sliders
+                    server.gui.add_html("<b>Position:</b>")
+                    grp_pos_x = server.gui.add_slider("Pos X (cm)", min=-100, max=100, step=0.1, initial_value=group['pos_x'].value)
+                    grp_pos_y = server.gui.add_slider("Pos Y (cm)", min=-100, max=100, step=0.1, initial_value=group['pos_y'].value)
+                    grp_pos_z = server.gui.add_slider("Pos Z (cm)", min=-100, max=100, step=0.1, initial_value=group['pos_z'].value)
+                    
+                    # Per-group rotation sliders
+                    server.gui.add_html("<b>Rotation:</b>")
+                    grp_rot_lr = server.gui.add_slider("Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0)
+                    grp_rot_ud = server.gui.add_slider("Alto/Basso (°)", min=-180, max=180, step=1, initial_value=group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0)
+                    grp_rot_roll = server.gui.add_slider("Roll (°)", min=-180, max=180, step=1, initial_value=group['rot_roll'].value if 'rot_roll' in group else 0)
+                    
+                    per_group_pos_rot_controls.append({
+                        'group': group,
+                        'enable': grp_enable_chk,
+                        'pos_x': grp_pos_x, 'pos_y': grp_pos_y, 'pos_z': grp_pos_z,
+                        'rot_lr': grp_rot_lr, 'rot_ud': grp_rot_ud, 'rot_roll': grp_rot_roll
+                    })
+                    
+                    # Per-group lumens controls
+                    server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens:</b>")
+                    _grp_lum_init = group['lumens_override'].value if group.get('lumens_override') else False
+                    _grp_lum_val = group['lumens_value'].value if group.get('lumens_value') else 100
+                    grp_lumens_chk = server.gui.add_checkbox("Custom lumens", initial_value=_grp_lum_init)
+                    grp_lumens_slider = server.gui.add_slider("Lumens (lm)", min=1, max=900000, step=1, initial_value=_grp_lum_val)
+                    per_group_lumens_controls.append({'chk': grp_lumens_chk, 'slider': grp_lumens_slider, 'group': group})
+                    
+                    server.gui.add_html("<hr style='margin:4px 0;'>")
                     
                     # ALL button for this group
                     group_all_btn = server.gui.add_button("ALL LEDs", color="#666666")
@@ -2563,6 +3615,54 @@ def main():
             
             # Initial color update
             update_master_led_button_colors()
+            
+            # Wire per-group lumens handlers
+            def make_group_lumens_handler(grp, chk, slider):
+                def handler(_):
+                    if loading_in_progress[0]:
+                        return
+                    if grp.get('lumens_override'):
+                        grp['lumens_override'].value = chk.value
+                    if grp.get('lumens_value'):
+                        grp['lumens_value'].value = slider.value
+                    update_scene()
+                return handler
+            
+            for pg_ctrl in per_group_lumens_controls:
+                _h = make_group_lumens_handler(pg_ctrl['group'], pg_ctrl['chk'], pg_ctrl['slider'])
+                pg_ctrl['chk'].on_update(_h)
+                pg_ctrl['slider'].on_update(_h)
+            
+            # Wire per-group position/rotation handlers
+            def make_group_pos_rot_handler(grp, ctrl):
+                def handler(_):
+                    if loading_in_progress[0]:
+                        return
+                    grp['enable'].value = ctrl['enable'].value
+                    grp['pos_x'].value = ctrl['pos_x'].value
+                    grp['pos_y'].value = ctrl['pos_y'].value
+                    grp['pos_z'].value = ctrl['pos_z'].value
+                    if 'rot_tilt_lr' in grp:
+                        grp['rot_tilt_lr'].value = int(ctrl['rot_lr'].value)
+                    if 'rot_tilt_ud' in grp:
+                        grp['rot_tilt_ud'].value = int(ctrl['rot_ud'].value)
+                    if 'rot_roll' in grp:
+                        grp['rot_roll'].value = int(ctrl['rot_roll'].value)
+                    # Apply rotation if group supports it
+                    if grp.get('apply_rotation'):
+                        grp['apply_rotation']()
+                    update_scene()
+                return handler
+            
+            for pg_ctrl in per_group_pos_rot_controls:
+                _h = make_group_pos_rot_handler(pg_ctrl['group'], pg_ctrl)
+                pg_ctrl['enable'].on_update(_h)
+                pg_ctrl['pos_x'].on_update(_h)
+                pg_ctrl['pos_y'].on_update(_h)
+                pg_ctrl['pos_z'].on_update(_h)
+                pg_ctrl['rot_lr'].on_update(_h)
+                pg_ctrl['rot_ud'].on_update(_h)
+                pg_ctrl['rot_roll'].on_update(_h)
         
         # Setup master control callbacks to sync all groups
         def update_all_from_master(_):
@@ -2599,6 +3699,16 @@ def main():
                 group['rot_roll'].value = initial_rotations[idx][0]
                 group['rot_tilt_ud'].value = initial_rotations[idx][1]
                 group['rot_tilt_lr'].value = initial_rotations[idx][2]
+                
+                # Sync per-group UI sliders
+                if idx < len(per_group_pos_rot_controls):
+                    per_group_pos_rot_controls[idx]['enable'].value = master_enable.value
+                    per_group_pos_rot_controls[idx]['pos_x'].value = float(rotated_pos[0])
+                    per_group_pos_rot_controls[idx]['pos_y'].value = float(rotated_pos[1])
+                    per_group_pos_rot_controls[idx]['pos_z'].value = float(rotated_pos[2])
+                    per_group_pos_rot_controls[idx]['rot_roll'].value = initial_rotations[idx][0]
+                    per_group_pos_rot_controls[idx]['rot_ud'].value = initial_rotations[idx][1]
+                    per_group_pos_rot_controls[idx]['rot_lr'].value = initial_rotations[idx][2]
                 
                 # RIGID BODY: rotate internal LED geometry with R_master
                 # Same approach as apply_rotation_transform in elios3_pannel
@@ -2664,6 +3774,26 @@ def main():
         master_rot_y.on_update(update_all_from_master)
         master_rot_z.on_update(update_all_from_master)
         remove_template_btn.on_click(remove_all_groups)
+        
+        # Lumens override callback: propagate master lumens to all sub-groups
+        def update_lumens_from_master(_):
+            if loading_in_progress[0]:
+                return
+            loading_in_progress[0] = True
+            for i, group in enumerate(created_groups):
+                if group.get('lumens_override'):
+                    group['lumens_override'].value = master_lumens_chk.value
+                if group.get('lumens_value'):
+                    group['lumens_value'].value = master_lumens_slider.value
+                # Sync per-group UI controls
+                if i < len(per_group_lumens_controls):
+                    per_group_lumens_controls[i]['chk'].value = master_lumens_chk.value
+                    per_group_lumens_controls[i]['slider'].value = master_lumens_slider.value
+            loading_in_progress[0] = False
+            update_scene()
+        
+        master_lumens_chk.on_update(update_lumens_from_master)
+        master_lumens_slider.on_update(update_lumens_from_master)
         
         # Store template folder data for cleanup on new project/load
         template_folders.append({
@@ -2790,6 +3920,10 @@ def main():
                             group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
                             group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
                             group_cfg['led_euler_angles'] = group.get('led_euler_angles', [])
+                            group_cfg['led_beam_tilts'] = group.get('led_beam_tilts', [])
+                        # Save lumens override for template
+                        group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
+                        group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
                         custom_groups_data.append(group_cfg)
                     
                     # Save individual LEDs
@@ -2806,13 +3940,21 @@ def main():
                             'rot_z': led['rot_z'].value,
                             'size': led['size'].value,
                             'viewing_angle': led['viewing_angle'].value,
-                            'square_roll': led['square_roll'].value
+                            'square_roll': led['square_roll'].value,
+                            'beam_tilt': led['beam_tilt'].value,
+                            'lumens_override_enabled': led.get('lumens_override') and led['lumens_override'].value,
+                            'lumens_value': led['lumens_value'].value if led.get('lumens_value') else 100,
                         })
                     
                     # Save as template with separate groups
                     save_custom_group_template(name, custom_groups_data, individual_leds_data)
                     # Refresh template dropdown list
-                    template_dropdown.options = ["Empty"] + get_available_templates()
+                    _fresh = get_available_templates()
+                    template_dropdown.options = ["Empty"] + _fresh
+                    for _pdd in _panel_dropdowns:
+                        _cur = _pdd.value
+                        _pdd.options = ["-- Nessuno --"] + _fresh
+                        _pdd.value = _cur if _cur in _pdd.options else "-- Nessuno --"
                     
                     print(f"✓ Template saved: {len(custom_groups_data)} group(s) + {len(individual_leds_data)} individual LED(s)")
                 else:
@@ -2868,10 +4010,24 @@ def main():
             "Circle radius (cm)", min=10, max=60, step=1, initial_value=35
         )
         wall_dist_slider = server.gui.add_slider(
-            "Wall distance (cm)", min=20, max=100, step=5, initial_value=50
+            "Wall distance (cm)", min=10, max=1500, step=5, initial_value=50
         )
         circle_center_slider = server.gui.add_slider(
             "Circle center X (cm)", min=-60, max=0, step=5, initial_value=-35
+        )
+        server.gui.add_html("<hr style='margin:8px 0;'><b>Global Rotation:</b>")
+        global_rotation_z_slider = server.gui.add_slider(
+            "Ruota configurazione (°)", min=-180, max=180, step=1, initial_value=0
+        )
+        server.gui.add_html("<hr style='margin:8px 0;'><b>Global Position:</b>")
+        global_pos_x_slider = server.gui.add_slider(
+            "Global offset X (cm)", min=-100, max=100, step=0.5, initial_value=0
+        )
+        global_pos_y_slider = server.gui.add_slider(
+            "Global offset Y (cm)", min=-100, max=100, step=0.5, initial_value=0
+        )
+        global_pos_z_slider = server.gui.add_slider(
+            "Global offset Z (cm)", min=-100, max=100, step=0.5, initial_value=0
         )
 
     with server.gui.add_folder("Display"):
@@ -2891,19 +4047,35 @@ def main():
             "Show intensity on wall", initial_value=False
         )
         intensity_rays_slider = server.gui.add_slider(
-            "Rays per pixel (↑quality, ↓speed)", min=10, max=50000, step=10, initial_value=50
+            "Rays per pixel (↑quality, ↓speed)", min=10, max=500000, step=10, initial_value=10500
         )
         ray_uniformity_slider = server.gui.add_slider(
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
         )
         led_lumens_slider = server.gui.add_slider(
-            "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=100
+            "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=168
+        )
+        
+        server.gui.add_html("<hr style='margin:8px 0;'><b>Diffuser Lens:</b>")
+        server.gui.add_html(
+            "<div style='color:#888;font-size:11px;margin-bottom:4px;'>"
+            "Simula una lente diffusore davanti ai LED: allarga il fascio e lo rende più uniforme. "
+            "Trasmittanza tipica 85-95%.</div>"
+        )
+        diffuser_enable_chk = server.gui.add_checkbox(
+            "Enable diffuser lens", initial_value=False
+        )
+        diffuser_angle_slider = server.gui.add_slider(
+            "Diffuser output angle (°)", min=60, max=180, step=5, initial_value=170
+        )
+        diffuser_transmission_slider = server.gui.add_slider(
+            "Diffuser transmission (%)", min=50, max=100, step=1, initial_value=90
         )
         calibration_factor_slider = server.gui.add_slider(
             "Calibration factor", min=0.5, max=1.5, step=0.001, initial_value=1.0
         )
         intensity_grid_size = server.gui.add_slider(
-            "Wall grid resolution", min=5, max=100, step=5, initial_value=30
+            "Wall grid resolution", min=5, max=1000 , step=5, initial_value=30
         )
         # Cell area info (updated dynamically)
         cell_area_html = server.gui.add_html(
@@ -2918,11 +4090,31 @@ def main():
             "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click<br>'Update Intensity Map' to populate legend</div>"
             "</div>"
         )
-        wall_view_size = server.gui.add_slider(
-            "Wall view size (cm)", min=100, max=200, step=10, initial_value=100
-        )
+        bw_scale_chk = server.gui.add_checkbox("B/W Scale", initial_value=False)
+        legend_max_input = server.gui.add_number("Legend max (lux)", initial_value=3500, min=1, max=100000, step=50)
+        server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap: colors scale 0–this value. If peak exceeds it, switches to AUTO.</div>")
+        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=100)
         # Manual update button for intensity map (computationally expensive)
         update_intensity_button = server.gui.add_button("Update Intensity Map")
+        export_lux_matrix_button = server.gui.add_button("Export Lux Matrix (±40cm)")
+        run_benchmark_button = server.gui.add_button("Run Benchmark (multi-distance)")
+
+    # --- CSV Pattern Import (initially collapsed) ---
+    with server.gui.add_folder("📊 Import CSV Pattern", expand_by_default=False):
+        server.gui.add_html(
+            "<div style='color:#888;font-size:11px;margin-bottom:6px;'>"
+            "Import a benchmark or FOV intensity CSV and overlay the measured pattern on the wall."
+            "</div>"
+        )
+        csv_import_path = server.gui.add_text("CSV File Path", initial_value="")
+        csv_import_btn = server.gui.add_button("📂 Import CSV", color="#4CAF50")
+        csv_clear_btn = server.gui.add_button("🗑️ Clear Imported Pattern", color="#FF5555")
+        csv_import_status = server.gui.add_html("<div style='font-size:11px;color:#888;'>No file imported</div>")
+        csv_legend_max_input = server.gui.add_number("CSV Legend max (lux)", initial_value=523, min=1, max=100000, step=10)
+        server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap for CSV pattern legend. AUTO if peak exceeds it.</div>")
+        csv_legend_html = server.gui.add_html("")
+        csv_diff_html = server.gui.add_html("")
+
         # Reset button: some Viser button handles don't support on_update;
         # we'll detect clicks by polling `reset_button.value` in the main loop.
         reset_button = server.gui.add_button("Reset to original positions")
@@ -2936,7 +4128,46 @@ def main():
     # 3D Model Import (STL files)
     stl_mesh_handle = [None]  # Store mesh handle for removal/update
     stl_mesh_data = [None]  # Store loaded trimesh object
-    
+
+    # ---------- Fast pure-numpy rotation matrices (avoid trimesh overhead) ----------
+    def _rot4_x(angle_rad):
+        """4x4 rotation matrix around X axis (pure numpy, ~50x faster than trimesh)."""
+        c, s = np.cos(angle_rad), np.sin(angle_rad)
+        return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]], dtype=np.float64)
+
+    def _rot4_y(angle_rad):
+        """4x4 rotation matrix around Y axis."""
+        c, s = np.cos(angle_rad), np.sin(angle_rad)
+        return np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]], dtype=np.float64)
+
+    def _rot4_z(angle_rad):
+        """4x4 rotation matrix around Z axis."""
+        c, s = np.cos(angle_rad), np.sin(angle_rad)
+        return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
+    # -------------------------------------------------------------------------------
+
+    def _build_stl_transform(stl_scale_ctrl, stl_rot_x_ctrl, stl_rot_y_ctrl, stl_rot_z_ctrl,
+                              stl_pos_x_ctrl, stl_pos_y_ctrl, stl_pos_z_ctrl):
+        """Build 4x4 transform matrix from STL GUI controls. Shared by all ray tracing paths."""
+        transform = np.eye(4)
+        scale = float(stl_scale_ctrl.value)
+        if np.isfinite(scale) and scale > 0:
+            transform[:3, :3] *= scale
+        rx = float(stl_rot_x_ctrl.value) if np.isfinite(float(stl_rot_x_ctrl.value)) else 0.0
+        ry = float(stl_rot_y_ctrl.value) if np.isfinite(float(stl_rot_y_ctrl.value)) else 0.0
+        rz = float(stl_rot_z_ctrl.value) if np.isfinite(float(stl_rot_z_ctrl.value)) else 0.0
+        if rx != 0:
+            transform = _rot4_x(np.radians(rx)) @ transform
+        if ry != 0:
+            transform = _rot4_y(np.radians(ry)) @ transform
+        if rz != 0:
+            transform = _rot4_z(np.radians(rz)) @ transform
+        px = float(stl_pos_x_ctrl.value) if np.isfinite(float(stl_pos_x_ctrl.value)) else 0.0
+        py = float(stl_pos_y_ctrl.value) if np.isfinite(float(stl_pos_y_ctrl.value)) else 0.0
+        pz = float(stl_pos_z_ctrl.value) if np.isfinite(float(stl_pos_z_ctrl.value)) else 0.0
+        transform[:3, 3] = [px, py, pz]
+        return transform
+
     with server.gui.add_folder("3D Models (STL)"):
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Import 3D CAD models</div>")
         stl_file_path = server.gui.add_text("STL File Path", initial_value=r"C:\Users\gianmatteo.marietti_\Downloads\109045 E3 CAGE ASSEMBLY_Coarse.STL")
@@ -2988,8 +4219,18 @@ def main():
             "</div>"
         )
         
+        def _get_stl_cache_path(file_path):
+            """Get cache file path for an STL file based on its content hash."""
+            # Use file path + modification time as cache key for speed
+            stat = os.stat(file_path)
+            cache_key = f"{file_path}|{stat.st_size}|{stat.st_mtime_ns}"
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            cache_dir = os.path.join(os.path.dirname(file_path), '.stl_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            return os.path.join(cache_dir, f"{cache_hash}.npz")
+
         def load_stl_file():
-            """Load STL file and display in scene."""
+            """Load STL file and display in scene. Uses numpy binary cache for fast reloads."""
             file_path = stl_file_path.value.strip()
             if not file_path:
                 print("⚠️ Please enter a file path")
@@ -3000,18 +4241,49 @@ def main():
                 return
             
             try:
-                print(f"Loading STL file: {file_path}")
-                mesh = trimesh.load(file_path)
+                t_start = time.perf_counter()
+                cache_path = _get_stl_cache_path(file_path)
                 
-                # Handle multiple meshes (Scene object)
-                if isinstance(mesh, trimesh.Scene):
-                    # Combine all meshes in the scene
-                    mesh = trimesh.util.concatenate(
-                        [geom for geom in mesh.geometry.values() if isinstance(geom, trimesh.Trimesh)]
+                # Try loading from numpy binary cache first (10-50x faster)
+                if os.path.exists(cache_path):
+                    print(f"Loading STL from cache: {os.path.basename(file_path)}")
+                    cached = np.load(cache_path)
+                    mesh = trimesh.Trimesh(
+                        vertices=cached['vertices'],
+                        faces=cached['faces'],
+                        vertex_normals=cached['vertex_normals'],
+                        process=False  # Skip expensive validation since we know data is good
                     )
-                
-                # Center mesh at origin (move centroid to 0,0,0)
-                mesh.vertices -= mesh.centroid
+                    t_load = time.perf_counter()
+                    print(f"  Cache loaded in {t_load - t_start:.2f}s")
+                else:
+                    print(f"Loading STL file: {file_path} (first load, will cache)")
+                    mesh = trimesh.load(file_path, force='mesh', process=False)
+                    
+                    # Handle multiple meshes (Scene object)
+                    if isinstance(mesh, trimesh.Scene):
+                        mesh = trimesh.util.concatenate(
+                            [geom for geom in mesh.geometry.values() if isinstance(geom, trimesh.Trimesh)]
+                        )
+                    
+                    # Center mesh at origin (move centroid to 0,0,0)
+                    mesh.vertices -= mesh.centroid
+                    
+                    t_load = time.perf_counter()
+                    print(f"  STL parsed in {t_load - t_start:.2f}s")
+                    
+                    # Save to numpy binary cache for fast future loads
+                    # np.savez (uncompressed) is much faster than np.savez_compressed
+                    try:
+                        np.savez(
+                            cache_path,
+                            vertices=mesh.vertices.astype(np.float32),
+                            faces=mesh.faces,
+                            vertex_normals=mesh.vertex_normals.astype(np.float32)
+                        )
+                        print(f"  Cache saved: {os.path.basename(cache_path)}")
+                    except Exception as ce:
+                        print(f"  Warning: could not save cache: {ce}")
                 
                 stl_mesh_data[0] = mesh
                 
@@ -3021,18 +4293,14 @@ def main():
                 bounds = mesh.bounds
                 size = bounds[1] - bounds[0]
                 
-                # Auto-calculate ideal scale for this project
-                # Project uses cm scale, typical diameter ~70cm (2 * radius 35cm)
-                # Assume largest dimension should be around 70cm in project space
-                target_size_cm = 70.0  # Target size in cm
+                # Auto-calculate ideal scale
+                target_size_cm = 70.0
                 max_dimension = np.max(size)
+                ideal_scale = 1.0
                 
                 if max_dimension > 0:
-                    # Calculate scale: target_size / current_size
-                    # Note: mesh is in STL units (usually mm), we want it in cm for display
                     ideal_scale = target_size_cm / max_dimension
                     stl_scale.value = ideal_scale
-                    print(f"Auto-scale applied: {ideal_scale:.4f} (model size: {max_dimension:.1f} → {target_size_cm}cm)")
                 
                 # Update info
                 info_text = (
@@ -3046,18 +4314,27 @@ def main():
                 )
                 stl_info_html.content = info_text
                 
-                print(f"✓ STL loaded: {num_vertices:,} vertices, {num_faces:,} faces")
-                update_stl_mesh()
+                t_total = time.perf_counter() - t_start
+                print(f"✓ STL loaded: {num_vertices:,} vertices, {num_faces:,} faces ({t_total:.2f}s total)")
+                update_stl_mesh(skip_lighting=True)
                 
             except Exception as e:
                 print(f"❌ Error loading STL: {e}")
+                import traceback; traceback.print_exc()
                 stl_info_html.content = f"<div style='color:#FF5555;'>Error: {str(e)}</div>"
         
-        def update_stl_mesh():
-            """Update STL mesh visualization in scene."""
+        def update_stl_mesh(skip_lighting=False):
+            """Update STL mesh visualization in scene.
+            
+            Args:
+                skip_lighting: If True, use uniform base color instead of computing
+                    per-vertex lighting. Much faster for initial load.
+            """
             nonlocal stl_mesh_handle
             
             try:
+                t_start = time.perf_counter()
+                
                 # Remove existing mesh
                 if stl_mesh_handle[0] is not None:
                     try:
@@ -3068,44 +4345,25 @@ def main():
                 
                 # Add mesh if loaded and visible
                 if stl_mesh_data[0] is not None and stl_visible.value:
-                    mesh = stl_mesh_data[0].copy()
+                    orig_mesh = stl_mesh_data[0]
                     
                     # Validate values (protect against NaN)
                     scale = float(stl_scale.value)
                     if not np.isfinite(scale) or scale <= 0:
                         scale = 1.0
                     
-                    pos_x = float(stl_pos_x.value)
-                    pos_y = float(stl_pos_y.value)
-                    pos_z = float(stl_pos_z.value)
-                    if not np.isfinite(pos_x):
-                        pos_x = 0.0
-                    if not np.isfinite(pos_y):
-                        pos_y = 0.0
-                    if not np.isfinite(pos_z):
-                        pos_z = 0.0
+                    pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
+                    pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
+                    pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
+                    rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
+                    rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0
+                    rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
+                    opacity = float(stl_opacity.value) if np.isfinite(float(stl_opacity.value)) else 0.8
                     
-                    rot_x = float(stl_rot_x.value)
-                    rot_y = float(stl_rot_y.value)
-                    rot_z = float(stl_rot_z.value)
-                    if not np.isfinite(rot_x):
-                        rot_x = 0.0
-                    if not np.isfinite(rot_y):
-                        rot_y = 0.0
-                    if not np.isfinite(rot_z):
-                        rot_z = 0.0
-                    
-                    opacity = float(stl_opacity.value)
-                    if not np.isfinite(opacity):
-                        opacity = 0.8
-                    
-                    # Calculate original and scaled sizes for info display
-                    orig_mesh = stl_mesh_data[0]
+                    # Update info display
                     bounds = orig_mesh.bounds
                     orig_size = bounds[1] - bounds[0]
                     scaled_size = orig_size * scale
-                    
-                    # Update info display with current scale
                     num_vertices = len(orig_mesh.vertices)
                     num_faces = len(orig_mesh.faces)
                     info_text = (
@@ -3119,102 +4377,103 @@ def main():
                     )
                     stl_info_html.content = info_text
                     
-                    # Apply transformations by creating a transformed copy
-                    # This prevents the original mesh from being modified
+                    # --- Build combined 4x4 transform (no mesh.copy() needed) ---
+                    orig_vertices = orig_mesh.vertices  # Direct reference, no copy
+                    orig_normals = orig_mesh.vertex_normals
+                    orig_faces = orig_mesh.faces
                     
-                    # Get original vertices and faces
-                    orig_vertices = mesh.vertices.copy()
-                    orig_faces = mesh.faces.copy()
-                    
-                    # Build transformation matrix: Scale * Rotation * Translation
-                    # 1. Scale matrix
-                    T_scale = np.eye(4)
-                    T_scale[0, 0] = scale
-                    T_scale[1, 1] = scale
-                    T_scale[2, 2] = scale
-                    
-                    # 2. Rotation matrices
+                    # Build rotation matrix using pure numpy helpers (much faster than trimesh)
                     T_rot = np.eye(4)
                     if rot_x != 0:
-                        T_rot = T_rot @ trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
+                        T_rot = T_rot @ _rot4_x(np.radians(rot_x))
                     if rot_y != 0:
-                        T_rot = T_rot @ trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
+                        T_rot = T_rot @ _rot4_y(np.radians(rot_y))
                     if rot_z != 0:
-                        T_rot = T_rot @ trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
+                        T_rot = T_rot @ _rot4_z(np.radians(rot_z))
                     
-                    # 3. Translation matrix (in cm, will be converted to meters later)
-                    T_trans = trimesh.transformations.translation_matrix([pos_x, pos_y, pos_z])
+                    # Apply global Z rotation on top of STL-local rotation
+                    g_rot_deg = global_rotation_z_slider.value
+                    if abs(g_rot_deg) > 0.01:
+                        T_rot = _rot4_z(np.radians(g_rot_deg)) @ T_rot
+
+                    # Combined transform: Scale -> Rotate -> Translate -> cm-to-meters
+                    # Instead of building 4 separate matrices and multiplying, build directly
+                    R = T_rot[:3, :3]
+                    scale_m = scale * 0.01  # scale * cm_to_meters
                     
-                    # 4. Final cm to meters conversion
-                    T_to_meters = np.eye(4) * 0.01  # Scale by 0.01
-                    T_to_meters[3, 3] = 1.0  # Keep homogeneous coordinate
+                    # Transform vertices: v' = (R * scale_m) @ v + translate_m
+                    RS = R * scale_m  # 3x3 scaled rotation
+                    # Also rotate the translation vector by global rotation
+                    translate_cm = np.array([pos_x, pos_y, pos_z])
+                    if abs(g_rot_deg) > 0.01:
+                        cg2, sg2 = np.cos(np.radians(g_rot_deg)), np.sin(np.radians(g_rot_deg))
+                        translate_cm = np.array([cg2*pos_x - sg2*pos_y, sg2*pos_x + cg2*pos_y, pos_z])
+                    translate_m = translate_cm * 0.01  # cm to meters
                     
-                    # Combine: first scale, then rotate, then translate, then convert to meters
-                    T_combined = T_to_meters @ T_trans @ T_rot @ T_scale
+                    vertices_transformed = (orig_vertices @ RS.T) + translate_m
+                    vertices_transformed = vertices_transformed.astype(np.float32)
                     
-                    # Apply combined transform to vertices
-                    vertices_homogeneous = np.hstack([orig_vertices, np.ones((len(orig_vertices), 1))])
-                    vertices_transformed = (T_combined @ vertices_homogeneous.T).T[:, :3]
+                    # --- Compute vertex colors & render ---
+                    if skip_lighting:
+                        # FAST PATH: use add_mesh_simple (no Trimesh/GLB overhead, no normal transform)
+                        stl_mesh_handle[0] = server.scene.add_mesh_simple(
+                            name="/stl_model",
+                            vertices=vertices_transformed,
+                            faces=orig_faces.astype(np.uint32),
+                            color=(0, 0, 51),  # dark blue (0.0, 0.0, 0.2) * 255
+                            opacity=opacity if opacity < 1.0 else None,
+                            flat_shading=False,
+                            side="double",
+                            wireframe=stl_wireframe.value,
+                            visible=True,
+                        )
+                    else:
+                        # Transform normals (rotation only, then normalize) — only needed for lighting
+                        normals_transformed = orig_normals @ R.T
+                        norms = np.linalg.norm(normals_transformed, axis=1, keepdims=True)
+                        norms[norms < 1e-10] = 1.0
+                        normals_transformed = (normals_transformed / norms).astype(np.float32)
+
+                        # Full lighting calculation — need per-vertex colors → Trimesh path
+                        vertex_colors = calculate_mesh_lighting(
+                            vertices_transformed, 
+                            normals_transformed, 
+                            current_leds,
+                            base_color=(0.7, 0.7, 0.9),
+                            led_lumens=led_lumens_slider.value
+                        )
+                        vertex_colors_uint8 = (vertex_colors * 255).astype(np.uint8)
                     
-                    # Transform normals (rotation only, no translation or scale for normals)
-                    # Use the upper-left 3x3 of the rotation matrix
-                    R_only = T_rot[:3, :3]
-                    normals_transformed = (R_only @ mesh.vertex_normals.T).T
-                    # Normalize
-                    normals_transformed = normals_transformed / (np.linalg.norm(normals_transformed, axis=1, keepdims=True) + 1e-10)
+                        # Add alpha channel
+                        alpha_value = int(opacity * 255)
+                        vertex_colors_rgba = np.concatenate([
+                            vertex_colors_uint8,
+                            np.full((num_vertices, 1), alpha_value, dtype=np.uint8)
+                        ], axis=1)
                     
-                    # Create new mesh with transformed vertices
-                    from trimesh import Trimesh
-                    mesh_transformed = Trimesh(
-                        vertices=vertices_transformed.astype(np.float32),
-                        faces=orig_faces,
-                        vertex_normals=normals_transformed.astype(np.float32),
-                        process=False  # Don't recompute normals
-                    )
+                        # Build trimesh with transformed data (process=False skips expensive validation)
+                        mesh_transformed = trimesh.Trimesh(
+                            vertices=vertices_transformed,
+                            faces=orig_faces,
+                            vertex_normals=normals_transformed,
+                            process=False
+                        )
+                        from trimesh.visual import ColorVisuals
+                        mesh_transformed.visual = ColorVisuals(mesh=mesh_transformed, vertex_colors=vertex_colors_rgba)
                     
-                    vertices = mesh_transformed.vertices
-                    faces = mesh_transformed.faces
-                    vertex_normals = mesh_transformed.vertex_normals
+                        # Add to scene
+                        stl_mesh_handle[0] = server.scene.add_mesh_trimesh(
+                            name="/stl_model",
+                            mesh=mesh_transformed,
+                            visible=True,
+                        )
                     
-                    # For lighting calculation, vertices are already in world space (meters)
-                    vertices_world = vertices
-                    
-                    # Calculate dynamic lighting based on current LEDs
-                    base_color = (0.7, 0.7, 0.9)  # Light blue base color
-                    vertex_colors = calculate_mesh_lighting(
-                        vertices_world, 
-                        vertex_normals, 
-                        current_leds,
-                        base_color=base_color,
-                        led_lumens=led_lumens_slider.value
-                    )
-                    
-                    # Set vertex colors on the mesh before adding to scene
-                    # Convert to uint8 RGBA format (Viser/Three.js expects 0-255 range)
-                    vertex_colors_uint8 = (vertex_colors * 255).astype(np.uint8)
-                    # Add alpha channel with user-controlled opacity
-                    alpha_value = int(opacity * 255)
-                    vertex_colors_rgba = np.concatenate([
-                        vertex_colors_uint8,
-                        np.full((len(vertex_colors_uint8), 1), alpha_value, dtype=np.uint8)
-                    ], axis=1)
-                    
-                    # Assign to mesh visual
-                    from trimesh.visual import ColorVisuals
-                    mesh_transformed.visual = ColorVisuals(mesh=mesh_transformed, vertex_colors=vertex_colors_rgba)
-                    
-                    # Add to scene
-                    # Note: add_mesh_trimesh doesn't support opacity and wireframe parameters
-                    # Opacity is controlled via alpha channel in vertex colors
-                    # Wireframe mode is not supported with per-vertex colors
-                    # Position, rotation, and scale are already baked into the mesh
-                    stl_mesh_handle[0] = server.scene.add_mesh_trimesh(
-                        name="/stl_model",
-                        mesh=mesh_transformed,
-                        visible=True,
-                    )
+                    t_total = time.perf_counter() - t_start
+                    if t_total > 0.5:
+                        print(f"  Mesh update: {t_total:.2f}s {'(no lighting)' if skip_lighting else '(with lighting)'}")
             except Exception as e:
                 print(f"Error updating STL mesh: {e}")
+                import traceback; traceback.print_exc()
         
         def clear_stl_model():
             """Clear loaded STL model."""
@@ -3242,17 +4501,18 @@ def main():
         def _(_):
             try:
                 if stl_mesh_data[0] is not None:
-                    update_stl_mesh()
+                    print("Calculating mesh lighting...")
+                    update_stl_mesh(skip_lighting=False)
                     print("✓ Mesh lighting updated")
                 else:
                     print("⚠️ No mesh loaded")
             except Exception as e:
                 print(f"Error updating mesh lighting: {e}")
         
-        # Update mesh when parameters change (with error protection)
+        # Update mesh when parameters change (geometry only, no lighting)
         def safe_update_stl(_):
             try:
-                update_stl_mesh()
+                update_stl_mesh(skip_lighting=True)
                 # Update ray visualization with new STL mesh
                 update_scene()
                 # Note: Intensity calculations remain manual (use update buttons)
@@ -3302,6 +4562,38 @@ def main():
             "Room walls grid resolution", min=10, max=50, step=5, initial_value=20
         )
         update_room_button = server.gui.add_button("Update Room Intensity")
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Wall Reflections</div>")
+        reflections_enable = server.gui.add_checkbox("Enable Reflections", initial_value=False)
+        wall_material_dropdown = server.gui.add_dropdown(
+            "Wall Material",
+            options=["White Paint (\u03c1=0.85)", "Light Gray (\u03c1=0.65)", "Concrete (\u03c1=0.30)",
+                     "Wood (\u03c1=0.45)", "Brick (\u03c1=0.25)", "Dark Paint (\u03c1=0.15)", "Custom"],
+            initial_value="White Paint (\u03c1=0.85)"
+        )
+        custom_reflectance_slider = server.gui.add_slider(
+            "Reflectance (\u03c1)", min=0.0, max=0.99, step=0.01, initial_value=0.85
+        )
+        max_bounces_slider_room = server.gui.add_slider(
+            "Max Bounces", min=1, max=10, step=1, initial_value=3
+        )
+        server.gui.add_html(
+            "<div style='color:#888;font-size:11px;margin-top:-4px;'>More bounces = more accurate but slower.<br>"
+            "Reflected flux per bounce: \u03a6 \u00d7 \u03c1<sup>n</sup></div>"
+        )
+        _MATERIAL_REFLECTANCE = {
+            "White Paint (\u03c1=0.85)": 0.85,
+            "Light Gray (\u03c1=0.65)": 0.65,
+            "Concrete (\u03c1=0.30)": 0.30,
+            "Wood (\u03c1=0.45)": 0.45,
+            "Brick (\u03c1=0.25)": 0.25,
+            "Dark Paint (\u03c1=0.15)": 0.15,
+        }
+        @wall_material_dropdown.on_update
+        def _on_material_change(_):
+            mat = wall_material_dropdown.value
+            if mat in _MATERIAL_REFLECTANCE:
+                custom_reflectance_slider.value = _MATERIAL_REFLECTANCE[mat]
 
     # Camera FOV visualization
     with server.gui.add_folder("Camera FOV"):
@@ -3310,7 +4602,7 @@ def main():
             "Horizontal FOV (°)", min=10, max=120, step=1, initial_value=75
         )
         camera_fov_v = server.gui.add_slider(
-            "Vertical FOV (°)", min=10, max=90, step=1, initial_value=60
+            "Vertical FOV (°)", min=10, max=120, step=1, initial_value=60
         )
         camera_pos_x = server.gui.add_slider(
             "Camera X pos (cm)", min=-100, max=100, step=1, initial_value=0
@@ -3325,6 +4617,7 @@ def main():
     room_intensity_handles = []
     room_wall_handles = []
     absorber_handles = []
+    imported_csv_handles = []
     
     # Store current LED objects (for reuse in room intensity calculation)
     current_leds = []
@@ -3332,6 +4625,7 @@ def main():
     def calculate_mesh_lighting(mesh_vertices, mesh_normals, leds, base_color=(0.7, 0.7, 0.9), led_lumens=100):
         """
         Calculate per-vertex lighting for STL mesh using physical lux calculation.
+        Vectorized: processes all LEDs in a single batched computation.
         
         Args:
             mesh_vertices: Nx3 array of vertex positions in meters (Viser units)
@@ -3344,107 +4638,101 @@ def main():
             Nx3 array of RGB colors for each vertex
         """
         num_vertices = len(mesh_vertices)
-        vertex_colors = np.zeros((num_vertices, 3), dtype=np.float32)
-        
-        # Base ambient lighting (minimum visibility)
-        ambient = 0.15  # 15% ambient light
-        vertex_colors[:] = np.array(base_color) * ambient
         
         # Get only enabled LEDs
         active_leds = [led for led in leds if getattr(led, 'enabled', True)]
         
         if len(active_leds) == 0:
-            return vertex_colors
+            # Just return ambient
+            ambient = 0.15
+            base = np.array(base_color, dtype=np.float32) * ambient
+            return np.tile(base, (num_vertices, 1))
         
-        # Calculate luminous intensity (candelas) from lumens and viewing angle
-        # For a cone with half-angle θ: solid_angle = 2π(1 - cos(θ))
-        # Luminous intensity I = Φ / Ω (candelas = lumens / steradians)
+        num_leds = len(active_leds)
         
-        # For each active LED, calculate contribution to each vertex
-        for led in active_leds:
-            # LED position in cm, convert to meters
-            led_pos_m = np.array(led.position) / 100.0
-            led_dir = np.array(led.direction)
-            led_dir_norm = led_dir / (np.linalg.norm(led_dir) + 1e-10)
+        # Pre-extract LED data into contiguous arrays for vectorized computation
+        led_positions = np.array([led.position for led in active_leds], dtype=np.float32) / 100.0  # cm -> m, shape (L, 3)
+        led_directions = np.array([led.direction for led in active_leds], dtype=np.float32)  # (L, 3)
+        led_half_angles = np.array([np.radians(led.viewing_angle / 2.0) for led in active_leds], dtype=np.float32)  # (L,)
+        
+        # Per-LED lumens: use override if available, else global
+        per_led_lumens = np.array([
+            float(getattr(led, 'lumens', None) or led_lumens)
+            for led in active_leds
+        ], dtype=np.float32)
+        
+        # Normalize LED directions
+        led_dir_norms = np.linalg.norm(led_directions, axis=1, keepdims=True) + 1e-10
+        led_directions = led_directions / led_dir_norms  # (L, 3)
+        
+        # Calculate luminous intensity per LED (candelas)
+        solid_angles = 2 * np.pi * (1 - np.cos(led_half_angles))  # (L,)
+        solid_angles = np.maximum(solid_angles, 0.001)
+        luminous_intensities = per_led_lumens / solid_angles  # (L,)
+        cos_half_angles = np.cos(led_half_angles)  # (L,)
+        
+        # Filter out LEDs with invalid intensity
+        valid = np.isfinite(luminous_intensities) & (luminous_intensities > 0)
+        if not np.any(valid):
+            ambient = 0.15
+            base = np.array(base_color, dtype=np.float32) * ambient
+            return np.tile(base, (num_vertices, 1))
+        
+        led_positions = led_positions[valid]
+        led_directions = led_directions[valid]
+        luminous_intensities = luminous_intensities[valid]
+        cos_half_angles = cos_half_angles[valid]
+        num_leds = len(led_positions)
+        
+        # --- Batched computation: all LEDs x all vertices ---
+        # Process in chunks to limit memory (L * N * 3 can be large)
+        chunk_size = max(1, min(num_leds, 50_000_000 // max(num_vertices, 1)))  # ~200MB limit
+        
+        total_illuminance = np.zeros(num_vertices, dtype=np.float32)
+        
+        for led_start in range(0, num_leds, chunk_size):
+            led_end = min(led_start + chunk_size, num_leds)
+            L = led_end - led_start
             
-            # Calculate solid angle for this LED's cone
-            viewing_half_angle_rad = np.radians(led.viewing_angle / 2.0)
-            solid_angle = 2 * np.pi * (1 - np.cos(viewing_half_angle_rad))  # steradians
+            # to_vertex[l, v, :] = mesh_vertices[v] - led_positions[l]
+            # Shape: (L, N, 3) 
+            to_vertex = mesh_vertices[np.newaxis, :, :] - led_positions[led_start:led_end, np.newaxis, :]  # (L, N, 3)
+            distances = np.linalg.norm(to_vertex, axis=2) + 1e-6  # (L, N)
+            to_vertex_norm = to_vertex / distances[:, :, np.newaxis]  # (L, N, 3)
             
-            # Protect against division by zero or very small solid angles
-            if solid_angle < 0.001:
-                solid_angle = 0.001
+            # Cone check: cos(angle) between LED direction and to_vertex
+            cos_angle = np.einsum('ld,lnd->ln', led_directions[led_start:led_end], to_vertex_norm)  # (L, N)
+            in_cone = cos_angle > cos_half_angles[led_start:led_end, np.newaxis]  # (L, N)
             
-            luminous_intensity = led_lumens / solid_angle  # candelas
+            # Lambert's cosine: angle between surface normal and incoming light
+            cos_incident = np.einsum('nd,lnd->ln', mesh_normals, -to_vertex_norm)  # (L, N)
+            cos_incident = np.maximum(0, cos_incident)
             
-            # Validate luminous intensity
-            if not np.isfinite(luminous_intensity) or luminous_intensity <= 0:
-                continue
+            # Illuminance = I * cos_incident / d^2 (only in cone)
+            illuminance = luminous_intensities[led_start:led_end, np.newaxis] * cos_incident / (distances ** 2)  # (L, N)
             
-            # Vector from LED to each vertex
-            to_vertex = mesh_vertices - led_pos_m  # Shape: (N, 3)
-            distances = np.linalg.norm(to_vertex, axis=1, keepdims=True) + 1e-6  # meters
-            to_vertex_norm = to_vertex / distances  # Normalized direction to vertex
-            
-            # Check if vertex is within LED's viewing cone
-            cos_angle_to_vertex = np.sum(led_dir_norm * to_vertex_norm, axis=1, keepdims=True)
-            cos_half_angle = np.cos(viewing_half_angle_rad)
-            
-            # Only illuminate vertices within viewing cone
-            in_cone = (cos_angle_to_vertex > cos_half_angle).flatten()
-            
-            if np.sum(in_cone) == 0:
-                continue
-            
-            # Lambert's cosine law: intensity depends on angle of incidence
-            # N = surface normal, L = direction from surface to light source
-            cos_incident = np.sum(mesh_normals * (-to_vertex_norm), axis=1, keepdims=True)
-            cos_incident = np.maximum(0, cos_incident)  # Only positive (facing the light)
-            
-            # Physical illuminance calculation (lux)
-            # E = I × cos(θ_incident) / d²
-            # where: E = illuminance (lux), I = luminous intensity (cd), d = distance (m)
-            illuminance = np.zeros((num_vertices, 1), dtype=np.float32)
-            illuminance[in_cone] = (luminous_intensity * cos_incident[in_cone] / 
-                                   (distances[in_cone] ** 2))
-            
-            # Remove any NaN or infinite values
-            illuminance = np.nan_to_num(illuminance, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # Apply cone edge falloff for smooth transition
-            angle_factor = np.ones((num_vertices, 1), dtype=np.float32)
-            angle_factor[in_cone] = np.maximum(0, 
-                (cos_angle_to_vertex[in_cone] - cos_half_angle) / (1.0 - cos_half_angle)) ** 2
+            # Cone edge falloff
+            denom = 1.0 - cos_half_angles[led_start:led_end, np.newaxis]
+            denom = np.maximum(denom, 1e-10)
+            angle_factor = np.maximum(0, (cos_angle - cos_half_angles[led_start:led_end, np.newaxis]) / denom) ** 2
             illuminance *= angle_factor
             
-            # Convert lux to color intensity (normalize to reasonable range)
-            # Typical indoor lighting: 100-500 lux
-            # Scale factor to map lux to [0, 1] color range
-            lux_to_color_scale = 0.002  # Adjust to control brightness response
-            color_intensity = np.clip(illuminance * lux_to_color_scale, 0.0, 1.0)
+            # Zero out contributions outside cone
+            illuminance *= in_cone.astype(np.float32)
             
-            # Ensure no NaN values in final color intensity
-            color_intensity = np.nan_to_num(color_intensity, nan=0.0)
-            
-            # Add this LED's contribution to vertex colors (accumulate intensity)
-            # Keep as (N, 1) for proper broadcasting with (N, 3)
-            vertex_colors += color_intensity
+            # Sum across LEDs in this chunk
+            total_illuminance += np.nansum(illuminance, axis=0)
         
-        # Final safety check: remove any remaining NaN or infinite values
-        vertex_colors = np.nan_to_num(vertex_colors, nan=0.0, posinf=1.0, neginf=0.0)
+        # Convert lux to color intensity
+        lux_to_color_scale = 0.002
+        intensity_normalized = np.clip(total_illuminance * lux_to_color_scale, 0.0, 1.0)
         
-        # Calculate total intensity per vertex (average across RGB channels)
-        intensity_per_vertex = np.mean(vertex_colors, axis=1, keepdims=True)
+        # Map to blue-to-white gradient
+        blue_base = np.array([0.0, 0.0, 0.2], dtype=np.float32)
+        white = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         
-        # Map accumulated intensity to blue-to-white color gradient
-        # Dark blue (0,0,0.2) at low intensity → White (1,1,1) at high intensity
-        blue_base = np.array([0.0, 0.0, 0.2])  # Dark blue
-        white = np.array([1.0, 1.0, 1.0])  # White
-        
-        # Interpolate between blue and white based on intensity
-        # Use a smooth curve for better visual appearance
-        intensity_normalized = np.clip(intensity_per_vertex, 0.0, 1.0)
-        final_colors = blue_base * (1.0 - intensity_normalized) + white * intensity_normalized
+        t = intensity_normalized[:, np.newaxis]  # (N, 1)
+        final_colors = blue_base * (1.0 - t) + white * t
         final_colors = np.clip(final_colors, 0.0, 1.0)
         
         return final_colors
@@ -3519,6 +4807,11 @@ def main():
             rot_tilt_lr = server.gui.add_slider("Inclina Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=0)
             rot_tilt_ud = server.gui.add_slider("Inclina Alto/Basso (°)", min=-180, max=180, step=1, initial_value=0)
             rot_roll = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
+            
+            server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>")
+            group_lumens_override_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
+            group_lumens_slider = server.gui.add_slider("Lumens per LED (lm)", min=1, max=900000, step=1, initial_value=100)
+            
             remove_btn = server.gui.add_button("Remove Group", color="red")
             
             server.gui.add_html("<hr style='margin:4px 0;'><b>LED Controls:</b>")
@@ -3560,6 +4853,8 @@ def main():
             'rot_tilt_lr': rot_tilt_lr,
             'rot_tilt_ud': rot_tilt_ud,
             'rot_roll': rot_roll,
+            'lumens_override': group_lumens_override_chk,
+            'lumens_value': group_lumens_slider,
             'remove_btn': remove_btn,
             'led_states': led_states,
             'led_rows': led_rows,  # Store row organization
@@ -3577,6 +4872,8 @@ def main():
             'led_row_directions': None,  # Row direction for each LED (for square orientation)
             'original_led_row_directions': None,  # Original row directions (never modified)
             'led_euler_angles': None,  # Original Euler angles for lossless roundtrip
+            'led_beam_tilts': None,  # Beam tilt angles for lossless roundtrip
+            'apply_rotation': None,  # Will be set to apply_rotation_transform()
         }
         
         # Function to update button colors based on LED states
@@ -3596,6 +4893,7 @@ def main():
         
         # Store reference to update function in group_data
         group_data['update_button_colors'] = update_button_colors
+        # apply_rotation will be set after apply_rotation_transform is defined
         
         # Setup callbacks for this group
         def on_all_click(_):
@@ -3713,6 +5011,9 @@ def main():
                     rotated_row_dirs.append(tuple(rd_rotated))
                 group_data['led_row_directions'] = rotated_row_dirs
         
+        # Store reference so external code can trigger the same rotation logic
+        group_data['apply_rotation'] = apply_rotation_transform
+
         def on_rot_tilt_lr_update(_):
             if not loading_in_progress[0]:
                 apply_rotation_transform()
@@ -3736,6 +5037,8 @@ def main():
         rot_tilt_lr.on_update(on_rot_tilt_lr_update)
         rot_tilt_ud.on_update(on_rot_tilt_ud_update)
         rot_roll.on_update(on_rot_roll_update)
+        group_lumens_override_chk.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        group_lumens_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         
         custom_groups.append(group_data)
         
@@ -3787,8 +5090,793 @@ def main():
                     # Load as solid group (default behavior)
                     load_custom_group_from_template(selected_template)
                 # Refresh template list in case new templates were added
-                template_dropdown.options = ["Empty"] + get_available_templates()
-    
+                _fresh = get_available_templates()
+                template_dropdown.options = ["Empty"] + _fresh
+                for _pdd in _panel_dropdowns:
+                    _cur = _pdd.value
+                    _pdd.options = ["-- Nessuno --"] + _fresh
+                    _pdd.value = _cur if _cur in _pdd.options else "-- Nessuno --"
+
+    # =====================================================================
+    #  PANEL CONFIGURATOR  – 4 Elios 3 slots with per-slot template choice
+    # =====================================================================
+    # Pre-computed Elios3 slot data (centroid + outward Z-rotation angle)
+    _ELIOS3_SLOTS = [
+        {"name": "Front +",  "centroid": [18.06, -7.92, -1.59], "angle_deg": -23.7, "config_rot": 0.7,  "config_roll":  0,  "config_lr":  10},
+        {"name": "Front -",  "centroid": [18.03,  7.97, -1.59], "angle_deg":  23.8, "config_rot": -0.7, "config_roll": -3,  "config_lr":  -6},
+        {"name": "Side -",   "centroid": [16.07, 12.57, -0.83], "angle_deg":  38.0, "config_rot": -18,  "config_roll":  0,  "config_lr":  21},
+        {"name": "Side +",   "centroid": [16.07, -12.63, -0.82], "angle_deg": -38.2, "config_rot": 18,  "config_roll":  0,  "config_lr": -21},
+    ]
+
+    def _Rz_matrix(deg):
+        """Build a 3×3 rotation matrix around Z axis."""
+        r = np.radians(deg)
+        c, s = np.cos(r), np.sin(r)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    def _convert_individual_leds_to_dynamic_group(individual_leds_data):
+        """Convert an individual_leds list into a single dynamic-format group config
+        with positions made RELATIVE (centroid subtracted)."""
+        if not individual_leds_data:
+            return None
+
+        sorted_leds = sorted(individual_leds_data,
+                             key=lambda l: l.get('pos_z', 0.0), reverse=True)
+
+        # Group into rows by Z coordinate
+        z_tol = 0.5
+        led_rows_indices, current_row, current_z = [], [], None
+        for idx, led in enumerate(sorted_leds):
+            lz = led.get('pos_z', 0.0)
+            if current_z is None or abs(lz - current_z) <= z_tol:
+                current_row.append(idx)
+                if current_z is None:
+                    current_z = lz
+            else:
+                if current_row:
+                    led_rows_indices.append(current_row)
+                current_row = [idx]
+                current_z = lz
+        if current_row:
+            led_rows_indices.append(current_row)
+
+        num_leds = len(sorted_leds)
+        led_states = [l.get('led_on', True) for l in sorted_leds]
+        led_positions = [(l.get('pos_x', 0.0), l.get('pos_y', 0.0), l.get('pos_z', 0.0))
+                         for l in sorted_leds]
+        led_sizes = [l.get('size', 0.5) for l in sorted_leds]
+        led_viewing_angles = [l.get('viewing_angle', 120) for l in sorted_leds]
+
+        # Euler → direction vectors (Rz · Ry · Rx · [1,0,0])
+        led_rotations = []
+        for led in sorted_leds:
+            d = np.array([1.0, 0.0, 0.0])
+            for axis, ang in [('z', led.get('rot_z', 0.0)),
+                              ('y', led.get('rot_y', 0.0)),
+                              ('x', led.get('rot_x', 0.0))]:
+                rad = np.radians(ang)
+                cs, sn = np.cos(rad), np.sin(rad)
+                if axis == 'z':
+                    M = np.array([[cs, -sn, 0], [sn, cs, 0], [0, 0, 1]])
+                elif axis == 'y':
+                    M = np.array([[cs, 0, sn], [0, 1, 0], [-sn, 0, cs]])
+                else:
+                    M = np.array([[1, 0, 0], [0, cs, -sn], [0, sn, cs]])
+                d = M @ d
+            d = d / max(np.linalg.norm(d), 1e-10)
+            led_rotations.append(tuple(d))
+
+        # Row directions with Rodrigues square_roll
+        led_row_directions = []
+        for i, dt in enumerate(led_rotations):
+            dv = np.array(dt)
+            rd = np.cross(dv, [0, 0, 1])
+            if np.linalg.norm(rd) < 0.01:
+                rd = np.cross(dv, [0, 1, 0])
+            rd = rd / np.linalg.norm(rd)
+            sq = sorted_leds[i].get('square_roll', 0.0)
+            if abs(sq) > 0.01:
+                sr = np.radians(sq)
+                k = dv / np.linalg.norm(dv)
+                rd = (rd * np.cos(sr)
+                      + np.cross(k, rd) * np.sin(sr)
+                      + k * np.dot(k, rd) * (1 - np.cos(sr)))
+            led_row_directions.append(tuple(rd))
+
+        # Subtract centroid → relative positions
+        pa = np.array(led_positions)
+        ctr = pa.mean(axis=0)
+        relative_positions = [tuple(p - ctr) for p in pa]
+
+        led_euler_angles = [(l.get('rot_x', 0.0), l.get('rot_y', 0.0), l.get('rot_z', 0.0))
+                            for l in sorted_leds]
+        led_beam_tilts = [l.get('beam_tilt', 0.0) for l in sorted_leds]
+
+        return {
+            'enabled': True,
+            'position': [0.0, 0.0, 0.0],
+            'rotation_x': 0, 'rotation_y': 0, 'rotation_z': 0,
+            'led_states': led_states,
+            'is_dynamic': True,
+            'num_leds': num_leds,
+            'led_positions': relative_positions,
+            'led_rotations': list(led_rotations),
+            'led_row_directions': led_row_directions,
+            'led_sizes': led_sizes,
+            'led_viewing_angles': led_viewing_angles,
+            'led_rows': led_rows_indices,
+            'led_euler_angles': led_euler_angles,
+            'led_beam_tilts': led_beam_tilts,
+            'lumens_override_enabled': False,
+            'lumens_value': 100,
+        }
+
+    def _generate_standard_12led_group(led_states=None):
+        """Generate a standard 12-LED Elios-style panel group at origin."""
+        led_spacing_cm = 0.8
+        inclinations = [90, 30, -30, -90]
+        row_offsets = [-0.85, -0.55, 0.55, 0.85]
+
+        # Local frame (forward = +X, row direction = -Y, up = +Z)
+        x_axis = np.array([0.0, -1.0, 0.0])
+        rolled_z = np.array([0.0, 0.0, 1.0])
+        radial = np.array([1.0, 0.0, 0.0])
+
+        positions, directions, row_dirs = [], [], []
+        for row_idx, alpha_deg in enumerate(inclinations):
+            alpha = np.radians(alpha_deg)
+            row_center = rolled_z * row_offsets[row_idx]
+            rotated_dir = np.cos(alpha) * radial + (-np.sin(alpha)) * rolled_z
+            rotated_dir = rotated_dir / np.linalg.norm(rotated_dir)
+            if row_idx in (0, 3):
+                row_center = row_center - radial * 0.5
+            for off in [-led_spacing_cm, 0.0, led_spacing_cm]:
+                positions.append(tuple(row_center + x_axis * off))
+                directions.append(tuple(rotated_dir))
+                row_dirs.append(tuple(x_axis))
+
+        if led_states is None:
+            led_states = [True] * 12
+        return {
+            'enabled': True,
+            'position': [0.0, 0.0, 0.0],
+            'rotation_x': 0, 'rotation_y': 0, 'rotation_z': 0,
+            'led_states': led_states[:],
+            'is_dynamic': True,
+            'num_leds': 12,
+            'led_positions': positions,
+            'led_rotations': directions,
+            'led_row_directions': row_dirs,
+            'led_sizes': [0.5] * 12,
+            'led_viewing_angles': [120] * 12,
+            'led_rows': [[0,1,2], [3,4,5], [6,7,8], [9,10,11]],
+            'led_euler_angles': [],
+            'led_beam_tilts': [0] * 12,
+            'lumens_override_enabled': False,
+            'lumens_value': 100,
+        }
+
+    def _load_template_into_slot(slot_idx, template_name, as_individual):
+        """Load a template into a Panel Configurator slot, rotated to face outward."""
+        nonlocal loading_in_progress
+        slot = _ELIOS3_SLOTS[slot_idx]
+        centroid = np.array(slot["centroid"])
+        R = _Rz_matrix(slot["angle_deg"])
+
+        # Full rotation for individual LEDs: Rz(config_rot+config_lr) @ Rx(config_roll) @ Rz(angle_deg)
+        _cfg_lr = slot.get("config_rot", 0) + slot.get("config_lr", 0)
+        _cfg_roll = slot.get("config_roll", 0)
+        _lr_rad = np.radians(_cfg_lr)
+        _roll_rad = np.radians(_cfg_roll)
+        _Rz_cfg = np.array([[np.cos(_lr_rad), -np.sin(_lr_rad), 0],
+                            [np.sin(_lr_rad),  np.cos(_lr_rad), 0],
+                            [0, 0, 1]])
+        _Rx_cfg = np.array([[1, 0, 0],
+                            [0, np.cos(_roll_rad), -np.sin(_roll_rad)],
+                            [0, np.sin(_roll_rad),  np.cos(_roll_rad)]])
+        R_full = _Rz_cfg @ _Rx_cfg @ R  # coarse(angle_deg) + config offsets
+
+        # Remove previous content in this slot if any
+        _clear_panel_slot(slot_idx)
+
+        path = os.path.join(custom_groups_templates_dir, f"{template_name}.json")
+        if not os.path.exists(path):
+            print(f"Panel Configurator: template '{template_name}' not found")
+            return
+
+        with open(path, "r") as f:
+            template = json.load(f)
+
+        groups_data = template.get('groups', [])
+        if not groups_data and 'enabled' in template:
+            groups_data = [{
+                'enabled': template.get('enabled', True),
+                'position': template.get('position', [0, 0, 0]),
+                'led_states': template.get('led_states', [True] * 12),
+            }]
+
+        # ---- Normalize ALL formats into dynamic group configs ----
+        # 1) Convert individual_leds → dynamic group (centered at origin)
+        individual_leds_data = template.get('individual_leds', [])
+        if individual_leds_data:
+            converted = _convert_individual_leds_to_dynamic_group(individual_leds_data)
+            if converted:
+                groups_data.append(converted)
+
+        # 2) Convert standard groups (no is_dynamic, no led_positions) → dynamic
+        for gi in range(len(groups_data)):
+            grp = groups_data[gi]
+            if not grp.get('is_dynamic', False) and 'led_positions' not in grp:
+                std = _generate_standard_12led_group(grp.get('led_states', [True] * 12))
+                std['lumens_override_enabled'] = grp.get('lumens_override_enabled', False)
+                std['lumens_value'] = grp.get('lumens_value', 100)
+                std['enabled'] = grp.get('enabled', True)
+                groups_data[gi] = std
+
+        if not groups_data:
+            print(f"Panel Configurator: template '{template_name}' has no LED data")
+            loading_in_progress[0] = False
+            return
+
+        # ---- Align every group to +X-forward convention ----
+        # Templates from individual_leds or pre-rotated configs may have
+        # world-frame directions.  Detect the mean XY direction and un-rotate
+        # so that the panel faces +X.  update_scene() will apply
+        # rot_tilt_lr = slot_angle to orient it to the correct direction.
+        for gi in range(len(groups_data)):
+            grp = groups_data[gi]
+            dirs = grp.get('led_rotations', [])
+            if not dirs:
+                continue
+            mean_d = np.mean([np.array(d) for d in dirs], axis=0)
+            azimuth = np.arctan2(mean_d[1], mean_d[0])          # current heading
+            if abs(azimuth) < np.radians(2):                    # already ~+X
+                continue
+            # Build Rz(-azimuth) to bring mean direction back to +X
+            Runrot = _Rz_matrix(np.degrees(-azimuth))
+            grp['led_positions'] = [tuple(Runrot @ np.array(p))
+                                    for p in grp.get('led_positions', [])]
+            grp['led_rotations'] = [tuple(Runrot @ np.array(d))
+                                    for d in dirs]
+            rds = grp.get('led_row_directions', [])
+            if rds:
+                grp['led_row_directions'] = [tuple(Runrot @ np.array(rd))
+                                             for rd in rds]
+
+        loading_in_progress[0] = True
+
+        slot_label = slot["name"]
+        template_display = template.get('name', template_name)
+        mode_label = "Individual LEDs" if as_individual else "Solid Group"
+
+        # Create a master folder for this slot
+        slot_folder = server.gui.add_folder(f"Slot {slot_label}: {template_display} ({mode_label})")
+
+        with slot_folder:
+            slot_enable = server.gui.add_checkbox("Enable Slot", initial_value=True)
+            slot_pos_x = server.gui.add_slider("Offset X (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            slot_pos_y = server.gui.add_slider("Offset Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            slot_pos_z = server.gui.add_slider("Offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
+            slot_rot_x = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
+            slot_rot_y = server.gui.add_slider("Inclina Alto/Basso (°)", min=-180, max=180, step=1, initial_value=0)
+            slot_rot_z = server.gui.add_slider("Inclina Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=0)
+            server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>")
+            slot_lumens_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
+            slot_lumens_slider = server.gui.add_slider("Lumens per LED (lm)", min=1, max=900000, step=1, initial_value=100)
+            slot_remove_btn = server.gui.add_button("Rimuovi Slot", color="red")
+
+        created_groups = []
+        created_individual_leds = []
+
+        if as_individual:
+            # --- Load as individual LEDs ---
+            for grp_cfg in groups_data:
+                is_dynamic = grp_cfg.get('is_dynamic', False)
+                num_leds = grp_cfg.get('num_leds', 12)
+                led_positions_raw = grp_cfg.get('led_positions', [(0,0,0)] * num_leds) if is_dynamic else []
+                led_rotations_raw = grp_cfg.get('led_rotations', [(1,0,0)] * num_leds) if is_dynamic else []
+                led_sizes_raw = grp_cfg.get('led_sizes', [0.5] * num_leds) if is_dynamic else []
+                led_va_raw = grp_cfg.get('led_viewing_angles', [120] * num_leds) if is_dynamic else []
+                led_states_raw = grp_cfg.get('led_states', [True] * num_leds)
+                led_row_dirs_raw = grp_cfg.get('led_row_directions', []) if is_dynamic else []
+                led_beam_tilts_raw = grp_cfg.get('led_beam_tilts', []) if is_dynamic else []
+
+                if not is_dynamic:
+                    # Static group — generate default positions
+                    led_rows = grp_cfg.get('led_rows', [[0,1,2],[3,4,5],[6,7,8],[9,10,11]])
+                    led_positions_raw = []
+                    led_rotations_raw = []
+                    led_sizes_raw = []
+                    led_va_raw = []
+                    for row_idx, led_indices in enumerate(led_rows):
+                        for led_idx_in_row, _ in enumerate(led_indices):
+                            led_positions_raw.append((led_idx_in_row * 1.5, 0.0, -row_idx * 2.0))
+                            led_rotations_raw.append((1, 0, 0))
+                            led_sizes_raw.append(0.5)
+                            led_va_raw.append(120)
+
+                for led_idx in range(num_leds):
+                    # Rotate position with full rotation (coarse + config offsets), then add centroid
+                    raw_pos = np.array(led_positions_raw[led_idx]) if led_idx < len(led_positions_raw) else np.zeros(3)
+                    world_pos = R_full @ raw_pos + centroid
+
+                    # Rotate direction vector
+                    raw_dir = np.array(led_rotations_raw[led_idx]) if led_idx < len(led_rotations_raw) else np.array([1,0,0])
+                    world_dir = R_full @ raw_dir
+                    world_dir = world_dir / max(np.linalg.norm(world_dir), 1e-10)
+
+                    # Derive Euler angles from direction
+                    dy_clamped = np.clip(world_dir[1], -1.0, 1.0)
+                    rot_z_rad = np.arcsin(dy_clamped)
+                    cos_rz = np.cos(rot_z_rad)
+                    rot_y_rad = np.arctan2(-world_dir[2], world_dir[0]) if abs(cos_rz) > 1e-6 else 0.0
+                    rot_angles = [0.0, float(np.degrees(rot_y_rad)), float(np.degrees(rot_z_rad))]
+
+                    led_data = create_individual_led(skip_update_scene=True)
+                    led_data['enable'].value = True
+                    led_data['led_on'] = led_states_raw[led_idx] if led_idx < len(led_states_raw) else True
+                    led_data['led_on_btn'].color = "#00FF00" if led_data['led_on'] else "#FF0000"
+                    led_data['pos_x'].value = float(world_pos[0])
+                    led_data['pos_y'].value = float(world_pos[1])
+                    led_data['pos_z'].value = float(world_pos[2])
+                    led_data['rot_x'].value = rot_angles[0]
+                    led_data['rot_y'].value = rot_angles[1]
+                    led_data['rot_z'].value = rot_angles[2]
+                    led_data['size'].value = float(led_sizes_raw[led_idx]) if led_idx < len(led_sizes_raw) else 0.5
+                    led_data['viewing_angle'].value = float(led_va_raw[led_idx]) if led_idx < len(led_va_raw) else 120
+
+                    if led_beam_tilts_raw and led_idx < len(led_beam_tilts_raw):
+                        led_data['beam_tilt'].value = int(round(led_beam_tilts_raw[led_idx]))
+
+                    created_individual_leds.append(led_data)
+
+            # Store initial positions/rotations for slot offset/rotation callbacks
+            _ind_init_positions = []
+            _ind_init_rotations = []
+            for led in created_individual_leds:
+                _ind_init_positions.append([led['pos_x'].value, led['pos_y'].value, led['pos_z'].value])
+                _ind_init_rotations.append([led['rot_x'].value, led['rot_y'].value, led['rot_z'].value])
+
+            # Slot callbacks for individual LEDs (offset + rotation)
+            def _make_ind_slot_update(s_enable, s_px, s_py, s_pz, s_rx, s_ry, s_rz,
+                                      c_leds, init_pos, init_rot, ctr,
+                                      base_roll=0, base_lr=0):
+                def handler(_):
+                    if loading_in_progress[0]:
+                        return
+                    offset = np.array([s_px.value, s_py.value, s_pz.value])
+                    roll_r = np.radians(base_roll + s_rx.value)
+                    pitch_r = np.radians(s_ry.value)
+                    yaw_r = np.radians(base_lr + s_rz.value)
+                    Rx_ = np.array([[1,0,0],[0,np.cos(roll_r),-np.sin(roll_r)],[0,np.sin(roll_r),np.cos(roll_r)]])
+                    Ry_ = np.array([[np.cos(pitch_r),0,np.sin(pitch_r)],[0,1,0],[-np.sin(pitch_r),0,np.cos(pitch_r)]])
+                    Rz_ = np.array([[np.cos(yaw_r),-np.sin(yaw_r),0],[np.sin(yaw_r),np.cos(yaw_r),0],[0,0,1]])
+                    R_s = Rz_ @ Ry_ @ Rx_
+                    for li, led in enumerate(c_leds):
+                        led['enable'].value = s_enable.value
+                        ip = np.array(init_pos[li])
+                        rp = R_s @ (ip - ctr) + ctr + offset
+                        led['pos_x'].value = float(rp[0])
+                        led['pos_y'].value = float(rp[1])
+                        led['pos_z'].value = float(rp[2])
+                        # Recompute direction from initial Euler + slot rotation
+                        ir = init_rot[li]
+                        d = np.array([1.0, 0.0, 0.0])
+                        for axis, ang in [('z', ir[2]), ('y', ir[1]), ('x', ir[0])]:
+                            rad = np.radians(ang)
+                            cs, sn = np.cos(rad), np.sin(rad)
+                            if axis == 'z':
+                                M = np.array([[cs, -sn, 0], [sn, cs, 0], [0, 0, 1]])
+                            elif axis == 'y':
+                                M = np.array([[cs, 0, sn], [0, 1, 0], [-sn, 0, cs]])
+                            else:
+                                M = np.array([[1, 0, 0], [0, cs, -sn], [0, sn, cs]])
+                            d = M @ d
+                        d = R_s @ d
+                        d = d / max(np.linalg.norm(d), 1e-10)
+                        dy_c = np.clip(d[1], -1.0, 1.0)
+                        rz_r = np.arcsin(dy_c)
+                        crz = np.cos(rz_r)
+                        ry_r = np.arctan2(-d[2], d[0]) if abs(crz) > 1e-6 else 0.0
+                        led['rot_x'].value = 0.0
+                        led['rot_y'].value = float(np.degrees(ry_r))
+                        led['rot_z'].value = float(np.degrees(rz_r))
+                    update_scene()
+                return handler
+
+            ind_center = np.mean(_ind_init_positions, axis=0) if _ind_init_positions else np.zeros(3)
+            _ind_cb = _make_ind_slot_update(slot_enable, slot_pos_x, slot_pos_y, slot_pos_z,
+                                            slot_rot_x, slot_rot_y, slot_rot_z,
+                                            created_individual_leds, _ind_init_positions,
+                                            _ind_init_rotations, ind_center,
+                                            base_roll=slot.get("config_roll", 0),
+                                            base_lr=slot.get("config_rot", 0) + slot.get("config_lr", 0))
+            slot_enable.on_update(_ind_cb)
+            slot_pos_x.on_update(_ind_cb)
+            slot_pos_y.on_update(_ind_cb)
+            slot_pos_z.on_update(_ind_cb)
+            slot_rot_x.on_update(_ind_cb)
+            slot_rot_y.on_update(_ind_cb)
+            slot_rot_z.on_update(_ind_cb)
+
+            # Lumens callback for individual LEDs
+            def _make_ind_lumens_cb(c_leds):
+                def handler(_):
+                    if loading_in_progress[0]:
+                        return
+                    for led in c_leds:
+                        if led.get('lumens_override'):
+                            led['lumens_override'].value = slot_lumens_chk.value
+                        if led.get('lumens_value'):
+                            led['lumens_value'].value = slot_lumens_slider.value
+                    update_scene()
+                return handler
+
+            _ind_lum_cb = _make_ind_lumens_cb(created_individual_leds)
+            slot_lumens_chk.on_update(_ind_lum_cb)
+            slot_lumens_slider.on_update(_ind_lum_cb)
+
+        else:
+            # --- Load as solid group(s) ---
+            initial_positions = []
+            initial_rotations = []
+
+            for grp_cfg in groups_data:
+                if 'num_leds' in grp_cfg and 'led_rows' in grp_cfg:
+                    group_data = create_custom_group(
+                        skip_update_scene=True,
+                        num_leds=grp_cfg['num_leds'],
+                        led_rows=grp_cfg['led_rows'],
+                        group_name=grp_cfg.get('name', None)
+                    )
+                else:
+                    group_data = create_custom_group(skip_update_scene=True)
+
+                # Set position to slot centroid
+                group_data['pos_x'].value = float(centroid[0])
+                group_data['pos_y'].value = float(centroid[1])
+                group_data['pos_z'].value = float(centroid[2])
+                # Set initial rotation offsets matching Elios3 config
+                if 'rot_tilt_lr' in group_data:
+                    group_data['rot_tilt_lr'].value = int(round(slot["config_rot"] + slot.get("config_lr", 0)))
+                if 'rot_tilt_ud' in group_data:
+                    group_data['rot_tilt_ud'].value = 0
+                if 'rot_roll' in group_data:
+                    group_data['rot_roll'].value = int(round(slot.get("config_roll", 0)))
+
+                # Pre-bake Rz(angle_deg) into original positions for coarse
+                # slot orientation; config_rot in rot_tilt_lr provides the
+                # fine-tuning (same split as standard Elios3 groups).
+                if grp_cfg.get('is_dynamic', False):
+                    group_data['is_dynamic'] = True
+                    raw_positions = grp_cfg.get('led_positions', [])
+                    raw_rotations = grp_cfg.get('led_rotations', [])
+                    raw_row_dirs = grp_cfg.get('led_row_directions', [])
+
+                    baked_pos = [tuple(R @ np.array(p)) for p in raw_positions]
+                    baked_rot = [tuple(R @ np.array(d)) for d in raw_rotations]
+                    baked_row = [tuple(R @ np.array(rd)) for rd in raw_row_dirs]
+
+                    group_data['led_positions'] = baked_pos
+                    group_data['led_rotations'] = baked_rot
+                    group_data['led_row_directions'] = baked_row
+                    group_data['led_euler_angles'] = grp_cfg.get('led_euler_angles', [])
+                    group_data['led_beam_tilts'] = grp_cfg.get('led_beam_tilts', [])
+                    group_data['led_sizes'] = grp_cfg.get('led_sizes', [])
+                    group_data['led_viewing_angles'] = grp_cfg.get('led_viewing_angles', [])
+
+                    group_data['original_led_positions'] = list(baked_pos)
+                    group_data['original_led_rotations'] = list(baked_rot)
+                    if baked_row:
+                        group_data['original_led_row_directions'] = list(baked_row)
+
+                # Load LED states
+                led_states_cfg = grp_cfg.get('led_states', [])
+                for i, state in enumerate(led_states_cfg):
+                    if i < len(group_data['led_states']):
+                        group_data['led_states'][i] = state
+                if 'update_button_colors' in group_data and group_data['update_button_colors']:
+                    group_data['update_button_colors']()
+
+                # Restore lumens override if present
+                if group_data.get('lumens_override') and grp_cfg.get('lumens_override_enabled'):
+                    group_data['lumens_override'].value = True
+                    group_data['lumens_value'].value = grp_cfg.get('lumens_value', 100)
+
+                group_data['enable'].value = grp_cfg.get('enabled', True)
+
+                group_data['template_name'] = template_display
+                group_data['panel_slot'] = slot_idx
+                group_data['panel_slot_name'] = slot["name"]
+                group_data['initial_pos'] = [float(centroid[0]), float(centroid[1]), float(centroid[2])]
+                group_data['initial_rot'] = [0, 0, 0]
+                group_data['folder'].visible = False
+
+                initial_positions.append(group_data['initial_pos'])
+                initial_rotations.append(group_data['initial_rot'])
+                created_groups.append(group_data)
+
+            # -- LED Controls (tracked buttons) --
+            _slot_led_buttons = []
+
+            with slot_folder:
+                server.gui.add_html("<hr style='margin:8px 0;'><b>LED Controls:</b>")
+                for g_idx, group in enumerate(created_groups):
+                    with server.gui.add_folder(f"Group {g_idx + 1} LEDs"):
+                        _gb = {'all_btn': None, 'row_btns': {}, 'led_btns': {}}
+                        led_rows = group.get('led_rows', [[0,1,2],[3,4,5],[6,7,8],[9,10,11]])
+
+                        _ab = server.gui.add_button("ALL LEDs", color="#666666")
+                        _gb['all_btn'] = _ab
+                        server.gui.add_html("<hr style='margin:4px 0;'>")
+
+                        for r_idx, led_indices in enumerate(led_rows):
+                            _rb = server.gui.add_button(f"Row {r_idx + 1}", color="#666666")
+                            _gb['row_btns'][r_idx] = _rb
+
+                        server.gui.add_html("<hr style='margin:4px 0;'>")
+
+                        for l_idx in range(group.get('num_leds', 12)):
+                            _c = "#FF00FF" if group['led_states'][l_idx] else "#444444"
+                            _lb = server.gui.add_button(f"LED {l_idx + 1}", color=_c)
+                            _gb['led_btns'][l_idx] = _lb
+
+                        _slot_led_buttons.append({
+                            'group': group, 'buttons': _gb, 'led_rows': led_rows
+                        })
+
+            # Function to sync all slot LED button colours
+            def _update_slot_btn_colors():
+                for _gd in _slot_led_buttons:
+                    _grp = _gd['group']
+                    _btns = _gd['buttons']
+                    _lrs = _gd['led_rows']
+                    for _li, _lb in _btns['led_btns'].items():
+                        if _li < len(_grp['led_states']):
+                            _lb.color = "#FF00FF" if _grp['led_states'][_li] else "#444444"
+                    for _ri, _lis in enumerate(_lrs):
+                        if _ri in _btns['row_btns']:
+                            _any = any(_grp['led_states'][i] for i in _lis if i < len(_grp['led_states']))
+                            _btns['row_btns'][_ri].color = "#FF00FF" if _any else "#666666"
+                    if _btns['all_btn']:
+                        _btns['all_btn'].color = "#FF00FF" if any(_grp['led_states']) else "#666666"
+
+            # Wire LED button handlers
+            def _mk_all_h(grp, uf):
+                def h(_):
+                    _ao = all(grp['led_states'])
+                    for i in range(len(grp['led_states'])):
+                        grp['led_states'][i] = not _ao
+                    if grp.get('update_button_colors'):
+                        grp['update_button_colors']()
+                    uf()
+                    update_scene()
+                return h
+
+            def _mk_row_h(grp, leds_in_row, uf):
+                def h(_):
+                    _ao = all(grp['led_states'][i] for i in leds_in_row if i < len(grp['led_states']))
+                    for li in leds_in_row:
+                        if li < len(grp['led_states']):
+                            grp['led_states'][li] = not _ao
+                    if grp.get('update_button_colors'):
+                        grp['update_button_colors']()
+                    uf()
+                    update_scene()
+                return h
+
+            def _mk_led_h(grp, idx, uf):
+                def h(_):
+                    if idx < len(grp['led_states']):
+                        grp['led_states'][idx] = not grp['led_states'][idx]
+                    if grp.get('update_button_colors'):
+                        grp['update_button_colors']()
+                    uf()
+                    update_scene()
+                return h
+
+            for _gd in _slot_led_buttons:
+                _grp = _gd['group']
+                _btns = _gd['buttons']
+                _lrs = _gd['led_rows']
+                _btns['all_btn'].on_click(_mk_all_h(_grp, _update_slot_btn_colors))
+                for _ri, _lis in enumerate(_lrs):
+                    if _ri in _btns['row_btns']:
+                        _btns['row_btns'][_ri].on_click(_mk_row_h(_grp, _lis, _update_slot_btn_colors))
+                for _li, _lb in _btns['led_btns'].items():
+                    _lb.on_click(_mk_led_h(_grp, _li, _update_slot_btn_colors))
+
+            _update_slot_btn_colors()
+
+            # -- Slot master callback (enable / offset / rotation) --
+            # Uses the SAME rotation mechanism as standard Elios3 groups:
+            # slot_rot_x → rot_roll (Ruota su se stesso, around panel forward axis)
+            # slot_rot_y → rot_tilt_ud (Inclina Alto/Basso)
+            # slot_rot_z → rot_tilt_lr = slot_angle + user_offset
+            # R_total = Rz(slot_angle + user_z) @ Ry(user_y) @ Rx(user_roll)
+            # Since Rx is applied FIRST to the +X-forward template, roll works
+            # around the panel's own forward direction — identical to Elios3.
+            def _make_slot_update(s_enable, s_px, s_py, s_pz, s_rx, s_ry, s_rz,
+                                  c_groups, init_pos, base_lr, base_roll):
+                def handler(_):
+                    if loading_in_progress[0]:
+                        return
+                    loading_in_progress[0] = True
+                    offset = np.array([s_px.value, s_py.value, s_pz.value])
+
+                    for gi, g in enumerate(c_groups):
+                        g['enable'].value = s_enable.value
+                        # Position = initial + offset
+                        base = np.array(init_pos[gi])
+                        g['pos_x'].value = float(base[0] + offset[0])
+                        g['pos_y'].value = float(base[1] + offset[1])
+                        g['pos_z'].value = float(base[2] + offset[2])
+                        # Map slot rotation sliders → per-group rotation sliders
+                        # base offsets replicate the Elios3 config defaults
+                        if 'rot_roll' in g:
+                            g['rot_roll'].value = int(round(base_roll + s_rx.value))
+                        if 'rot_tilt_ud' in g:
+                            g['rot_tilt_ud'].value = int(round(s_ry.value))
+                        if 'rot_tilt_lr' in g:
+                            g['rot_tilt_lr'].value = int(round(base_lr + s_rz.value))
+                        # Trigger the group's own rotation transform
+                        if callable(g.get('apply_rotation')):
+                            g['apply_rotation']()
+
+                    loading_in_progress[0] = False
+                    update_scene()
+                return handler
+
+            _slot_cb = _make_slot_update(slot_enable, slot_pos_x, slot_pos_y, slot_pos_z,
+                                        slot_rot_x, slot_rot_y, slot_rot_z,
+                                        created_groups, initial_positions,
+                                        slot["config_rot"] + slot.get("config_lr", 0),
+                                        slot.get("config_roll", 0))
+            slot_enable.on_update(_slot_cb)
+            slot_pos_x.on_update(_slot_cb)
+            slot_pos_y.on_update(_slot_cb)
+            slot_pos_z.on_update(_slot_cb)
+            slot_rot_x.on_update(_slot_cb)
+            slot_rot_y.on_update(_slot_cb)
+            slot_rot_z.on_update(_slot_cb)
+
+            # Lumens override callback
+            def _make_lumens_cb(c_groups):
+                def handler(_):
+                    if loading_in_progress[0]:
+                        return
+                    for g in c_groups:
+                        if g.get('lumens_override'):
+                            g['lumens_override'].value = slot_lumens_chk.value
+                        if g.get('lumens_value'):
+                            g['lumens_value'].value = slot_lumens_slider.value
+                    update_scene()
+                return handler
+
+            _lum_cb = _make_lumens_cb(created_groups)
+            slot_lumens_chk.on_update(_lum_cb)
+            slot_lumens_slider.on_update(_lum_cb)
+
+        # Remove slot callback (shared between both modes)
+        def _make_remove_cb(si):
+            def handler(_):
+                _clear_panel_slot(si)
+                if si < len(_panel_dropdowns):
+                    _panel_dropdowns[si].value = "-- Nessuno --"
+                update_scene()
+            return handler
+        slot_remove_btn.on_click(_make_remove_cb(slot_idx))
+
+        # Store slot data
+        _panel_slot_data[slot_idx] = {
+            'template_name': template_name,
+            'as_individual': as_individual,
+            'folder': slot_folder,
+            'groups': created_groups,
+            'individual_leds': created_individual_leds,
+        }
+
+        # Also register in template_folders for cleanup on new project
+        template_folders.append({
+            'folder': slot_folder,
+            'groups': created_groups,
+        })
+
+        loading_in_progress[0] = False
+        update_scene()
+        print(f"✓ Panel Configurator: Loaded '{template_display}' into slot {slot_label} ({mode_label})")
+
+    def _clear_panel_slot(slot_idx):
+        """Remove all content from a panel slot."""
+        data = _panel_slot_data[slot_idx]
+        if data is None:
+            return
+        # Remove groups
+        for g in data.get('groups', []):
+            if g in custom_groups:
+                custom_groups.remove(g)
+            try:
+                g['folder'].remove()
+            except Exception:
+                pass
+        # Remove individual LEDs
+        for led in data.get('individual_leds', []):
+            if led in individual_leds:
+                individual_leds.remove(led)
+            try:
+                led['folder'].remove()
+            except Exception:
+                pass
+        # Remove slot folder
+        try:
+            data['folder'].remove()
+        except Exception:
+            pass
+        # Remove from template_folders
+        for tf in template_folders[:]:
+            if tf.get('folder') == data.get('folder'):
+                template_folders.remove(tf)
+                break
+        _panel_slot_data[slot_idx] = None
+
+    # --- Panel Configurator UI ---
+    panel_config_folder = server.gui.add_folder("Panel Configurator (Elios 3 Slots)", expand_by_default=False)
+
+    _panel_dropdowns = []
+    _panel_mode_dropdowns = []
+    _panel_load_btns = []
+    _panel_clear_btns = []
+
+    with panel_config_folder:
+        server.gui.add_html(
+            "<div style='color:#aaa;font-size:11px;margin-bottom:8px;'>"
+            "Assign a template to each of the 4 Elios 3 panel positions.<br>"
+            "Positions and rotations are pre-set to match the drone geometry.</div>"
+        )
+
+        for _si, _slot_info in enumerate(_ELIOS3_SLOTS):
+            with server.gui.add_folder(f"📍 {_slot_info['name']}"):
+                _tpl_dd = server.gui.add_dropdown(
+                    "Template",
+                    options=["-- Nessuno --"] + get_available_templates(),
+                    initial_value="-- Nessuno --",
+                )
+                _mode_dd = server.gui.add_dropdown(
+                    "Mode",
+                    options=["Solid (Group)", "Individual LEDs"],
+                    initial_value="Solid (Group)",
+                )
+                _load_btn = server.gui.add_button("✅ Carica Pannello", color="green")
+                _clear_btn = server.gui.add_button("🗑️ Rimuovi Pannello", color="red")
+
+                _panel_dropdowns.append(_tpl_dd)
+                _panel_mode_dropdowns.append(_mode_dd)
+                _panel_load_btns.append(_load_btn)
+                _panel_clear_btns.append(_clear_btn)
+
+                def _make_load_handler(si, dd, mdd):
+                    def handler(_):
+                        tpl = dd.value
+                        if tpl == "-- Nessuno --":
+                            _clear_panel_slot(si)
+                            update_scene()
+                            print(f"Panel Configurator: Slot {_ELIOS3_SLOTS[si]['name']} cleared.")
+                            return
+                        as_individual = mdd.value == "Individual LEDs"
+                        _load_template_into_slot(si, tpl, as_individual)
+                    return handler
+
+                def _make_clear_handler(si, dd):
+                    def handler(_):
+                        _clear_panel_slot(si)
+                        dd.value = "-- Nessuno --"
+                        update_scene()
+                        print(f"Panel Configurator: Slot {_ELIOS3_SLOTS[si]['name']} cleared.")
+                    return handler
+
+                _load_btn.on_click(_make_load_handler(_si, _tpl_dd, _mode_dd))
+                _clear_btn.on_click(_make_clear_handler(_si, _tpl_dd))
+
     def load_template_as_individual_leds(template_name):
         """Load a template and create individual editable LEDs instead of a group."""
         nonlocal loading_in_progress
@@ -3861,75 +5949,44 @@ def main():
                     group_cfg.get('pos_z', 0.0)
                 ]
             
-            # Support both rotation_x/y/z and rot_x/y/z
+            # Group rotation is now always [0,0,0] (data saved in world-space)
+            # Keep group_rot for metadata only
             group_rot = [
                 group_cfg.get('rotation_x', group_cfg.get('rot_x', 0)),
                 group_cfg.get('rotation_y', group_cfg.get('rot_y', 0)),
                 group_cfg.get('rotation_z', group_cfg.get('rot_z', 0))
             ]
             
-            # Create rotation matrix for group rotation
-            rot_x_rad = np.radians(group_rot[0])
-            rot_y_rad = np.radians(group_rot[1])
-            rot_z_rad = np.radians(group_rot[2])
-            
-            Rx = np.array([[1, 0, 0], [0, np.cos(rot_x_rad), -np.sin(rot_x_rad)], [0, np.sin(rot_x_rad), np.cos(rot_x_rad)]])
-            Ry = np.array([[np.cos(rot_y_rad), 0, np.sin(rot_y_rad)], [0, 1, 0], [-np.sin(rot_y_rad), 0, np.cos(rot_y_rad)]])
-            Rz = np.array([[np.cos(rot_z_rad), -np.sin(rot_z_rad), 0], [np.sin(rot_z_rad), np.cos(rot_z_rad), 0], [0, 0, 1]])
-            R_group = Rz @ Ry @ Rx
-            
             # Create individual LED for each LED in the group
             for led_idx in range(num_leds):
-                # Apply group rotation to LED position
+                # Compute world position: relative position + group offset
+                # (positions in template are relative to group_pos)
                 led_pos_local = np.array(led_positions[led_idx])
-                led_pos_rotated = R_group @ led_pos_local
-                led_pos_final = led_pos_rotated + np.array(group_pos)
+                led_pos_final = led_pos_local + np.array(group_pos)
                 
-                # Apply group rotation to LED direction
-                led_dir_local = np.array(led_rotations[led_idx])
-                led_dir_rotated = R_group @ led_dir_local
+                # ALWAYS derive rotation angles from led_rotations (direction vectors).
+                # led_euler_angles may be stale (not updated after group master rotation).
+                # led_rotations are the ground truth in world-space.
+                # Convention: direction = Rx(rx) @ Ry(ry) @ Rz(rz) @ [1,0,0]
+                # With rx=0: dx = cos(ry)*cos(rz), dy = sin(rz), dz = -sin(ry)*cos(rz)
+                led_dir = np.array(led_rotations[led_idx])
+                led_dir = led_dir / np.linalg.norm(led_dir)  # ensure unit vector
                 
-                # Convert to rotation angles using stored Euler angles (lossless) or direction (fallback)
-                led_euler_angles_data = group_cfg.get('led_euler_angles', [])
-                if led_euler_angles_data and led_idx < len(led_euler_angles_data):
-                    # Reconstruct full rotation matrix from stored Euler angles
-                    stored_angles = led_euler_angles_data[led_idx]
-                    srx = np.radians(stored_angles[0])
-                    sry = np.radians(stored_angles[1])
-                    srz = np.radians(stored_angles[2])
-                    Rx_s = np.array([[1, 0, 0], [0, np.cos(srx), -np.sin(srx)], [0, np.sin(srx), np.cos(srx)]])
-                    Ry_s = np.array([[np.cos(sry), 0, np.sin(sry)], [0, 1, 0], [-np.sin(sry), 0, np.cos(sry)]])
-                    Rz_s = np.array([[np.cos(srz), -np.sin(srz), 0], [np.sin(srz), np.cos(srz), 0], [0, 0, 1]])
-                    R_local = Rx_s @ Ry_s @ Rz_s  # Same convention as rendering
-                    
-                    # Compose with group rotation: R_combined = R_group @ R_local
-                    R_combined = R_group @ R_local
-                    
-                    # Decompose R_combined = Rx @ Ry @ Rz back into Euler angles
-                    sy = np.clip(R_combined[0, 2], -1.0, 1.0)
-                    rot_y_new = np.degrees(np.arcsin(sy))
-                    cy = np.cos(np.arcsin(sy))
-                    
-                    if abs(cy) > 1e-6:
-                        rot_x_new = np.degrees(np.arctan2(-R_combined[1, 2], R_combined[2, 2]))
-                        rot_z_new = np.degrees(np.arctan2(-R_combined[0, 1], R_combined[0, 0]))
-                    else:
-                        # Gimbal lock
-                        rot_z_new = 0.0
-                        rot_x_new = np.degrees(np.arctan2(R_combined[1, 0], R_combined[1, 1]))
-                    
-                    rot_angles = [rot_x_new, rot_y_new, rot_z_new]
+                forward = np.array([1, 0, 0])
+                if np.allclose(led_dir, forward, atol=1e-6):
+                    rot_angles = [0.0, 0.0, 0.0]
+                elif np.allclose(led_dir, -forward, atol=1e-6):
+                    rot_angles = [0.0, 180.0, 0.0]
                 else:
-                    # Fallback: convert direction to rotation angles (lossy - no rot_x recovery)
-                    forward = np.array([1, 0, 0])
-                    if np.allclose(led_dir_rotated, forward):
-                        rot_angles = [0, 0, 0]
-                    elif np.allclose(led_dir_rotated, -forward):
-                        rot_angles = [0, 180, 0]
+                    # rz from dy = sin(rz)
+                    dy_clamped = np.clip(led_dir[1], -1.0, 1.0)
+                    rot_z_rad = np.arcsin(dy_clamped)
+                    cos_rz = np.cos(rot_z_rad)
+                    if abs(cos_rz) > 1e-6:
+                        rot_y_rad = np.arctan2(-led_dir[2], led_dir[0])
                     else:
-                        rot_y = np.degrees(np.arctan2(-led_dir_rotated[2], led_dir_rotated[0]))
-                        rot_z = np.degrees(np.arctan2(led_dir_rotated[1], np.sqrt(led_dir_rotated[0]**2 + led_dir_rotated[2]**2)))
-                        rot_angles = [0, rot_y, rot_z]
+                        rot_y_rad = 0.0
+                    rot_angles = [0.0, np.degrees(rot_y_rad), np.degrees(rot_z_rad)]
                 
                 # Create individual LED
                 led_data = create_individual_led(skip_update_scene=True)
@@ -3947,18 +6004,31 @@ def main():
                 led_data['size'].value = float(led_sizes[led_idx])
                 led_data['viewing_angle'].value = float(led_viewing_angles[led_idx])
                 
+                # Recover beam_tilt from stored led_beam_tilts
+                led_beam_tilts_data = group_cfg.get('led_beam_tilts', [])
+                if led_beam_tilts_data and led_idx < len(led_beam_tilts_data):
+                    led_data['beam_tilt'].value = int(round(led_beam_tilts_data[led_idx]))
+                
                 # Recover square_roll from led_row_directions if available
                 if led_row_directions and led_idx < len(led_row_directions):
-                    saved_row_dir = R_group @ np.array(led_row_directions[led_idx])
+                    saved_row_dir = np.array(led_row_directions[led_idx])
+                    # Compute LED direction from rotation angles
+                    led_dir = np.array([1.0, 0.0, 0.0])
+                    rz_r = np.radians(rot_angles[2]); ry_r = np.radians(rot_angles[1]); rx_r = np.radians(rot_angles[0])
+                    Rz_m = np.array([[np.cos(rz_r), -np.sin(rz_r), 0], [np.sin(rz_r), np.cos(rz_r), 0], [0, 0, 1]])
+                    Ry_m = np.array([[np.cos(ry_r), 0, np.sin(ry_r)], [0, 1, 0], [-np.sin(ry_r), 0, np.cos(ry_r)]])
+                    Rx_m = np.array([[1, 0, 0], [0, np.cos(rx_r), -np.sin(rx_r)], [0, np.sin(rx_r), np.cos(rx_r)]])
+                    led_dir = Rx_m @ Ry_m @ Rz_m @ led_dir
+                    led_dir = led_dir / np.linalg.norm(led_dir)
                     # Compute default row_dir for this LED's direction (same logic as create_leds)
-                    default_row_dir = np.cross(led_dir_rotated, np.array([0, 0, 1]))
+                    default_row_dir = np.cross(led_dir, np.array([0, 0, 1]))
                     if np.linalg.norm(default_row_dir) < 1e-6:
-                        default_row_dir = np.cross(led_dir_rotated, np.array([0, 1, 0]))
+                        default_row_dir = np.cross(led_dir, np.array([0, 1, 0]))
                     default_row_dir = default_row_dir / np.linalg.norm(default_row_dir)
                     # Compute angle between default and saved row_dir around LED direction
                     dot_val = np.clip(np.dot(default_row_dir, saved_row_dir), -1.0, 1.0)
                     cross_val = np.cross(default_row_dir, saved_row_dir)
-                    sign = np.sign(np.dot(cross_val, led_dir_rotated / np.linalg.norm(led_dir_rotated)))
+                    sign = np.sign(np.dot(cross_val, led_dir))
                     angle_rad = np.arccos(dot_val) * (sign if sign != 0 else 1)
                     led_data['square_roll'].value = int(round(np.degrees(angle_rad)))
                 
@@ -3988,6 +6058,12 @@ def main():
             led_data['size'].value = led_cfg.get('size', 0.5)
             led_data['viewing_angle'].value = led_cfg.get('viewing_angle', 120)
             led_data['square_roll'].value = led_cfg.get('square_roll', 0)
+            led_data['beam_tilt'].value = led_cfg.get('beam_tilt', 0)
+            
+            # Restore lumens override settings for individual LED
+            if led_data.get('lumens_override') and led_cfg.get('lumens_override_enabled'):
+                led_data['lumens_override'].value = True
+                led_data['lumens_value'].value = led_cfg.get('lumens_value', 100)
             
             # Mark as part of this template
             led_data['template_source'] = template_name
@@ -4040,6 +6116,18 @@ def main():
             server.gui.add_html("<b>Rotazione quadrato:</b>")
             square_roll_slider = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
             
+            server.gui.add_html("<b>Beam Tilt:</b>")
+            beam_tilt_slider = server.gui.add_slider("Tilt beam sopra/sotto (°)", min=-180, max=180, step=1, initial_value=0)
+            
+            server.gui.add_html("<b>Lumens Override:</b>")
+            lumens_override_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
+            lumens_slider_ind = server.gui.add_slider("Lumens (lm)", min=1, max=900000, step=1, initial_value=100)
+            
+            server.gui.add_html("<b>Lente esterna (collimatrice):</b>")
+            ext_lens_chk = server.gui.add_checkbox("Enable external lens", initial_value=False)
+            ext_lens_angle = server.gui.add_slider("Lens beam angle (°)", min=5, max=120, step=5, initial_value=30)
+            ext_lens_efficiency = server.gui.add_slider("Lens efficiency (%)", min=10, max=100, step=1, initial_value=80)
+            
             remove_btn = server.gui.add_button("Remove LED", color="red")
         
         # Store LED data
@@ -4058,6 +6146,12 @@ def main():
             'size': size_slider,
             'viewing_angle': viewing_angle_slider,
             'square_roll': square_roll_slider,
+            'beam_tilt': beam_tilt_slider,
+            'lumens_override': lumens_override_chk,
+            'lumens_value': lumens_slider_ind,
+            'ext_lens_enable': ext_lens_chk,
+            'ext_lens_angle': ext_lens_angle,
+            'ext_lens_efficiency': ext_lens_efficiency,
             'remove_btn': remove_btn,
         }
         
@@ -4086,6 +6180,12 @@ def main():
         size_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         viewing_angle_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         square_roll_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        beam_tilt_slider.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        lumens_override_chk.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        lumens_slider_ind.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        ext_lens_chk.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        ext_lens_angle.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
+        ext_lens_efficiency.on_update(lambda _: update_scene() if not loading_in_progress[0] else None)
         remove_btn.on_click(on_remove)
         
         individual_leds.append(led_data)
@@ -4125,7 +6225,8 @@ def main():
                 },
                 "size": float(led_data['size'].value),
                 "viewing_angle": float(led_data['viewing_angle'].value),
-                "square_roll": float(led_data['square_roll'].value)
+                "square_roll": float(led_data['square_roll'].value),
+                "beam_tilt": float(led_data['beam_tilt'].value)
             }
             
             # Add metadata if present (template source info)
@@ -4157,6 +6258,355 @@ def main():
         print(f"✓ Exported {len(leds_export)} individual LED(s) to: {filename}")
         return filepath
     
+    def export_leds_to_stl():
+        """Export each LED as an editable planar surface in STEP format.
+        
+        One face per LED (rectangle with filleted corners). The output is a
+        true B-Rep STEP file with planar faces, fully editable in SolidWorks
+        (selectable as reference plane, extrudable, etc.).
+        """
+        if len(current_leds) == 0:
+            print("⚠️ No LEDs in the scene. Update the scene first.")
+            return None
+        
+        try:
+            import cadquery as cq
+        except ImportError:
+            print("⚠️ 'cadquery' library required for STEP export.  pip install cadquery")
+            return None
+        try:
+            from shapely.geometry import Polygon
+        except ImportError:
+            print("⚠️ 'shapely' library required.  pip install shapely")
+            return None
+        
+        active_leds = [led for led in current_leds
+                       if not (hasattr(led, 'enabled') and not led.enabled)]
+        if not active_leds:
+            print("⚠️ No active LEDs to export.")
+            return None
+        
+        # ── Parameters (cm) ──
+        margin   = 0.05   # 0.5 mm border around each LED
+        fillet_r = 0.04   # 0.4 mm fillet on outer corners
+        faces    = []
+        
+        def _normal(led):
+            n = np.array(getattr(led, 'square_normal', led.direction), dtype=float)
+            nm = np.linalg.norm(n)
+            return n / nm if nm > 1e-10 else np.array([1., 0., 0.])
+        
+        for led in active_leds:
+            pos = np.array(led.position, dtype=float)
+            nrm = _normal(led)
+            hw  = led.width / 2.0
+            
+            # Local 2-D frame on the LED's plane
+            if abs(nrm[2]) < 0.9:
+                lx = np.cross(nrm, [0, 0, 1])
+            else:
+                lx = np.cross(nrm, [0, 1, 0])
+            lx /= np.linalg.norm(lx)
+            ly = np.cross(nrm, lx)
+            ly /= np.linalg.norm(ly)
+            
+            # Use row_direction for consistent orientation
+            row_d = getattr(led, 'row_direction', None)
+            if row_d is not None:
+                row_d = np.array(row_d, dtype=float)
+                r2x = np.dot(row_d, lx)
+                r2y = np.dot(row_d, ly)
+                n2  = np.hypot(r2x, r2y)
+                if n2 > 0.01:
+                    r_hat = np.array([r2x, r2y]) / n2
+                else:
+                    r_hat = np.array([1., 0.])
+            else:
+                r_hat = np.array([1., 0.])
+            p_hat = np.array([-r_hat[1], r_hat[0]])
+            
+            # ── Outer panel outline (LED square + margin) with filleted corners ──
+            m = hw + margin
+            outer_corners = [(r_hat[0]*sx*m + p_hat[0]*sy*m,
+                              r_hat[1]*sx*m + p_hat[1]*sy*m)
+                             for sx, sy in [(-1,-1),(1,-1),(1,1),(-1,1)]]
+            outer = Polygon(outer_corners)
+            try:
+                sm = outer.buffer(-fillet_r, resolution=8).buffer(fillet_r, resolution=8)
+                if sm.is_valid and not sm.is_empty and sm.area > outer.area * 0.5:
+                    outer = sm
+            except Exception:
+                pass
+            
+            if outer.is_empty:
+                continue
+            
+            polys = (list(outer.geoms)
+                     if outer.geom_type == 'MultiPolygon'
+                     else [outer])
+            
+            # Build a CadQuery Workplane on the LED's local plane.
+            # Units: cadquery uses mm; our scene is in cm → multiply by 10.
+            plane = cq.Plane(
+                origin=cq.Vector(float(pos[0])*10, float(pos[1])*10, float(pos[2])*10),
+                xDir=cq.Vector(float(lx[0]), float(lx[1]), float(lx[2])),
+                normal=cq.Vector(float(nrm[0]), float(nrm[1]), float(nrm[2])),
+            )
+            
+            for poly in polys:
+                try:
+                    coords = list(poly.exterior.coords)
+                    if len(coords) > 1 and coords[0] == coords[-1]:
+                        coords = coords[:-1]
+                    pts_mm = [(float(x)*10, float(y)*10) for (x, y) in coords]
+                    wire = (
+                        cq.Workplane(plane)
+                        .polyline(pts_mm)
+                        .close()
+                        .val()
+                    )
+                    face = cq.Face.makeFromWires(wire)
+                    faces.append(face)
+                except Exception as e:
+                    print(f"   [skip face] {e}")
+        
+        if not faces:
+            print("⚠️ No faces generated.")
+            return None
+        
+        compound = cq.Compound.makeCompound(faces)
+        
+        export_dir = "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"led_panel_{ts}.step"
+        filepath = os.path.join(export_dir, filename)
+        cq.exporters.export(compound, filepath, exportType='STEP')
+        
+        print(f"✓ Exported STEP: {filename}")
+        print(f"  Planar faces: {len(faces)} (editable in SolidWorks)")
+        print(f"  Margin: {margin*10:.1f} mm  Fillet: {fillet_r*10:.1f} mm  Units: mm")
+        print(f"  Path: {os.path.abspath(filepath)}")
+        return filepath
+    
+    def export_custom_group_dxf():
+        """Export a 2D DXF file for CNC cutting of the custom group LEDs.
+        
+        Projects all custom-group LEDs onto their unfolded flat plane,
+        groups them into rows by Y-coordinate clustering, then places
+        horizontal living-hinge slot patterns between rows whose normals
+        differ so the flat panel can be bent into the 3-D shape.
+        
+        Units in the DXF are millimetres.
+        
+        Layers:
+          PANEL_OUTLINE  – outer contour (white)
+          LED_HOLES      – square LED apertures (red)
+          FLEX_CUTS      – living-hinge slots between rows (green)
+        """
+        try:
+            import ezdxf
+        except ImportError:
+            print("⚠️ 'ezdxf' library required.  pip install ezdxf")
+            return None
+        
+        # Gather custom-group LEDs that are active
+        custom_leds = [
+            led for led in current_leds
+            if getattr(led, 'is_custom', False)
+            and not (hasattr(led, 'enabled') and not led.enabled)
+        ]
+        if not custom_leds:
+            print("⚠️ No active custom-group LEDs in the scene.")
+            return None
+        
+        # --- Helper: normalised normal vector ---
+        def _led_normal(led):
+            n = np.array(getattr(led, 'square_normal', led.direction), dtype=float)
+            nm = np.linalg.norm(n)
+            return n / nm if nm > 1e-10 else np.array([1., 0., 0.])
+        
+        # --- Compute local 2-D frame from the average LED normal ---
+        positions_3d = np.array([led.position for led in custom_leds])
+        normals_3d = np.array([_led_normal(led) for led in custom_leds])
+        
+        avg_normal = normals_3d.mean(axis=0)
+        n_len = np.linalg.norm(avg_normal)
+        avg_normal = avg_normal / n_len if n_len > 1e-10 else np.array([1., 0., 0.])
+        
+        centroid = positions_3d.mean(axis=0)
+        
+        # Orthonormal frame on the projection plane
+        if abs(avg_normal[2]) < 0.9:
+            x_local = np.cross(avg_normal, [0, 0, 1])
+        else:
+            x_local = np.cross(avg_normal, [0, 1, 0])
+        x_local /= np.linalg.norm(x_local)
+        y_local = np.cross(avg_normal, x_local)
+        y_local /= np.linalg.norm(y_local)
+        
+        # --- Project each LED onto the 2-D plane (cm → mm) ---
+        margin_mm      = 1.5   # margin around each LED hole
+        panel_border_mm = 3.0  # extra border around the panel edges
+        
+        led_data = []  # [(cx_mm, cy_mm, hw_mm, normal_3d), ...]
+        for idx, led in enumerate(custom_leds):
+            delta = np.array(led.position) - centroid
+            cx = np.dot(delta, x_local) * 10.0  # cm → mm
+            cy = np.dot(delta, y_local) * 10.0
+            hw = (led.width / 2.0) * 10.0
+            led_data.append((cx, cy, hw, normals_3d[idx]))
+        
+        # --- Outer panel bounding rectangle ---
+        all_x  = [d[0] for d in led_data]
+        all_y  = [d[1] for d in led_data]
+        max_hw = max(d[2] for d in led_data)
+        border = max_hw + margin_mm + panel_border_mm
+        
+        x_min = min(all_x) - border
+        x_max = max(all_x) + border
+        y_min = min(all_y) - border
+        y_max = max(all_y) + border
+        
+        # ================================================================
+        #  Cluster LEDs into rows by Y coordinate, then add flex cuts
+        #  between adjacent rows whose average normals differ
+        # ================================================================
+        # Sort LEDs by Y coordinate
+        sorted_indices = sorted(range(len(led_data)), key=lambda i: led_data[i][1])
+        
+        # Cluster into rows: LEDs within cluster_tol mm of each other in Y
+        cluster_tol = max_hw * 1.5  # LEDs in same row are close in Y
+        rows = []  # list of lists of led_data indices
+        current_row = [sorted_indices[0]]
+        for k in range(1, len(sorted_indices)):
+            prev_y = led_data[sorted_indices[k - 1]][1]
+            curr_y = led_data[sorted_indices[k]][1]
+            if abs(curr_y - prev_y) < cluster_tol:
+                current_row.append(sorted_indices[k])
+            else:
+                rows.append(current_row)
+                current_row = [sorted_indices[k]]
+        rows.append(current_row)
+        
+        # Compute per-row average Y and average normal
+        row_info = []  # (avg_y, avg_normal_3d, min_x, max_x)
+        for row in rows:
+            avg_y = np.mean([led_data[i][1] for i in row])
+            avg_n = np.mean([led_data[i][3] for i in row], axis=0)
+            nm = np.linalg.norm(avg_n)
+            avg_n = avg_n / nm if nm > 1e-10 else np.array([1., 0., 0.])
+            r_min_x = min(led_data[i][0] - led_data[i][2] for i in row)
+            r_max_x = max(led_data[i][0] + led_data[i][2] for i in row)
+            row_info.append((avg_y, avg_n, r_min_x, r_max_x))
+        
+        # --- Generate flex cuts between adjacent rows ---
+        flex_angle_threshold_deg = 2.0
+        slot_length_mm  = 4.0   # length of each slot segment
+        slot_gap_mm     = 1.5   # gap between consecutive slots in a line
+        n_slot_lines    = 3     # parallel lines of slots
+        slot_line_gap   = 1.0   # spacing between parallel lines
+        
+        flex_cuts = []  # ((x1,y1),(x2,y2))
+        
+        for r in range(len(rows) - 1):
+            # Angle between adjacent row normals
+            dot = np.clip(np.dot(row_info[r][1], row_info[r + 1][1]), -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(abs(dot)))
+            if angle_deg < flex_angle_threshold_deg:
+                continue
+            
+            # Y zone: between the bottom of upper row and top of lower row
+            # (rows sorted bottom to top, i.e. ascending Y)
+            row_top_leds    = rows[r]
+            row_bottom_leds = rows[r + 1]
+            
+            y_top_of_lower = max(led_data[i][1] + led_data[i][2] + margin_mm for i in row_top_leds)
+            y_bot_of_upper = min(led_data[i][1] - led_data[i][2] - margin_mm for i in row_bottom_leds)
+            
+            zone_y_center = (y_top_of_lower + y_bot_of_upper) / 2.0
+            zone_y_height = y_bot_of_upper - y_top_of_lower
+            
+            if zone_y_height < 1.5:
+                # Not enough vertical space for flex cuts; place them anyway at midpoint
+                zone_y_center = (row_info[r][0] + row_info[r + 1][0]) / 2.0
+                zone_y_height = abs(row_info[r + 1][0] - row_info[r][0]) * 0.3
+                if zone_y_height < 1.0:
+                    continue
+            
+            # X extent of the flex zone = full panel width minus a small inset
+            inset = panel_border_mm * 0.5
+            zone_x_min = x_min + inset
+            zone_x_max = x_max - inset
+            zone_width = zone_x_max - zone_x_min
+            if zone_width < slot_length_mm:
+                continue
+            
+            # Place n_slot_lines parallel horizontal lines of staggered slots
+            total_lines_span = (n_slot_lines - 1) * slot_line_gap
+            
+            for line_k in range(n_slot_lines):
+                line_y = zone_y_center - total_lines_span / 2.0 + line_k * slot_line_gap
+                
+                # Stagger odd lines by half a stride
+                stride = slot_length_mm + slot_gap_mm
+                stagger = (stride / 2.0) if (line_k % 2 == 1) else 0.0
+                
+                x_pos = zone_x_min + stagger
+                while x_pos + slot_length_mm <= zone_x_max:
+                    x1 = x_pos
+                    x2 = x_pos + slot_length_mm
+                    flex_cuts.append(((x1, line_y), (x2, line_y)))
+                    x_pos += stride
+        
+        # --- Build DXF ---
+        doc = ezdxf.new(dxfversion='R2010')
+        doc.units = ezdxf.units.MM
+        msp = doc.modelspace()
+        
+        # Outer panel contour
+        msp.add_lwpolyline(
+            [(x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)],
+            close=True,
+            dxfattribs={'layer': 'PANEL_OUTLINE', 'color': 7}
+        )
+        
+        # LED holes (square)
+        for cx, cy, hw, _ in led_data:
+            msp.add_lwpolyline(
+                [(cx - hw, cy - hw), (cx + hw, cy - hw),
+                 (cx + hw, cy + hw), (cx - hw, cy + hw)],
+                close=True,
+                dxfattribs={'layer': 'LED_HOLES', 'color': 1}
+            )
+        
+        # Flex cuts (horizontal living-hinge slots)
+        for (x1, y1), (x2, y2) in flex_cuts:
+            msp.add_line(
+                (x1, y1), (x2, y2),
+                dxfattribs={'layer': 'FLEX_CUTS', 'color': 3}
+            )
+        
+        # --- Save ---
+        export_dir = "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"cnc_panel_{ts}.dxf"
+        filepath = os.path.join(export_dir, filename)
+        doc.saveas(filepath)
+        
+        panel_w = x_max - x_min
+        panel_h = y_max - y_min
+        print(f"✓ Exported CNC DXF: {filename}")
+        print(f"  Custom LEDs: {len(custom_leds)}  Rows detected: {len(rows)}")
+        print(f"  Panel size: {panel_w:.1f} x {panel_h:.1f} mm")
+        print(f"  Flex zones: {max(0, len(rows)-1)}  Slots: {len(flex_cuts)}")
+        print(f"  Layers: PANEL_OUTLINE, LED_HOLES, FLEX_CUTS")
+        print(f"  Path: {os.path.abspath(filepath)}")
+        return filepath
+    
     with individual_leds_folder:
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Add New Individual LED</div>")
         server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Add single LEDs with custom position, rotation, and size</div>")
@@ -4169,6 +6619,18 @@ def main():
         
         export_individual_leds_btn = server.gui.add_button("💾 Export to JSON", color="#4CAF50")
         
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export Cover Panel (STEP)</div>")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Superfici planari editabili in SolidWorks (selezionabili come piano, estrudibili). Una faccia per LED.</div>")
+        
+        export_stl_btn = server.gui.add_button("📦 Export Panel STEP", color="#FF9800")
+        
+        server.gui.add_html("<hr style='margin:8px 0;'>")
+        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export CNC Cutting (DXF)</div>")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>File DXF 2D per taglio CNC del pannello custom. Apribile in AutoCAD, LibreCAD, ecc.</div>")
+        
+        export_cnc_btn = server.gui.add_button("🔩 Export CNC DXF", color="#2196F3")
+        
         @add_individual_led_btn.on_click
         def _(_):
             create_individual_led()
@@ -4177,6 +6639,14 @@ def main():
         @export_individual_leds_btn.on_click
         def _(_):
             export_individual_leds_simple()
+        
+        @export_stl_btn.on_click
+        def _(_):
+            export_leds_to_stl()
+        
+        @export_cnc_btn.on_click
+        def _(_):
+            export_custom_group_dxf()
 
 
     # LED Control Matrix (individual LED and row control for base groups)
@@ -4225,6 +6695,9 @@ def main():
 
         # Assume uniform luminous flux per LED provided by GUI
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value) if 'led_lumens_slider' in globals() or True else 100.0
+        # Apply diffuser transmission loss
+        if diffuser_enable_chk.value:
+            lumens_per_led *= float(diffuser_transmission_slider.value) / 100.0
         
         # Count active LEDs to calculate rays per LED for target rays per pixel
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
@@ -4281,31 +6754,218 @@ def main():
         # Prepare parameters for worker processes
         ray_uniformity = float(ray_uniformity_slider.value) if 'ray_uniformity_slider' in globals() or True else 0.0
         
-        worker_args = []
-        for led, led_idx in active_leds:
-            params = {
+        # === GPU ACCELERATION PATH ===
+        # Lazy-init: check GPU availability on first use (not at import)
+        use_gpu = False
+        if _HAS_GPU_MODULE:
+            _ensure_gpu_init()
+            from gpu_raytrace import GPU_AVAILABLE
+            use_gpu = GPU_AVAILABLE
+        
+        if use_gpu:
+            # Prepare LED data for GPU (shared between both paths)
+            leds_data = []
+            per_led_lumens_list = []
+            for led, led_idx in active_leds:
+                leds_data.append({
+                    'position': np.array(led.position, dtype=np.float32),
+                    'direction': np.array(led.direction, dtype=np.float32),
+                    'viewing_angle': float(led.viewing_angle),
+                    'ext_lens_angle': getattr(led, 'ext_lens_angle', None),
+                    'led_idx': int(led_idx),
+                })
+                per_led_lumens_list.append(float(getattr(led, 'lumens', None) or lumens_per_led))
+            gpu_params = {
                 'wall_dist': wall_dist,
                 'rays_per_led': rays_per_led_calculated,
                 'grid_size': grid_size,
                 'wall_size': wall_size,
                 'lumens_per_led': lumens_per_led,
+                'per_led_lumens': np.array(per_led_lumens_list, dtype=np.float32),
                 'absorbers': absorbers if absorbers else [],
-                'stl_mesh_data': stl_mesh_data,
+                'stl_mesh_data': None,  # GPU always traces without mesh
                 'ray_uniformity': ray_uniformity,
-                'led_idx': led_idx,
             }
-            worker_args.append((led, params))
+            
+            if stl_mesh_data is not None:
+                # === HYBRID GPU+CPU PATH ===
+                # 1) GPU: compute full grid WITHOUT mesh absorber (fast)
+                # 2) CPU: per-LED ray generation + mesh intersection (memory-efficient)
+                # 3) Subtract absorbed lux from full grid
+                print(f"[GPU+Mesh] Hybrid mode: GPU ray trace + CPU mesh subtraction for {len(active_leds)} LEDs...")
+                import time as _time
+                t0 = _time.perf_counter()
+                
+                grid_full = gpu_process_led_wall_batch(leds_data, gpu_params)
+                t_gpu = _time.perf_counter()
+                print(f"  GPU full grid: {t_gpu - t0:.2f}s")
+                
+                # Build BVH once for mesh intersection
+                accel = _prepare_mesh_ray_accelerator(stl_mesh_data)
+                t_bvh = _time.perf_counter()
+                print(f"  BVH built in {t_bvh - t_gpu:.2f}s")
+                
+                cell_size = wall_size / grid_size
+                cell_area_m2 = (cell_size * cell_size) / 10000.0
+                half_size = wall_size / 2
+                absorbed_grid = np.zeros((grid_size, grid_size))
+                total_candidate_rays = 0
+                total_mesh_hits = 0
+                
+                # Process each LED sequentially (inner _batch_ray_mesh_intersection
+                # already parallelizes across CPU cores via ThreadPoolExecutor)
+                for led_i, (led, led_idx) in enumerate(active_leds):
+                    t_led = _time.perf_counter()
+                    led_lumens_val = float(getattr(led, 'lumens', None) or lumens_per_led)
+                    np.random.seed((42 + led_idx) % (2**32))
+                    
+                    z_axis = led.direction
+                    if abs(z_axis[2]) < 0.9:
+                        x_axis = np.cross(z_axis, [0, 0, 1])
+                    else:
+                        x_axis = np.cross(z_axis, [0, 1, 0])
+                    x_axis = x_axis / np.linalg.norm(x_axis)
+                    y_axis = np.cross(z_axis, x_axis)
+                    
+                    n = _get_effective_n(led, ray_uniformity)
+                    max_theta = np.radians(led.viewing_angle / 2.0)
+                    cos_max = np.cos(max_theta)
+                    
+                    u = np.random.uniform(0, 1, (rays_per_led_calculated, 2))
+                    cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+                    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                    theta = np.arccos(cos_theta)
+                    phi = 2 * np.pi * u[:, 1]
+                    
+                    sin_theta = np.sin(theta)
+                    local_dirs = np.column_stack([sin_theta * np.cos(phi), sin_theta * np.sin(phi), cos_theta])
+                    world_dirs = (local_dirs[:, 0:1] * x_axis + local_dirs[:, 1:2] * y_axis + local_dirs[:, 2:3] * z_axis)
+                    norms_d = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+                    world_dirs = world_dirs / norms_d
+                    
+                    cos_max_n1 = cos_max ** (n + 1.0)
+                    denom = 1.0 - cos_max_n1
+                    norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+                    cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+                    lumens_per_ray = (led_lumens_val / rays_per_led_calculated) * np.power(cos_theta_clamped, n) * norm_factor
+                    del u, cos_theta, theta, phi, sin_theta, local_dirs, cos_theta_clamped
+                    
+                    towards_wall = world_dirs[:, 0] > 0
+                    candidate_mask = towards_wall.copy()
+                    if absorbers:
+                        candidate_indices = np.where(candidate_mask)[0]
+                        if len(candidate_indices) > 0:
+                            origins_batch = np.broadcast_to(led.position, (len(candidate_indices), 3)).copy().astype(np.float32)
+                            dirs_batch = world_dirs[candidate_indices].astype(np.float32)
+                            absorbed = _ray_box_intersection_batch_np(origins_batch, dirs_batch, absorbers)
+                            candidate_mask[candidate_indices[absorbed]] = False
+                    
+                    towards_indices = np.where(candidate_mask)[0]
+                    if len(towards_indices) == 0:
+                        continue
+                    
+                    n_cand = len(towards_indices)
+                    total_candidate_rays += n_cand
+                    
+                    origins = np.tile(led.position, (n_cand, 1)).astype(np.float64)
+                    cand_dirs = world_dirs[towards_indices].astype(np.float64)
+                    cand_lumens = lumens_per_ray[towards_indices]
+                    del world_dirs, lumens_per_ray
+                    
+                    mesh_hits = _batch_ray_mesh_intersection(origins, cand_dirs, accel)
+                    n_hits = int(np.sum(mesh_hits))
+                    total_mesh_hits += n_hits
+                    
+                    if n_hits > 0:
+                        hit_dirs = cand_dirs[mesh_hits]
+                        hit_lumens = cand_lumens[mesh_hits]
+                        hit_origins = origins[mesh_hits]
+                        t_wall = (wall_dist - led.position[0]) / hit_dirs[:, 0]
+                        pos_t = t_wall > 0
+                        if np.any(pos_t):
+                            t_pos = t_wall[pos_t]
+                            hit_y = hit_origins[pos_t, 1] + hit_dirs[pos_t, 1] * t_pos
+                            hit_z = hit_origins[pos_t, 2] + hit_dirs[pos_t, 2] * t_pos
+                            grid_y = ((hit_y + half_size) / cell_size).astype(int)
+                            grid_z = ((hit_z + half_size) / cell_size).astype(int)
+                            in_bounds = (grid_y >= 0) & (grid_y < grid_size) & (grid_z >= 0) & (grid_z < grid_size)
+                            np.add.at(absorbed_grid, (grid_z[in_bounds], grid_y[in_bounds]),
+                                      hit_lumens[pos_t][in_bounds] / cell_area_m2)
+                    
+                    del origins, cand_dirs, cand_lumens, mesh_hits
+                    dt = _time.perf_counter() - t_led
+                    if dt > 0.3:
+                        print(f"    LED {led_i+1}/{len(active_leds)}: {n_cand:,} rays, {n_hits:,} hits, {dt:.2f}s")
+                
+                grid = np.maximum(0, grid_full - absorbed_grid)
+                t_total = _time.perf_counter() - t0
+                absorbed_pct = np.sum(absorbed_grid) / max(np.sum(grid_full), 1e-10) * 100
+                print(f"  Mesh subtraction: {t_total - (t_gpu - t0):.2f}s "
+                      f"({total_mesh_hits:,} hits / {total_candidate_rays:,} rays, {absorbed_pct:.1f}% absorbed)")
+                print(f"  Total hybrid: {t_total:.2f}s\n")
+            else:
+                # === PURE GPU PATH (no mesh) ===
+                print(f"[GPU] Using NVIDIA CUDA acceleration for {len(active_leds)} LEDs...")
+                grid = gpu_process_led_wall_batch(leds_data, gpu_params)
+                print(f"GPU ray tracing complete!\n")
+            return grid, wall_size
         
-        # Use multiprocessing to parallelize LED processing
-        num_processes = min(multiprocessing.cpu_count(), len(active_leds))
-        print(f"Using {num_processes} CPU cores to process {len(active_leds)} LEDs in parallel...")
-        
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            results = pool.map(_process_led_wall_worker, worker_args)
-        
-        # Aggregate results from all workers
-        for local_grid in results:
-            grid += local_grid
+        # === CPU FALLBACK (no GPU available) ===
+        if stl_mesh_data is not None:
+            print(f"STL mesh active → sequential mode (inner mesh queries use multi-thread BVH)")
+            import time as _time
+            t0 = _time.perf_counter()
+            
+            # Pre-build accelerator ONCE
+            accel = _prepare_mesh_ray_accelerator(stl_mesh_data)
+            t_bvh = _time.perf_counter()
+            print(f"  BVH built in {t_bvh - t0:.2f}s")
+            
+            # Process LEDs sequentially (inner _batch_ray_mesh_intersection
+            # already parallelizes across CPU cores)
+            for led, led_idx in active_leds:
+                params = {
+                    'wall_dist': wall_dist,
+                    'rays_per_led': rays_per_led_calculated,
+                    'grid_size': grid_size,
+                    'wall_size': wall_size,
+                    'lumens_per_led': lumens_per_led,
+                    'absorbers': absorbers if absorbers else [],
+                    'stl_mesh_data': None,
+                    'ray_uniformity': ray_uniformity,
+                    'led_idx': led_idx,
+                }
+                local_grid = _process_led_wall_worker_with_accel((led, params), accel)
+                grid += local_grid
+            
+            t_total = _time.perf_counter() - t0
+            print(f"  Ray tracing complete in {t_total:.2f}s (BVH: {t_bvh - t0:.2f}s, tracing: {t_total - (t_bvh - t0):.2f}s)\n")
+        else:
+            worker_args = []
+            for led, led_idx in active_leds:
+                params = {
+                    'wall_dist': wall_dist,
+                    'rays_per_led': rays_per_led_calculated,
+                    'grid_size': grid_size,
+                    'wall_size': wall_size,
+                    'lumens_per_led': lumens_per_led,
+                    'absorbers': absorbers if absorbers else [],
+                    'stl_mesh_data': stl_mesh_data,
+                    'ray_uniformity': ray_uniformity,
+                    'led_idx': led_idx,
+                }
+                worker_args.append((led, params))
+            
+            # Use multiprocessing to parallelize LED processing
+            num_processes = min(multiprocessing.cpu_count(), len(active_leds))
+            print(f"Using {num_processes} CPU cores to process {len(active_leds)} LEDs in parallel...")
+            
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                results = pool.map(_process_led_wall_worker, worker_args)
+            
+            # Aggregate results from all workers
+            for local_grid in results:
+                grid += local_grid
         
         print(f"Ray tracing complete!\n")
 
@@ -4372,6 +7032,9 @@ def main():
                                  'grid_y': front_grid_y, 'grid_z': front_grid_z}
         
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
+        # Apply diffuser transmission loss
+        if diffuser_enable_chk.value:
+            lumens_per_led *= float(diffuser_transmission_slider.value) / 100.0
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
         if num_active_leds == 0:
             return grids, wall_specs
@@ -4401,6 +7064,13 @@ def main():
         # Get ray uniformity from slider
         ray_uniformity = float(ray_uniformity_slider.value) if 'ray_uniformity_slider' in globals() else 0.0
         
+        # Get reflection settings
+        _refl_enabled = reflections_enable.value
+        _refl_bounces = int(max_bounces_slider_room.value) if _refl_enabled else 0
+        _refl_rho = float(custom_reflectance_slider.value) if _refl_enabled else 0.0
+        if _refl_enabled:
+            print(f"Reflections: ON (\u03c1={_refl_rho:.2f}, max {_refl_bounces} bounces)")
+        
         # Prepare grid shapes for workers
         grid_shapes = {
             'front': grids['front'].shape,
@@ -4412,42 +7082,337 @@ def main():
         if back_dist is not None:
             grid_shapes['back'] = grids['back'].shape
         
-        # Package parameters for workers
-        worker_params = {
-            'front_dist': front_dist,
-            'side_dist': side_dist,
-            'top_bottom_dist': top_bottom_dist,
-            'back_dist': back_dist,
-            'led_x_center': circle_center_slider.value,
-            'num_rays_per_led': num_rays_per_led,
-            'grid_size': grid_size,
-            'lumens_per_led': lumens_per_led,
-            'absorbers': absorbers if absorbers else [],
-            'stl_mesh_data': stl_mesh_data,
-            'ray_uniformity': ray_uniformity,
-            'grid_shapes': grid_shapes,
-            'wall_specs': wall_specs
-        }
+        # === GPU ACCELERATION PATH (room mode) ===
+        use_gpu = False
+        if _HAS_GPU_MODULE:
+            _ensure_gpu_init()
+            from gpu_raytrace import GPU_AVAILABLE
+            use_gpu = GPU_AVAILABLE
         
-        # Prepare arguments for each LED
-        led_args = [(led, worker_params) for led in active_leds]
-        
-        # Use multiprocessing to parallelize LED processing
-        num_processes = min(multiprocessing.cpu_count(), len(active_leds))
-        print(f"Using {num_processes} CPU cores for parallel ray tracing...")
-        
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            results = pool.map(_process_led_worker, led_args)
-        
-        # Combine results from all workers
-        for led_grids, led_ray_hits, led_total_rays in results:
-            for wall_name in grids.keys():
-                grids[wall_name] += led_grids[wall_name]
-                ray_hits[wall_name] += led_ray_hits[wall_name]
-            total_rays += led_total_rays
+        if use_gpu:
+            # Prepare LED data for GPU
+            leds_data = []
+            per_led_lumens_list = []
+            for led in active_leds:
+                leds_data.append({
+                    'position': np.array(led.position, dtype=np.float32),
+                    'direction': np.array(led.direction, dtype=np.float32),
+                    'viewing_angle': float(led.viewing_angle),
+                    'ext_lens_angle': getattr(led, 'ext_lens_angle', None),
+                })
+                _lm = float(getattr(led, 'lumens', None) or lumens_per_led)
+                if diffuser_enable_chk.value and getattr(led, 'lumens', None) is not None:
+                    _lm *= float(diffuser_transmission_slider.value) / 100.0
+                per_led_lumens_list.append(_lm)
+            gpu_params = {
+                'front_dist': front_dist,
+                'side_dist': side_dist,
+                'top_bottom_dist': top_bottom_dist,
+                'back_dist': back_dist,
+                'led_x_center': circle_center_slider.value,
+                'num_rays_per_led': num_rays_per_led,
+                'grid_size': grid_size,
+                'lumens_per_led': lumens_per_led,
+                'per_led_lumens': np.array(per_led_lumens_list, dtype=np.float32),
+                'absorbers': absorbers if absorbers else [],
+                'stl_mesh_data': None,  # GPU always traces without mesh
+                'ray_uniformity': ray_uniformity,
+                'grid_shapes': grid_shapes,
+                'wall_specs': wall_specs,
+                'max_bounces': _refl_bounces,
+                'wall_reflectance': _refl_rho,
+            }
+            
+            if stl_mesh_data is not None:
+                # === HYBRID GPU+CPU PATH (room mode) ===
+                print(f"[GPU+Mesh] Hybrid room mode: GPU ray trace + CPU mesh subtraction for {len(active_leds)} LEDs...")
+                import time as _time
+                t0 = _time.perf_counter()
+                
+                gpu_grids, gpu_hits, total_rays = gpu_process_room_batch(leds_data, gpu_params)
+                for wall_name in grids.keys():
+                    grids[wall_name] = gpu_grids[wall_name]
+                    ray_hits[wall_name] = gpu_hits.get(wall_name, 0)
+                t_gpu = _time.perf_counter()
+                print(f"  GPU full grids: {t_gpu - t0:.2f}s")
+                
+                # Build BVH once
+                accel = _prepare_mesh_ray_accelerator(stl_mesh_data)
+                t_bvh = _time.perf_counter()
+                print(f"  BVH built in {t_bvh - t_gpu:.2f}s")
+                
+                # Pre-compute cell areas
+                cell_areas_m2 = {}
+                for wall_name, spec in wall_specs.items():
+                    if wall_name in ('front', 'back'):
+                        cw = spec['size_y'] / spec['grid_y']
+                        ch = spec['size_z'] / spec['grid_z']
+                    elif wall_name in ('left', 'right'):
+                        cw = spec['size_x'] / spec['grid_x']
+                        ch = spec['size_z'] / spec['grid_z']
+                    else:
+                        cw = spec['size_x'] / spec['grid_x']
+                        ch = spec['size_y'] / spec['grid_y']
+                    cell_areas_m2[wall_name] = (cw * ch) / 10000.0
+                
+                rays_per_led = num_rays_per_led * grid_size * grid_size
+                absorbed_grids = {wn: np.zeros_like(g) for wn, g in grids.items()}
+                total_candidate_rays = 0
+                total_mesh_hits = 0
+                
+                # Process each LED independently to keep memory low
+                for led_i, led in enumerate(active_leds):
+                    t_led = _time.perf_counter()
+                    led_lumens_val = float(getattr(led, 'lumens', None) or lumens_per_led)
+                    np.random.seed(42)
+                    
+                    z_axis = led.direction
+                    if abs(z_axis[2]) < 0.9:
+                        x_axis = np.cross(z_axis, [0, 0, 1])
+                    else:
+                        x_axis = np.cross(z_axis, [0, 1, 0])
+                    x_axis = x_axis / np.linalg.norm(x_axis)
+                    y_axis = np.cross(z_axis, x_axis)
+                    
+                    n = _get_effective_n(led, ray_uniformity)
+                    max_theta = np.radians(led.viewing_angle / 2.0)
+                    cos_max = np.cos(max_theta)
+                    
+                    u = np.random.uniform(0, 1, (rays_per_led, 2))
+                    cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+                    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                    theta = np.arccos(cos_theta)
+                    phi = 2 * np.pi * u[:, 1]
+                    
+                    sin_theta = np.sin(theta)
+                    local_dirs = np.column_stack([sin_theta * np.cos(phi), sin_theta * np.sin(phi), cos_theta])
+                    world_dirs = (local_dirs[:, 0:1] * x_axis + local_dirs[:, 1:2] * y_axis + local_dirs[:, 2:3] * z_axis)
+                    norms_d = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+                    world_dirs = world_dirs / norms_d
+                    
+                    cos_max_n1 = cos_max ** (n + 1.0)
+                    denom = 1.0 - cos_max_n1
+                    norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+                    cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+                    lumens_per_ray = (led_lumens_val / rays_per_led) * np.power(cos_theta_clamped, n) * norm_factor
+                    
+                    del u, cos_theta, theta, phi, sin_theta, local_dirs, cos_theta_clamped
+                    
+                    n_cand = rays_per_led
+                    total_candidate_rays += n_cand
+                    
+                    origins = np.tile(led.position, (n_cand, 1)).astype(np.float64)
+                    cand_dirs = world_dirs.astype(np.float64)
+                    del world_dirs
+                    
+                    mesh_hits = _batch_ray_mesh_intersection(origins, cand_dirs, accel)
+                    n_hits = int(np.sum(mesh_hits))
+                    total_mesh_hits += n_hits
+                    
+                    if n_hits > 0:
+                        hit_dirs = cand_dirs[mesh_hits]
+                        hit_lumens = lumens_per_ray[mesh_hits]
+                        hit_pos = origins[mesh_hits]
+                        
+                        dx = hit_dirs[:, 0]
+                        dy = hit_dirs[:, 1]
+                        dz = hit_dirs[:, 2]
+                        ox = hit_pos[:, 0]
+                        oy = hit_pos[:, 1]
+                        oz = hit_pos[:, 2]
+                        
+                        INF = 1e30
+                        best_t = np.full(n_hits, INF)
+                        best_wall = np.full(n_hits, -1, dtype=int)
+                        best_c1 = np.zeros(n_hits)
+                        best_c2 = np.zeros(n_hits)
+                        
+                        # Front wall
+                        mask_f = dx > 0
+                        if np.any(mask_f):
+                            t_f = (front_dist - ox[mask_f]) / dx[mask_f]
+                            y_f = oy[mask_f] + dy[mask_f] * t_f
+                            z_f = oz[mask_f] + dz[mask_f] * t_f
+                            better = mask_f.copy()
+                            better[mask_f] &= (t_f > 0) & (t_f < best_t[mask_f])
+                            best_t[better] = t_f[better[mask_f]]
+                            best_wall[better] = 0
+                            best_c1[better] = y_f[better[mask_f]]
+                            best_c2[better] = z_f[better[mask_f]]
+                        
+                        # Left wall
+                        mask_l = dy < 0
+                        if np.any(mask_l):
+                            t_l = (-side_dist - oy[mask_l]) / dy[mask_l]
+                            x_l = ox[mask_l] + dx[mask_l] * t_l
+                            z_l = oz[mask_l] + dz[mask_l] * t_l
+                            better = mask_l.copy()
+                            better[mask_l] &= (t_l > 0) & (t_l < best_t[mask_l])
+                            best_t[better] = t_l[better[mask_l]]
+                            best_wall[better] = 1
+                            best_c1[better] = x_l[better[mask_l]]
+                            best_c2[better] = z_l[better[mask_l]]
+                        
+                        # Right wall
+                        mask_r = dy > 0
+                        if np.any(mask_r):
+                            t_r = (side_dist - oy[mask_r]) / dy[mask_r]
+                            x_r = ox[mask_r] + dx[mask_r] * t_r
+                            z_r = oz[mask_r] + dz[mask_r] * t_r
+                            better = mask_r.copy()
+                            better[mask_r] &= (t_r > 0) & (t_r < best_t[mask_r])
+                            best_t[better] = t_r[better[mask_r]]
+                            best_wall[better] = 2
+                            best_c1[better] = x_r[better[mask_r]]
+                            best_c2[better] = z_r[better[mask_r]]
+                        
+                        # Top wall
+                        mask_t = dz > 0
+                        if np.any(mask_t):
+                            t_t = (top_bottom_dist - oz[mask_t]) / dz[mask_t]
+                            x_t = ox[mask_t] + dx[mask_t] * t_t
+                            y_t = oy[mask_t] + dy[mask_t] * t_t
+                            better = mask_t.copy()
+                            better[mask_t] &= (t_t > 0) & (t_t < best_t[mask_t])
+                            best_t[better] = t_t[better[mask_t]]
+                            best_wall[better] = 3
+                            best_c1[better] = x_t[better[mask_t]]
+                            best_c2[better] = y_t[better[mask_t]]
+                        
+                        # Bottom wall
+                        mask_b = dz < 0
+                        if np.any(mask_b):
+                            t_b = (-top_bottom_dist - oz[mask_b]) / dz[mask_b]
+                            x_b = ox[mask_b] + dx[mask_b] * t_b
+                            y_b = oy[mask_b] + dy[mask_b] * t_b
+                            better = mask_b.copy()
+                            better[mask_b] &= (t_b > 0) & (t_b < best_t[mask_b])
+                            best_t[better] = t_b[better[mask_b]]
+                            best_wall[better] = 4
+                            best_c1[better] = x_b[better[mask_b]]
+                            best_c2[better] = y_b[better[mask_b]]
+                        
+                        # Back wall
+                        if back_dist is not None:
+                            mask_bk = dx < 0
+                            if np.any(mask_bk):
+                                t_bk = (-back_dist - ox[mask_bk]) / dx[mask_bk]
+                                y_bk = oy[mask_bk] + dy[mask_bk] * t_bk
+                                z_bk = oz[mask_bk] + dz[mask_bk] * t_bk
+                                better = mask_bk.copy()
+                                better[mask_bk] &= (t_bk > 0) & (t_bk < best_t[mask_bk])
+                                best_t[better] = t_bk[better[mask_bk]]
+                                best_wall[better] = 5
+                                best_c1[better] = y_bk[better[mask_bk]]
+                                best_c2[better] = z_bk[better[mask_bk]]
+                        
+                        # Scatter absorbed lux into per-wall grids
+                        wall_configs = [(0, 'front'), (1, 'left'), (2, 'right'), (3, 'top'), (4, 'bottom')]
+                        if back_dist is not None:
+                            wall_configs.append((5, 'back'))
+                        
+                        for wall_id, wall_name in wall_configs:
+                            w_mask = best_wall == wall_id
+                            if not np.any(w_mask):
+                                continue
+                            c1 = best_c1[w_mask]
+                            c2 = best_c2[w_mask]
+                            ray_lux = hit_lumens[w_mask] / cell_areas_m2[wall_name]
+                            spec = wall_specs[wall_name]
+                            shape = absorbed_grids[wall_name].shape
+                            if wall_name in ('front', 'back'):
+                                gi = ((c1 + spec['size_y'] / 2) / (spec['size_y'] / spec['grid_y'])).astype(int)
+                                gj = ((c2 + spec['size_z'] / 2) / (spec['size_z'] / spec['grid_z'])).astype(int)
+                            elif wall_name in ('left', 'right'):
+                                gi = ((c1 - spec['x_min']) / (spec['size_x'] / spec['grid_x'])).astype(int)
+                                gj = ((c2 + spec['size_z'] / 2) / (spec['size_z'] / spec['grid_z'])).astype(int)
+                            else:
+                                gi = ((c1 - spec['x_min']) / (spec['size_x'] / spec['grid_x'])).astype(int)
+                                gj = ((c2 + spec['size_y'] / 2) / (spec['size_y'] / spec['grid_y'])).astype(int)
+                            row = np.clip(gj, 0, shape[0] - 1)
+                            col = np.clip(gi, 0, shape[1] - 1)
+                            np.add.at(absorbed_grids[wall_name], (row, col), ray_lux)
+                    
+                    del origins, cand_dirs, lumens_per_ray, mesh_hits
+                    dt = _time.perf_counter() - t_led
+                    if dt > 0.3:
+                        print(f"    LED {led_i+1}/{len(active_leds)}: {n_cand:,} rays, {n_hits:,} hits, {dt:.2f}s")
+                
+                # Subtract absorbed from full grids
+                for wall_name in grids.keys():
+                    grids[wall_name] = np.maximum(0, grids[wall_name] - absorbed_grids[wall_name])
+                
+                t_total = _time.perf_counter() - t0
+                absorbed_total = sum(np.sum(a) for a in absorbed_grids.values())
+                full_total = max(sum(np.sum(g) for g in grids.values()), 1e-10)
+                print(f"  Mesh subtraction: {t_total - (t_gpu - t0):.2f}s "
+                      f"({total_mesh_hits:,} hits / {total_candidate_rays:,} rays)")
+                print(f"  Total hybrid room: {t_total:.2f}s\n")
+            else:
+                # === PURE GPU PATH (no mesh) ===
+                print(f"[GPU] Using NVIDIA CUDA acceleration for room mode ({len(active_leds)} LEDs)...")
+                gpu_grids, gpu_hits, total_rays = gpu_process_room_batch(leds_data, gpu_params)
+                for wall_name in grids.keys():
+                    grids[wall_name] = gpu_grids[wall_name]
+                    ray_hits[wall_name] = gpu_hits.get(wall_name, 0)
+        else:
+            # === CPU FALLBACK ===
+            # Package parameters for workers
+            worker_params = {
+                'front_dist': front_dist,
+                'side_dist': side_dist,
+                'top_bottom_dist': top_bottom_dist,
+                'back_dist': back_dist,
+                'led_x_center': circle_center_slider.value,
+                'num_rays_per_led': num_rays_per_led,
+                'grid_size': grid_size,
+                'lumens_per_led': lumens_per_led,
+                'absorbers': absorbers if absorbers else [],
+                'stl_mesh_data': stl_mesh_data,
+                'ray_uniformity': ray_uniformity,
+                'grid_shapes': grid_shapes,
+                'wall_specs': wall_specs,
+                'max_bounces': _refl_bounces,
+                'wall_reflectance': _refl_rho,
+            }
+            
+            led_args = []
+            import copy as _copy
+            _diff_trans_cpu = float(diffuser_transmission_slider.value) / 100.0 if diffuser_enable_chk.value else 1.0
+            for led in active_leds:
+                _led = _copy.copy(led)
+                if _diff_trans_cpu < 1.0 and _led.lumens is not None:
+                    _led.lumens = _led.lumens * _diff_trans_cpu
+                led_args.append((_led, worker_params))
+            
+            if stl_mesh_data is not None:
+                # Sequential mode: build BVH ONCE, reuse for all LEDs
+                # (inner _batch_ray_mesh_intersection already parallelizes across CPU cores)
+                print(f"[STL] Building BVH once for {len(active_leds)} LEDs...")
+                accel = _prepare_mesh_ray_accelerator(stl_mesh_data)
+                for led_arg in led_args:
+                    led_grids, led_ray_hits, led_total_rays = _process_led_worker_with_accel(led_arg, accel)
+                    for wall_name in grids.keys():
+                        grids[wall_name] += led_grids[wall_name]
+                        ray_hits[wall_name] += led_ray_hits[wall_name]
+                    total_rays += led_total_rays
+            else:
+                # Multiprocessing: no mesh, safe to parallelize
+                num_processes = min(multiprocessing.cpu_count(), len(active_leds))
+                print(f"Using {num_processes} CPU cores for parallel ray tracing...")
+                
+                with multiprocessing.Pool(processes=num_processes) as pool:
+                    results = pool.map(_process_led_worker, led_args)
+                
+                # Combine results from all workers
+                for led_grids, led_ray_hits, led_total_rays in results:
+                    for wall_name in grids.keys():
+                        grids[wall_name] += led_grids[wall_name]
+                        ray_hits[wall_name] += led_ray_hits[wall_name]
+                    total_rays += led_total_rays
         
         # Print summary
-        total_emitted = num_active_leds * lumens_per_led
+        total_emitted = sum(float(getattr(led, 'lumens', None) or lumens_per_led) for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
         total_on_walls = sum(grid.sum() for grid in grids.values())
         conservation_pct = (total_on_walls / total_emitted * 100) if total_emitted > 0 else 0
         
@@ -4613,6 +7578,11 @@ def main():
                 if original_row_dirs:
                     rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
                     config['led_row_directions'] = rotated_row_dirs
+            # Pass lumens override for custom group
+            if group.get('lumens_override') and group['lumens_override'].value:
+                config['lumens_override'] = float(group['lumens_value'].value)
+            else:
+                config['lumens_override'] = None
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -4630,7 +7600,17 @@ def main():
                 'size': led['size'].value,
                 'viewing_angle': led['viewing_angle'].value,
                 'square_roll': led['square_roll'].value,
+                'beam_tilt': led['beam_tilt'].value,
             }
+            # Pass lumens override for individual LED
+            if led.get('lumens_override') and led['lumens_override'].value:
+                config['lumens_override'] = float(led['lumens_value'].value)
+            else:
+                config['lumens_override'] = None
+            # Pass external lens settings
+            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
+                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
+                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
             individual_leds_configs.append(config)
         
         leds = create_leds(
@@ -4649,6 +7629,15 @@ def main():
             create_base_groups=any(led_states[:48]),
         )
         
+        # ── Apply diffuser lens effect (FOV camera) ──
+        if diffuser_enable_chk.value:
+            _diff_angle = float(diffuser_angle_slider.value)
+            _diff_trans = float(diffuser_transmission_slider.value) / 100.0
+            for led in leds:
+                led.viewing_angle = max(led.viewing_angle, _diff_angle)
+                if led.lumens is not None:
+                    led.lumens = led.lumens * _diff_trans
+
         # Build absorbers
         absorbers = []
         angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
@@ -4735,6 +7724,9 @@ def main():
         
         # Ray tracing for FOV region
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
+        # Apply diffuser transmission loss
+        if diffuser_enable_chk.value:
+            lumens_per_led *= float(diffuser_transmission_slider.value) / 100.0
         rays_per_pixel = int(intensity_rays_slider.value)
         
         # Count active LEDs
@@ -4751,6 +7743,37 @@ def main():
         print(f"Active LEDs: {num_active_leds}, Rays per LED: {num_rays_per_led}, Total rays: {num_active_leds * num_rays_per_led}")
         print(f"Target: {rays_per_pixel} rays/pixel, Actual: {(num_active_leds * num_rays_per_led) / total_pixels:.2f} rays/pixel")
         
+        # Pre-build STL mesh accelerator ONCE (outside LED loop)
+        fov_stl_accel = None
+        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
+            mesh_obj = stl_mesh_data[0]
+            transform = np.eye(4)
+            scale = float(stl_scale.value)
+            if np.isfinite(scale) and scale > 0:
+                transform[:3, :3] *= scale
+            rot_x_v = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
+            rot_y_v = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0
+            rot_z_v = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
+            if rot_x_v != 0:
+                transform = _rot4_x(np.radians(rot_x_v)) @ transform
+            if rot_y_v != 0:
+                transform = _rot4_y(np.radians(rot_y_v)) @ transform
+            if rot_z_v != 0:
+                transform = _rot4_z(np.radians(rot_z_v)) @ transform
+            pos_xv = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
+            pos_yv = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
+            pos_zv = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
+            transform[:3, 3] = [pos_xv, pos_yv, pos_zv]
+            fov_mesh_data = {
+                'vertices': mesh_obj.vertices,
+                'faces': mesh_obj.faces,
+                'transform': transform,
+            }
+            fov_stl_accel = _prepare_mesh_ray_accelerator(fov_mesh_data)
+            print(f"STL mesh absorber active ({len(mesh_obj.faces)} triangles)")
+        
+        led_total_lumens_emitted = 0.0
+        
         for led_idx, led in enumerate(leds):
             if hasattr(led, 'enabled') and not led.enabled:
                 continue
@@ -4766,178 +7789,84 @@ def main():
             x_axis = x_axis / np.linalg.norm(x_axis)
             y_axis = np.cross(z_axis, x_axis)
             
-            # IMPORTANT: viewing_angle defines the full emission cone angle
-            # LEDs emit rays within the full viewing_angle cone
-            # Calculate exponent n so that intensity drops to 50% at viewing_angle/2
-            # I(θ) = I₀ × cos^n(θ), at θ_half: 0.5 = cos^n(θ_half)
-            # n = ln(0.5) / ln(cos(θ_half))
-            
-            # Maximum emission angle is viewing_angle/2 (half-angle from center)
-            max_theta = np.radians(led.viewing_angle / 2.0)  # Use full viewing angle
-            
-            # Calculate n from viewing angle
-            theta_half = np.radians(led.viewing_angle / 2.0)
-            cos_half = np.cos(theta_half)
-            
-            # Calculate base exponent for this viewing angle
-            if cos_half > 0.01:
-                n_base = np.log(0.5) / np.log(cos_half)
-                # Clamp n_base to reasonable range to avoid numerical issues
-                n_base = np.clip(n_base, 0.1, 10.0)
-            else:
-                n_base = 1.0
-            
-            # Apply uniformity factor to make beam more focused if desired
             uniformity = float(ray_uniformity_slider.value)
-            n = n_base * (1.0 + uniformity * 2.0)
-            n = np.clip(n, 0.1, 30.0)  # Final safety clamp
+            n = _get_effective_n(led, uniformity)
+            max_theta = np.radians(led.viewing_angle / 2.0)
+            cos_max = np.cos(max_theta)
             
-            # Calculate normalization factor for uniform solid angle sampling with cos^n(θ) weighting
-            # For hemisphere (0 to 90°): norm_factor = (n+1)
-            # PHYSICS: Each ray = I₀ × cos^n(θ) × dΩ where dΩ = 2π/N
-            # With I₀ = Φ×(n+1)/(2π), we get: lumens_per_ray = Φ×(n+1)×cos^n(θ)/N
-            norm_factor = n + 1.0
+            # --- Generate ALL rays for this LED at once ---
+            u = np.random.uniform(0, 1, (num_rays_per_led, 2))
+            cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
+            cos_theta = np.clip(cos_theta, -1.0, 1.0)
+            theta = np.arccos(cos_theta)
+            phi = 2 * np.pi * u[:, 1]
             
-            led_total_lumens_emitted = 0.0  # Track for verification
+            sin_theta = np.sin(theta)
+            local_dirs = np.column_stack([
+                sin_theta * np.cos(phi),
+                sin_theta * np.sin(phi),
+                cos_theta,
+            ])
             
-            for _ in range(num_rays_per_led):
-                # Uniform sampling in solid angle (physically correct)
-                u1, u2 = np.random.uniform(0, 1, 2)
+            world_dirs = (local_dirs[:, 0:1] * x_axis +
+                          local_dirs[:, 1:2] * y_axis +
+                          local_dirs[:, 2:3] * z_axis)
+            norms_wd = np.linalg.norm(world_dirs, axis=1, keepdims=True)
+            world_dirs = world_dirs / norms_wd
+            
+            # Calculate lumens per ray with cone normalization and lens efficiency
+            cos_max_n1 = cos_max ** (n + 1.0)
+            denom = 1.0 - cos_max_n1
+            norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+            cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
+            intensity_coefficients = np.power(cos_theta_clamped, n)
+            fov_led_lumens = float(getattr(led, 'lumens', None) or lumens_per_led)
+            lumens_per_ray_arr = (fov_led_lumens / max(1, num_rays_per_led)) * intensity_coefficients * norm_factor
+            led_total_lumens_emitted += np.sum(lumens_per_ray_arr)
+            
+            # --- Check box absorber intersection (vectorized) ---
+            hit_absorbed = np.zeros(num_rays_per_led, dtype=bool)
+            if absorbers:
+                ray_origins = np.broadcast_to(led.position, (num_rays_per_led, 3)).copy().astype(np.float32)
+                hit_absorbed = _ray_box_intersection_batch_np(ray_origins, world_dirs.astype(np.float32), absorbers)
+            
+            # --- Batch STL mesh intersection ---
+            if fov_stl_accel is not None:
+                not_abs = np.where(~hit_absorbed)[0]
+                if len(not_abs) > 0:
+                    origins = np.tile(led.position, (len(not_abs), 1)).astype(np.float64)
+                    mesh_hits = _batch_ray_mesh_intersection(origins, world_dirs[not_abs], fov_stl_accel)
+                    hit_absorbed[not_abs[mesh_hits]] = True
+            
+            # --- Wall hits ---
+            alive = ~hit_absorbed
+            towards_wall = world_dirs[:, 0] > 0
+            valid = alive & towards_wall
+            vi = np.where(valid)[0]
+            
+            if len(vi) > 0:
+                t = (wall_dist - led.position[0]) / world_dirs[vi, 0]
+                pos_t = t > 0
+                vi2 = vi[pos_t]
+                t2 = t[pos_t]
                 
-                # Sample uniformly within hemisphere (0 to 90°)
-                cos_max = np.cos(max_theta)
-                cos_theta = 1.0 - u1 * (1.0 - cos_max)
-                cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                theta = np.arccos(cos_theta)
-                phi = 2 * np.pi * u2
+                hit_y = led.position[1] + world_dirs[vi2, 1] * t2
+                hit_z = led.position[2] + world_dirs[vi2, 2] * t2
                 
-                local_dir = np.array([
-                    np.sin(theta) * np.cos(phi),
-                    np.sin(theta) * np.sin(phi),
-                    np.cos(theta),
-                ])
-                world_dir = (
-                    local_dir[0] * x_axis
-                    + local_dir[1] * y_axis
-                    + local_dir[2] * z_axis
-                )
-                world_dir = world_dir / np.linalg.norm(world_dir)
+                half_w = fov_width_cm / 2
+                half_h = fov_height_cm / 2
                 
-                # Calculate lumens carried by this specific ray (emission in this direction)
-                cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
-                intensity_coefficient = np.power(cos_theta_clamped, n)
-                lumens_per_ray = (lumens_per_led / max(1, num_rays_per_led)) * intensity_coefficient * norm_factor
-                led_total_lumens_emitted += lumens_per_ray
+                in_fov = (hit_y >= -half_w) & (hit_y <= half_w) & (hit_z >= -half_h) & (hit_z <= half_h)
+                fi = np.where(in_fov)[0]
                 
-                # Check absorber intersection
-                def ray_box_intersection(pos, direction, box):
-                    center = np.array(box['center'], dtype=float)
-                    half = np.array(box['half_sizes'], dtype=float)
-                    rotation = box.get('rotation', None)
-                    
-                    # If box has rotation, transform ray to box's local space
-                    if rotation is not None:
-                        qw, qx, qy, qz = rotation
-                        # Convert quaternion to rotation matrix
-                        R = np.array([
-                            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
-                            [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
-                            [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
-                        ])
-                        # Transform ray to local space (inverse rotation)
-                        R_inv = R.T
-                        local_pos = R_inv @ (pos - center)
-                        local_dir = R_inv @ direction
-                        pos = local_pos
-                        direction = local_dir
-                        center = np.array([0.0, 0.0, 0.0])
-                    
-                    tmin = -np.inf
-                    tmax = np.inf
-                    for k in range(3):
-                        if abs(direction[k]) < 1e-12:
-                            if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
-                                return None
-                        else:
-                            t1 = (center[k] - half[k] - pos[k]) / direction[k]
-                            t2 = (center[k] + half[k] - pos[k]) / direction[k]
-                            t_near = min(t1, t2)
-                            t_far = max(t1, t2)
-                            tmin = max(tmin, t_near)
-                            tmax = min(tmax, t_far)
-                            if tmin > tmax:
-                                return None
-                    if tmax < 0:
-                        return None
-                    return tmin if tmin > 0 else (tmax if tmax > 0 else None)
+                grid_x = ((hit_y[fi] + half_w) / cell_size_cm).astype(int)
+                grid_y = ((hit_z[fi] + half_h) / cell_size_cm).astype(int)
                 
-                hit_absorbed = False
-                for a in absorbers:
-                    t_hit = ray_box_intersection(led.position, world_dir, a)
-                    if t_hit is not None and t_hit > 0:
-                        hit_absorbed = True
-                        break
+                in_bounds = (grid_x >= 0) & (grid_x < grid_width) & (grid_y >= 0) & (grid_y < grid_height)
+                bi = np.where(in_bounds)[0]
                 
-                # Check STL mesh intersection
-                if not hit_absorbed and stl_absorber_enable.value and stl_mesh_data[0] is not None:
-                    mesh = stl_mesh_data[0].copy()
-                    
-                    # Build transformation matrix  (same as before)
-                    transform = np.eye(4)
-                    scale = float(stl_scale.value)
-                    if np.isfinite(scale) and scale > 0:
-                        transform[:3, :3] *= scale
-                    
-                    rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
-                    rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
-                    rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
-                    
-                    if rot_x != 0:
-                        rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
-                        transform = rot_mat @ transform
-                    if rot_y != 0:
-                        rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
-                        transform = rot_mat @ transform
-                    if rot_z != 0:
-                        rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
-                        transform = rot_mat @ transform
-                    
-                    pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
-                    pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
-                    pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
-                    transform[:3, 3] = [pos_x, pos_y, pos_z]
-                    
-                    mesh_data_ray = {
-                        'vertices': mesh.vertices,
-                        'faces': mesh.faces,
-                        'transform': transform
-                    }
-                    
-                    t_hit = _ray_mesh_intersection(led.position, world_dir, mesh_data_ray)
-                    if t_hit is not None and t_hit > 0:
-                        hit_absorbed = True
-                
-                if hit_absorbed:
-                    continue
-                
-                if world_dir[0] > 0:
-                    t = (wall_dist - led.position[0]) / world_dir[0]
-                    if t > 0:
-                        hit_y = led.position[1] + world_dir[1] * t
-                        hit_z = led.position[2] + world_dir[2] * t
-                        
-                        # Check if hit is within FOV bounds (centered at 0,0)
-                        half_w = fov_width_cm / 2
-                        half_h = fov_height_cm / 2
-                        
-                        if -half_w <= hit_y <= half_w and -half_h <= hit_z <= half_h:
-                            # Convert to FOV grid indices
-                            grid_x = int((hit_y + half_w) / cell_size_cm)
-                            grid_y = int((hit_z + half_h) / cell_size_cm)
-                            
-                            if 0 <= grid_x < grid_width and 0 <= grid_y < grid_height:
-                                # Ray hits FOV region - add its lumens (already calculated above)
-                                fov_grid[grid_y, grid_x] += lumens_per_ray
+                lux_values = lumens_per_ray_arr[vi2[fi[bi]]]
+                np.add.at(fov_grid, (grid_y[bi], grid_x[bi]), lux_values)
         
         # Diagnostic: print first LED's flux conservation
         print(f"FOV Capture: First LED emitted {led_total_lumens_emitted:.2f} lm total (target: {lumens_per_led:.2f} lm)")
@@ -5026,13 +7955,20 @@ def main():
         print(f"Total lumens in FOV: {fov_grid.sum():.2f} lm")
         print(f"Max illuminance: {max_lux:.2f} lux")
 
+    FIXED_LEGEND_MAX = 3500.0  # Default fixed absolute legend cap (overridden by GUI)
+
     def intensity_to_color(value, max_val):
-        """Convert intensity to inferno-like colormap."""
+        """Convert intensity to colormap (inferno-like or black-to-white)."""
         # Handle invalid values
         if max_val == 0 or not np.isfinite(value) or not np.isfinite(max_val):
             return (0.0, 0.0, 0.0)
         
         t = np.clip(value / max_val, 0.0, 1.0)
+        
+        # Black-to-white grayscale mode
+        if bw_scale_chk.value:
+            return (t, t, t)
+        
         # Simple inferno-like gradient: black -> purple -> red -> orange -> yellow
         if t < 0.25:
             r, g, b = t * 4 * 0.5, 0, t * 4 * 0.5
@@ -5044,62 +7980,83 @@ def main():
             r, g, b = 1.0, 0.5 + (t - 0.75) * 4 * 0.5, (t - 0.75) * 4
         return (r, g, b)
 
-    def update_intensity_map():
-        """Update only the intensity map on the wall (expensive operation)."""
-        nonlocal intensity_handles, legend_html
-        
-        # Clear previous intensity handles
-        for handle in intensity_handles:
-            try:
-                handle.remove()
-            except KeyError:
-                pass
-        intensity_handles = []
-        
-        if not show_intensity_map.value:
-            # Update legend with message when intensity map is disabled
-            legend_html.content = (
-                "<div style='font-family: sans-serif;'>"
-                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-                "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click 'Update Intensity Map' to see the legend</div>"
-                "</div>"
+    # Cache for last computed intensity grid so uniformity can be recalculated
+    # when FOV changes without re-running ray tracing
+    _last_intensity_cache = {'grid': None, 'wall_size_cm': None, 'wall_dist': None,
+                             'cell_area_m2': None, 'max_lux': None, 'color_scale_max': None}
+
+    def _refresh_uniformity():
+        """Recalculate FOV-only uniformity from cached intensity grid (cheap)."""
+        cache = _last_intensity_cache
+        if cache['grid'] is None:
+            return  # No intensity data yet
+        grid = cache['grid']
+        wall_size_cm = cache['wall_size_cm']
+        wall_dist = cache['wall_dist']
+        cell_area_m2 = cache['cell_area_m2']
+        max_lux = cache['max_lux']
+        color_scale_max = cache['color_scale_max']
+
+        # Rebuild the legend exactly as update_intensity_map does
+        grid_size = grid.shape[0]
+        _legend_cap = float(legend_max_input.value)
+        if color_scale_max <= _legend_cap:
+            _step = max(1, _legend_cap / 8)
+            legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
+        else:
+            legend_vals_lux = np.linspace(0, color_scale_max, 9)
+        scale_label = f"(scale 0\u2013{int(color_scale_max)} lx" + (", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
+        html_lines = ["<div style='font-family: sans-serif;'>",
+                      f"<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
+                      f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} \u2014 peak {max_lux:.0f} lx</div>"]
+        for lux_val in reversed(legend_vals_lux):
+            color = intensity_to_color(lux_val, color_scale_max)
+            hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
+            lumen_val = lux_val * cell_area_m2
+            html_lines.append(
+                f"<div style='display:flex;align-items:center;margin:2px 0;'>"
+                f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
+                f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
+                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
             )
-            return
-        
-        # Get current values
-        wall_dist = wall_dist_slider.value
-        grid_size = int(intensity_grid_size.value)
-        wall_size = int(wall_view_size.value)
-        
-        # Get current LEDs configuration (fixed angles: front=0°, side=90°)
-        front_angle = 0.0  # Fixed front angle
-        side_angle = 90.0  # Fixed side angle
+        html_lines.append("</div>")
+
+        # Recalculate FOV crop and uniformity
+        _cam_x = camera_pos_x.value
+        _fov_h_rad = np.radians(camera_fov_h.value)
+        _fov_v_rad = np.radians(camera_fov_v.value)
+        _fov_w_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_h_rad / 2.0)
+        _fov_h_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_v_rad / 2.0)
+        uniformity_html = _compute_uniformity_html(
+            grid,
+            fov_bounds=(_fov_w_cm, _fov_h_cm),
+            wall_size_cm=wall_size_cm,
+        )
+        legend_html.content = "".join(html_lines) + uniformity_html
+
+    def _build_current_leds_and_absorbers():
+        """Build LEDs and absorbers from current GUI state."""
+        front_angle = 0.0
+        side_angle = 90.0
         viewing_angle = viewing_angle_slider.value
         radius = radius_slider.value
         circle_center_x = circle_center_slider.value
-        
+
         rotations = [
-            rot_front_pos.value,
-            rot_front_neg.value,
-            rot_side_pos.value,
-            rot_side_neg.value,
+            rot_front_pos.value, rot_front_neg.value,
+            rot_side_pos.value, rot_side_neg.value,
         ]
-        
         rotations_y = [
-            rot_y_front_pos.value,
-            rot_y_front_neg.value,
-            rot_y_side_pos.value,
-            rot_y_side_neg.value,
+            rot_y_front_pos.value, rot_y_front_neg.value,
+            rot_y_side_pos.value, rot_y_side_neg.value,
         ]
-        
         offsets = [
             (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
             (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
             (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
             (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
         ]
-        
-        # Build custom groups configs list
+
         custom_groups_configs = []
         for group in custom_groups:
             config = {
@@ -5111,49 +8068,31 @@ def main():
                 'led_states': group['led_states'],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
-            # Add dynamic group info if present
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
-                
-                # Get rotation angles (Euler angles in fixed frame)
-                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0  # Rotation around X
-                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0  # Rotation around Y
-                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0  # Rotation around Z
-                
-                # Build Euler rotation matrices (extrinsic X-Y-Z)
+                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0
+                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0
+                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0
                 roll_rad = np.radians(roll_deg)
                 pitch_rad = np.radians(pitch_deg)
                 yaw_rad = np.radians(yaw_deg)
-                
-                # Rotation matrix around X axis
                 Rx = np.array([
                     [1, 0, 0],
                     [0, np.cos(roll_rad), -np.sin(roll_rad)],
                     [0, np.sin(roll_rad), np.cos(roll_rad)]
                 ])
-                
-                # Rotation matrix around Y axis
                 Ry = np.array([
                     [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
                     [0, 1, 0],
                     [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
                 ])
-                
-                # Rotation matrix around Z axis
                 Rz = np.array([
                     [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
                     [np.sin(yaw_rad), np.cos(yaw_rad), 0],
                     [0, 0, 1]
                 ])
-                
-                # Compose: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
                 R_total = Rz @ Ry @ Rx
-                
-                # RIGID BODY rotation: rotate BOTH positions AND directions
-                # R is orthogonal => all distances are preserved
                 position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                
-                # Save originals if missing (for backward compatibility)
                 if 'original_led_positions' not in group and 'led_positions' in group:
                     relative_positions = []
                     for led_pos in group.get('led_positions', []):
@@ -5164,70 +8103,95 @@ def main():
                     group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
                 if 'original_led_row_directions' not in group and 'led_row_directions' in group:
                     group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
-
-                # Get originals
                 original_positions = group.get('original_led_positions', group.get('led_positions', []))
                 original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
-                
-                # Rotate relative positions then translate (rigid body)
                 translated_positions = []
                 for orig_pos in original_positions:
                     rotated_pos = R_total @ np.array(orig_pos)
                     final_pos = rotated_pos + position_offset
                     translated_positions.append(tuple(final_pos))
-                
-                # Rotate direction vectors
                 rotated_directions = []
                 for orig_dir in original_rotations:
                     rotated_dir = R_total @ np.array(orig_dir)
                     rotated_directions.append(tuple(rotated_dir))
-                
                 config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                
-                # Rotate row direction vectors
+                config['led_beam_tilts'] = group.get('led_beam_tilts', [])
                 original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
                 if original_row_dirs:
                     rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
                     config['led_row_directions'] = rotated_row_dirs
+            if group.get('lumens_override') and group['lumens_override'].value:
+                config['lumens_override'] = float(group['lumens_value'].value)
+            else:
+                config['lumens_override'] = None
             custom_groups_configs.append(config)
-        
-        # Build individual LEDs configs list
+
         individual_leds_configs = []
         for led in individual_leds:
             config = {
                 'enabled': led['enable'].value,
                 'led_on': led.get('led_on', True),
-                'pos_x': led['pos_x'].value,
-                'pos_y': led['pos_y'].value,
-                'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value,
-                'rot_y': led['rot_y'].value,
-                'rot_z': led['rot_z'].value,
-                'size': led['size'].value,
-                'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value,
+                'pos_x': led['pos_x'].value, 'pos_y': led['pos_y'].value, 'pos_z': led['pos_z'].value,
+                'rot_x': led['rot_x'].value, 'rot_y': led['rot_y'].value, 'rot_z': led['rot_z'].value,
+                'size': led['size'].value, 'viewing_angle': led['viewing_angle'].value,
+                'square_roll': led['square_roll'].value, 'beam_tilt': led['beam_tilt'].value,
             }
+            if led.get('lumens_override') and led['lumens_override'].value:
+                config['lumens_override'] = float(led['lumens_value'].value)
+            else:
+                config['lumens_override'] = None
+            # Pass external lens settings
+            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
+                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
+                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
             individual_leds_configs.append(config)
-        
+
         leds = create_leds(
-            front_angle,
-            side_angle,
-            viewing_angle,
-            radius,
-            circle_center_x,
-            group_rotations=rotations,
-            group_rotations_y=rotations_y,
+            front_angle, side_angle, viewing_angle, radius, circle_center_x,
+            group_rotations=rotations, group_rotations_y=rotations_y,
             row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states,
-            group_offsets=offsets,
+            led_states=led_states, group_offsets=offsets,
             custom_groups_configs=custom_groups_configs,
             individual_leds_configs=individual_leds_configs,
             create_base_groups=any(led_states[:48]),
         )
-        
-        # Build absorbers
+
+        _g_rot_z_deg = global_rotation_z_slider.value
+        if abs(_g_rot_z_deg) > 0.01:
+            _g_rad = np.radians(_g_rot_z_deg)
+            _cg, _sg = np.cos(_g_rad), np.sin(_g_rad)
+            _Rg = np.array([[_cg, -_sg, 0], [_sg, _cg, 0], [0, 0, 1]], dtype=float)
+            for led in leds:
+                led.position = _Rg @ led.position
+                led.direction = _Rg @ led.direction
+                if hasattr(led, 'row_direction') and led.row_direction is not None:
+                    led.row_direction = _Rg @ np.asarray(led.row_direction)
+                if hasattr(led, 'square_normal') and led.square_normal is not None:
+                    led.square_normal = _Rg @ np.asarray(led.square_normal)
+        else:
+            _g_rad = 0.0
+            _cg, _sg = 1.0, 0.0
+            _Rg = None
+
+        # Apply global position offset
+        _gp_x = global_pos_x_slider.value
+        _gp_y = global_pos_y_slider.value
+        _gp_z = global_pos_z_slider.value
+        if abs(_gp_x) > 0.001 or abs(_gp_y) > 0.001 or abs(_gp_z) > 0.001:
+            _gp_offset = np.array([_gp_x, _gp_y, _gp_z], dtype=float)
+            for led in leds:
+                led.position = led.position + _gp_offset
+
+        if diffuser_enable_chk.value:
+            _diff_angle = float(diffuser_angle_slider.value)
+            _diff_trans = float(diffuser_transmission_slider.value) / 100.0
+            for led in leds:
+                led.viewing_angle = max(led.viewing_angle, _diff_angle)
+                if led.lumens is not None:
+                    led.lumens = led.lumens * _diff_trans
+
         absorbers = []
         angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
         for i, angle_deg in enumerate(angles_deg):
@@ -5238,18 +8202,15 @@ def main():
             gy = radius * np.sin(angle_rad)
             y_offset = 6.5 if i == 0 else -6.5
             gy = gy + y_offset
-            
             radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
             if np.linalg.norm(radial) == 0:
                 radial_unit = np.array((1.0, 0.0, 0.0))
             else:
                 radial_unit = radial / np.linalg.norm(radial)
-            
             base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
             y_base_offset = -4.2 if i == 0 else 4.2
             base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
             base_abs_cz = 0.0
-            
             if not absorbers_enable.value:
                 continue
             if i == 0:
@@ -5260,107 +8221,117 @@ def main():
                 abs_cx = base_abs_cx + abs1_off_x.value
                 abs_cy = base_abs_cy + abs1_off_y.value
                 abs_cz = base_abs_cz + abs1_off_z.value
-            
             half_length_x = 5.0 / 2.0
             half_width_y = 1.5 / 2.0
             half_thickness_z = 3.0 / 2.0
-            
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
                 'rotation': None,
             })
-        
-        # Add abs2 and abs3 at origin with offsets
         if absorbers_enable.value:
-            # Abs2 with rotation
             abs_cx = 0.0 + abs2_off_x.value
             abs_cy = 0.0 + abs2_off_y.value
             abs_cz = 0.0 + abs2_off_z.value
             half_length_x = 5.0 / 2.0
             half_width_y = 1.5 / 2.0
             half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
             angle_rad = np.radians(abs2_rot_z.value)
             qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
+            qx, qy, qz = 0.0, 0.0, np.sin(angle_rad / 2)
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
                 'rotation': (qw, qx, qy, qz),
             })
-            
-            # Abs3 with rotation
             abs_cx = 0.0 + abs3_off_x.value
             abs_cy = 0.0 + abs3_off_y.value
             abs_cz = 0.0 + abs3_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
             angle_rad = np.radians(abs3_rot_z.value)
             qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
+            qx, qy, qz = 0.0, 0.0, np.sin(angle_rad / 2)
             absorbers.append({
                 'center': (abs_cx, abs_cy, abs_cz),
                 'half_sizes': (half_length_x, half_width_y, half_thickness_z),
                 'rotation': (qw, qx, qy, qz),
             })
-        
-        # Prepare STL mesh data for ray tracing if enabled
+        if abs(_g_rot_z_deg) > 0.01:
+            for a in absorbers:
+                cx, cy, cz = a['center']
+                a['center'] = (_cg * cx - _sg * cy, _sg * cx + _cg * cy, cz)
+                if a.get('rotation') is not None:
+                    qw0, qx0, qy0, qz0 = a['rotation']
+                    _half = _g_rad / 2.0
+                    gqw, gqz = np.cos(_half), np.sin(_half)
+                    a['rotation'] = (
+                        gqw*qw0 - gqz*qz0, gqw*qx0 - gqz*qy0,
+                        gqw*qy0 + gqz*qx0, gqw*qz0 + gqz*qw0,
+                    )
+                else:
+                    _half = _g_rad / 2.0
+                    a['rotation'] = (np.cos(_half), 0.0, 0.0, np.sin(_half))
+
         stl_mesh_for_raytracing = None
         if stl_absorber_enable.value and stl_mesh_data[0] is not None:
-            # Prepare transformation matrix for STL mesh
-            mesh = stl_mesh_data[0].copy()
-            
-            # Build transformation matrix
-            transform = np.eye(4)
-            
-            # Apply scale
-            scale = float(stl_scale.value)
-            if np.isfinite(scale) and scale > 0:
-                transform[:3, :3] *= scale
-            
-            # Apply rotations
-            rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
-            rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
-            rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
-            
-            if rot_x != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
-                transform = rot_mat @ transform
-            if rot_y != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
-                transform = rot_mat @ transform
-            if rot_z != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
-                transform = rot_mat @ transform
-            
-            # Apply translation (convert cm to same units as LED positions)
-            pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
-            pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
-            pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
-            transform[:3, 3] = [pos_x, pos_y, pos_z]
-            
+            mesh_ref = stl_mesh_data[0]
+            transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
+            if abs(_g_rot_z_deg) > 0.01:
+                T_global = np.eye(4)
+                T_global[:3, :3] = _Rg
+                transform = T_global @ transform
             stl_mesh_for_raytracing = {
-                'vertices': mesh.vertices,
-                'faces': mesh.faces,
+                'vertices': mesh_ref.vertices,
+                'faces': mesh_ref.faces,
                 'transform': transform
             }
-            print(f"STL mesh enabled as light absorber ({len(mesh.faces)} triangles)")
+
+        return leds, absorbers, stl_mesh_for_raytracing
+
+    def update_intensity_map():
+        """Update only the intensity map on the wall (expensive operation)."""
+        nonlocal intensity_handles, legend_html
+        
+        import time as _time
+        t_total_start = _time.perf_counter()
+        
+        # Clear previous intensity handles
+        for handle in intensity_handles:
+            try:
+                handle.remove()
+            except KeyError:
+                pass
+        intensity_handles = []
+        
+        if not show_intensity_map.value:
+            legend_html.content = (
+                "<div style='font-family: sans-serif;'>"
+                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click 'Update Intensity Map' to see the legend</div>"
+                "</div>"
+            )
+            return
+        
+        # Get current values
+        wall_dist = wall_dist_slider.value
+        grid_size = int(intensity_grid_size.value)
+        wall_size = max(int(wall_view_size.value), 80)  # min 80cm to always cover +-40cm export range
+        
+        leds, absorbers, stl_mesh_for_raytracing = _build_current_leds_and_absorbers()
         
         # Compute intensity with rays_per_pixel from slider
+        t_raytrace_start = _time.perf_counter()
         rays_per_pixel = int(intensity_rays_slider.value)
         intensity_grid, actual_wall_size = compute_wall_intensity(
             leds, wall_dist, rays_per_pixel, grid_size, wall_size, absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
         )
+        t_raytrace_end = _time.perf_counter()
+        print(f"  [TIMING] Ray tracing: {t_raytrace_end - t_raytrace_start:.2f}s")
         # Clean up any NaN or Inf values in the grid
         intensity_grid = np.nan_to_num(intensity_grid, nan=0.0, posinf=0.0, neginf=0.0)
         max_lux = intensity_grid.max()  # Grid now contains lux (lm/m²)
+        # Use fixed scale; fall back to actual max if it exceeds the cap
+        _legend_cap = float(legend_max_input.value)
+        color_scale_max = _legend_cap if max_lux <= _legend_cap else max_lux
         
         # Calculate cell area for lux to lumen conversion
         cell_size_cm = actual_wall_size / grid_size
@@ -5370,7 +8341,10 @@ def main():
         # === DIAGNOSTIC OUTPUT FOR FLUX CONSERVATION ===
         num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
-        total_emitted_lumens = num_active_leds * lumens_per_led
+        # Apply diffuser transmission loss
+        if diffuser_enable_chk.value:
+            lumens_per_led *= float(diffuser_transmission_slider.value) / 100.0
+        total_emitted_lumens = sum(float(getattr(led, 'lumens', None) or lumens_per_led) for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
         # Convert lux to lumen: multiply each cell by its area and sum
         total_wall_lumens = np.sum(intensity_grid * cell_area_m2)
         conservation_ratio = (total_wall_lumens / total_emitted_lumens * 100) if total_emitted_lumens > 0 else 0
@@ -5404,46 +8378,688 @@ def main():
         cell_size_m = cell_size_cm / 100.0
         half_size = actual_wall_size / 2
         
+        t_viz_start = _time.perf_counter()
+        
+        # Build a single colored mesh for the entire intensity grid (much faster than per-cell boxes)
+        # Each cell = 2 triangles (quad), with vertex colors for smooth rendering
+        vertices_list = []
+        faces_list = []
+        colors_list = []
+        
+        x_pos = wall_dist / 100.0 - 0.008  # slightly in front of the wall
+        vert_idx = 0
+        gap = 0.025  # Small gap between cells (2.5% of cell)
+        
         for gz in range(grid_size):
             for gy in range(grid_size):
                 intensity = intensity_grid[gz, gy]
                 if intensity > 0:
-                    color = intensity_to_color(intensity, max_lux)
-                    y_pos = (
-                        -half_size + gy * cell_size_cm + cell_size_cm / 2
-                    ) / 100.0
-                    z_pos = (
-                        -half_size + gz * cell_size_cm + cell_size_cm / 2
-                    ) / 100.0
-                    x_pos = wall_dist / 100.0 - 0.005
+                    color = intensity_to_color(intensity, color_scale_max)
+                    color_uint8 = [int(c * 255) for c in color] + [255]
                     
-                    handle = server.scene.add_box(
-                        f"/intensity/cell_{gz}_{gy}",
-                        dimensions=(0.001, cell_size_m * 0.95, cell_size_m * 0.95),
-                        color=color,
-                        position=(x_pos, y_pos, z_pos),
-                    )
-                    intensity_handles.append(handle)
+                    y_center = (-half_size + gy * cell_size_cm + cell_size_cm / 2) / 100.0
+                    z_center = (-half_size + gz * cell_size_cm + cell_size_cm / 2) / 100.0
+                    half_cell = cell_size_m * 0.5 * (1.0 - gap)
+                    
+                    # 4 corners of the quad
+                    v0 = [x_pos, y_center - half_cell, z_center - half_cell]
+                    v1 = [x_pos, y_center + half_cell, z_center - half_cell]
+                    v2 = [x_pos, y_center + half_cell, z_center + half_cell]
+                    v3 = [x_pos, y_center - half_cell, z_center + half_cell]
+                    
+                    vertices_list.extend([v0, v1, v2, v3])
+                    # Double-sided: both winding orders so visible from any angle
+                    faces_list.append([vert_idx, vert_idx + 1, vert_idx + 2])
+                    faces_list.append([vert_idx, vert_idx + 2, vert_idx + 3])
+                    faces_list.append([vert_idx, vert_idx + 2, vert_idx + 1])
+                    faces_list.append([vert_idx, vert_idx + 3, vert_idx + 2])
+                    colors_list.extend([color_uint8] * 4)
+                    vert_idx += 4
+        
+        if len(vertices_list) > 0:
+            vertices_np = np.array(vertices_list, dtype=np.float32)
+            faces_np = np.array(faces_list, dtype=np.uint32)
+            colors_np = np.array(colors_list, dtype=np.uint8)
+            
+            intensity_mesh = trimesh.Trimesh(
+                vertices=vertices_np,
+                faces=faces_np,
+                process=False
+            )
+            from trimesh.visual import ColorVisuals
+            intensity_mesh.visual = ColorVisuals(mesh=intensity_mesh, vertex_colors=colors_np)
+            
+            handle = server.scene.add_mesh_trimesh(
+                name="/intensity_map",
+                mesh=intensity_mesh,
+                visible=True,
+            )
+            intensity_handles.append(handle)
+        
+        t_viz_end = _time.perf_counter()
+        print(f"  [TIMING] Visualization: {t_viz_end - t_viz_start:.2f}s ({vert_idx // 4} cells)")
+        print(f"  [TIMING] Total update_intensity_map: {t_viz_end - t_total_start:.2f}s")
         
         # Update legend (grid now stores lux = lm/m²)
-        legend_steps = 6
-        legend_vals_lux = np.linspace(0, max_lux, legend_steps)
+        # Fixed legend ticks at absolute values up to color_scale_max
+        _legend_cap = float(legend_max_input.value)
+        if color_scale_max <= _legend_cap:
+            _step = max(1, _legend_cap / 8)
+            legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
+        else:
+            # Exceeded cap – uniform 9 ticks up to actual max
+            legend_vals_lux = np.linspace(0, color_scale_max, 9)
+        scale_label = f"(scale 0–{int(color_scale_max)} lx" + (", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
         html_lines = ["<div style='font-family: sans-serif;'>",
-                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend (lux)</div>"]
+                      f"<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
+                      f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} — peak {max_lux:.0f} lx</div>"]
         for lux_val in reversed(legend_vals_lux):
-            color = intensity_to_color(lux_val, max_lux)
+            color = intensity_to_color(lux_val, color_scale_max)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
             # Convert lux to lumens for this cell: Lumen = Lux × Area
             lumen_val = lux_val * cell_area_m2
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{lux_val:.1f} lx</div>"
+                f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
                 f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
             )
         html_lines.append("</div>")
-        legend_html.content = "".join(html_lines)
-    
+        # --- Uniformity metrics (FOV-only) ---
+        # Compute FOV footprint on wall so metrics cover only the green rectangle
+        _cam_x = camera_pos_x.value
+        _fov_h_rad = np.radians(camera_fov_h.value)
+        _fov_v_rad = np.radians(camera_fov_v.value)
+        _fov_w_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_h_rad / 2.0)
+        _fov_h_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_v_rad / 2.0)
+        uniformity_html = _compute_uniformity_html(
+            intensity_grid,
+            fov_bounds=(_fov_w_cm, _fov_h_cm),
+            wall_size_cm=actual_wall_size,
+        )
+        legend_html.content = "".join(html_lines) + uniformity_html
+
+        # Cache grid so FOV changes can recalculate uniformity cheaply
+        _last_intensity_cache['grid'] = intensity_grid
+        _last_intensity_cache['wall_size_cm'] = actual_wall_size
+        _last_intensity_cache['wall_dist'] = wall_dist
+        _last_intensity_cache['cell_area_m2'] = cell_area_m2
+        _last_intensity_cache['max_lux'] = max_lux
+        _last_intensity_cache['color_scale_max'] = color_scale_max
+
+    # ── CSV Pattern Import logic ──────────────────────────────────────────
+    def _parse_benchmark_csv(filepath):
+        """Parse a benchmark CSV file (NORMAL + UNIFORMITY sections).
+        Supports both the internal text export and spreadsheet CSV formats.
+        Extracts DFRobot lux values when available, falls back to Simulator.
+        Returns (grid_2d, wall_size_cm, description, y_min, y_max, x_min, x_max) or raises ValueError."""
+        with open(filepath, 'r') as f:
+            lines = [l.rstrip('\n') for l in f.readlines()]
+
+        if not lines:
+            raise ValueError("Empty file")
+
+        if lines[0].startswith("Camera FOV Intensity Image"):
+            return _parse_fov_intensity_csv(lines)
+
+        # Detect if this is a comma-separated spreadsheet CSV
+        is_csv = any(',' in l for l in lines[:20])
+
+        # Helper: extract non-empty cells from a CSV line
+        def _csv_cells(line):
+            return [c.strip() for c in line.split(',')]
+
+        # Helper: find a cell matching a pattern in a line (returns cell index or -1)
+        def _find_cell(cells, pattern):
+            pat_lower = pattern.lower()
+            for idx, c in enumerate(cells):
+                if pat_lower in c.lower():
+                    return idx
+            return -1
+
+        # Helper: extract numeric values from cells starting at given index
+        def _extract_nums(cells, start):
+            vals = []
+            for c in cells[start:]:
+                c = c.strip()
+                if not c:
+                    continue
+                try:
+                    vals.append(float(c))
+                except ValueError:
+                    break
+            return vals
+
+        # Find UNIFORMITY section
+        unif_start = None
+        for i, line in enumerate(lines):
+            text = line.strip().replace(',', ' ').strip()
+            cells = _csv_cells(line) if is_csv else [line.strip()]
+            for c in cells:
+                if 'UNIFORMITY' in c.upper():
+                    unif_start = i
+                    break
+            if unif_start is not None:
+                break
+        if unif_start is None:
+            raise ValueError("No UNIFORMITY section found in benchmark file")
+
+        # Parse Y blocks
+        y_positions_mm = []
+        lux_rows = []
+        x_scan_mm = None
+        i = unif_start + 1
+
+        while i < len(lines):
+            if is_csv:
+                cells = _csv_cells(lines[i])
+            else:
+                cells = [lines[i].strip()]
+
+            # Look for Y label in any cell
+            y_cell_idx = -1
+            for ci, c in enumerate(cells):
+                c_stripped = c.strip()
+                if c_stripped.startswith('Y ') or c_stripped.startswith('Y+') or c_stripped.startswith('Y-'):
+                    y_cell_idx = ci
+                    break
+            if y_cell_idx >= 0:
+                y_label = cells[y_cell_idx].strip()
+                if 'center' in y_label.lower():
+                    y_mm = 0
+                else:
+                    # Extract number: "Y +200", "Y -100", "Y+200"
+                    import re as _re
+                    nums = _re.findall(r'[+-]?\d+', y_label)
+                    if nums:
+                        y_mm = int(nums[0])
+                    else:
+                        i += 1
+                        continue
+                y_positions_mm.append(y_mm)
+
+                # Scan forward for X scan, Simulator, DFrobot lux lines
+                x_line_found = False
+                sim_vals = None
+                dfr_vals = None
+                j = i + 1
+                search_limit = min(j + 8, len(lines))
+                while j < search_limit:
+                    if is_csv:
+                        jcells = _csv_cells(lines[j])
+                    else:
+                        jcells = lines[j].strip().split()
+
+                    joined = ' '.join(c.strip() for c in jcells).lower()
+
+                    if 'x scan' in joined or 'x_scan' in joined:
+                        # Extract X positions
+                        if is_csv:
+                            xci = _find_cell(jcells, 'scan')
+                            if xci >= 0:
+                                x_vals = _extract_nums(jcells, xci + 1)
+                            else:
+                                x_vals = _extract_nums(jcells, 0)
+                        else:
+                            x_vals = []
+                            for t in jcells:
+                                try:
+                                    x_vals.append(int(t))
+                                except ValueError:
+                                    continue
+                        if x_vals and x_scan_mm is None:
+                            x_scan_mm = [int(v) for v in x_vals]
+                        x_line_found = True
+
+                    elif 'simulator' in joined:
+                        if is_csv:
+                            sci = _find_cell(jcells, 'simulator')
+                            if sci >= 0:
+                                sim_vals = _extract_nums(jcells, sci + 1)
+                        else:
+                            sv = []
+                            for t in jcells:
+                                try:
+                                    sv.append(float(t))
+                                except ValueError:
+                                    continue
+                            sim_vals = sv
+
+                    elif 'dfrobot' in joined or 'df robot' in joined or 'dfr' in joined.replace(' ', ''):
+                        if is_csv:
+                            dci = _find_cell(jcells, 'lux')
+                            if dci < 0:
+                                dci = _find_cell(jcells, 'dfrobot')
+                                if dci < 0:
+                                    dci = _find_cell(jcells, 'DFR')
+                            if dci >= 0:
+                                dfr_vals = _extract_nums(jcells, dci + 1)
+                            else:
+                                dfr_vals = _extract_nums(jcells, 0)
+                        else:
+                            dv = []
+                            for t in jcells:
+                                try:
+                                    dv.append(float(t))
+                                except ValueError:
+                                    continue
+                            dfr_vals = dv
+
+                    # Stop when we have both or hit next Y block or empty block
+                    if dfr_vals is not None and sim_vals is not None:
+                        break
+                    j += 1
+
+                # Prefer DFRobot lux; fall back to Simulator
+                chosen = dfr_vals if dfr_vals else sim_vals
+                if chosen:
+                    lux_rows.append(chosen)
+                else:
+                    # Remove the Y position since we found no data
+                    y_positions_mm.pop()
+
+            i += 1
+
+        if not lux_rows or x_scan_mm is None:
+            raise ValueError("Could not parse UNIFORMITY data")
+
+        # Build dense grid via interpolation
+        from scipy.interpolate import RegularGridInterpolator
+
+        y_cm = [y / 10.0 for y in y_positions_mm]  # e.g. [20, 10, 0, -10, -20]
+        x_cm = [x / 10.0 for x in x_scan_mm]       # e.g. [-40, -30, ..., 40]
+
+        # Sort y ascending for interpolator
+        sorted_pairs = sorted(zip(y_cm, lux_rows), key=lambda p: p[0])
+        y_sorted = [p[0] for p in sorted_pairs]
+        data_sorted = [p[1] for p in sorted_pairs]
+        data_2d = np.array(data_sorted, dtype=np.float64)  # shape (ny, nx)
+
+        # Target dense grid covering the data range
+        y_min, y_max = y_sorted[0], y_sorted[-1]
+        x_min, x_max = x_cm[0], x_cm[-1]
+        wall_size_cm = max(abs(x_max - x_min), abs(y_max - y_min))
+        dense_n = max(50, int(wall_size_cm))  # ~1cm resolution
+
+        dense_y = np.linspace(y_min, y_max, dense_n)
+        dense_x = np.linspace(x_min, x_max, dense_n)
+
+        interp = RegularGridInterpolator(
+            (np.array(y_sorted), np.array(x_cm)), data_2d,
+            method='linear', bounds_error=False, fill_value=0.0
+        )
+        yy, xx = np.meshgrid(dense_y, dense_x, indexing='ij')
+        grid = interp((yy, xx))
+        grid = np.clip(grid, 0, None)
+
+        desc = f"DFRobot lux – UNIFORMITY ({len(y_positions_mm)} Y × {len(x_scan_mm)} X)"
+        return grid, wall_size_cm, desc, y_min, y_max, x_min, x_max
+
+    def _parse_fov_intensity_csv(lines):
+        """Parse a Camera FOV Intensity Image CSV.
+        Returns (grid_2d, wall_size_cm, description, y_min, y_max, x_min, x_max)."""
+        # Header parsing
+        fov_w_cm = None
+        fov_h_cm = None
+        grid_start = None
+        for i, line in enumerate(lines):
+            if line.startswith("FOV Width"):
+                fov_w_cm = float(line.split(",")[1])
+            elif line.startswith("FOV Height"):
+                fov_h_cm = float(line.split(",")[1])
+            elif line.startswith("Intensity Grid"):
+                grid_start = i + 2  # skip blank line after header
+                break
+
+        if fov_w_cm is None or fov_h_cm is None or grid_start is None:
+            raise ValueError("Cannot parse FOV intensity CSV header")
+
+        # Parse grid data
+        rows = []
+        for i in range(grid_start, len(lines)):
+            line = lines[i].strip()
+            if not line:
+                continue
+            vals = [float(v) for v in line.split(",") if v.strip()]
+            if vals:
+                rows.append(vals)
+
+        grid = np.array(rows, dtype=np.float64)
+        wall_size_cm = max(fov_w_cm, fov_h_cm)
+        half_w = fov_w_cm / 2.0
+        half_h = fov_h_cm / 2.0
+        # FOV grid stores lumens per cell — convert to lux (lm/m²)
+        cell_w_cm = fov_w_cm / grid.shape[1]
+        cell_h_cm = fov_h_cm / grid.shape[0]
+        cell_area_m2 = (cell_w_cm / 100.0) * (cell_h_cm / 100.0)
+        if cell_area_m2 > 0:
+            grid = grid / cell_area_m2
+
+        desc = f"FOV Intensity ({grid.shape[0]}×{grid.shape[1]})"
+        return grid, wall_size_cm, desc, -half_h, half_h, -half_w, half_w
+
+    def _render_imported_csv_on_wall(grid, wall_size_cm, y_min, y_max, x_min, x_max):
+        """Render an imported lux grid on the wall, similar to update_intensity_map."""
+        nonlocal imported_csv_handles
+
+        # Clear previous
+        for h in imported_csv_handles:
+            try:
+                h.remove()
+            except (KeyError, Exception):
+                pass
+        imported_csv_handles = []
+
+        if room_mode_enable.value:
+            wall_dist = room_front_dist.value
+        else:
+            wall_dist = wall_dist_slider.value
+
+        _csv_cap = float(csv_legend_max_input.value)
+
+        max_lux = float(np.max(grid))
+        if max_lux <= 0:
+            print("[CSV Import] All values are zero — nothing to display.")
+            return
+
+        color_scale_max = _csv_cap if max_lux <= _csv_cap else max_lux
+        nrows, ncols = grid.shape
+
+        cell_h_cm = (y_max - y_min) / nrows
+        cell_w_cm = (x_max - x_min) / ncols
+
+        x_pos = wall_dist / 100.0 - 0.006  # slightly in front (different offset from sim)
+
+        vertices_list = []
+        faces_list = []
+        colors_list = []
+        vert_idx = 0
+        gap = 0.025
+
+        for gz in range(nrows):
+            for gy in range(ncols):
+                intensity = grid[gz, gy]
+                if intensity > 0:
+                    color = intensity_to_color(intensity, color_scale_max)
+                    color_uint8 = [int(c * 255) for c in color] + [255]
+
+                    # Map grid cell to wall coordinates (in meters)
+                    y_center = (x_min + gy * cell_w_cm + cell_w_cm / 2) / 100.0
+                    z_center = (y_min + gz * cell_h_cm + cell_h_cm / 2) / 100.0
+                    half_cell_y = (cell_w_cm / 100.0) * 0.5 * (1.0 - gap)
+                    half_cell_z = (cell_h_cm / 100.0) * 0.5 * (1.0 - gap)
+
+                    v0 = [x_pos, y_center - half_cell_y, z_center - half_cell_z]
+                    v1 = [x_pos, y_center + half_cell_y, z_center - half_cell_z]
+                    v2 = [x_pos, y_center + half_cell_y, z_center + half_cell_z]
+                    v3 = [x_pos, y_center - half_cell_y, z_center + half_cell_z]
+
+                    vertices_list.extend([v0, v1, v2, v3])
+                    faces_list.append([vert_idx, vert_idx + 1, vert_idx + 2])
+                    faces_list.append([vert_idx, vert_idx + 2, vert_idx + 3])
+                    faces_list.append([vert_idx, vert_idx + 2, vert_idx + 1])
+                    faces_list.append([vert_idx, vert_idx + 3, vert_idx + 2])
+                    colors_list.extend([color_uint8] * 4)
+                    vert_idx += 4
+
+        if len(vertices_list) > 0:
+            vertices_np = np.array(vertices_list, dtype=np.float32)
+            faces_np = np.array(faces_list, dtype=np.uint32)
+            colors_np = np.array(colors_list, dtype=np.uint8)
+
+            mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
+            from trimesh.visual import ColorVisuals
+            mesh.visual = ColorVisuals(mesh=mesh, vertex_colors=colors_np)
+
+            handle = server.scene.add_mesh_trimesh(
+                name="/imported_csv_pattern",
+                mesh=mesh,
+                visible=True,
+            )
+            imported_csv_handles.append(handle)
+
+        print(f"[CSV Import] Rendered {vert_idx // 4} cells, max {max_lux:.1f} lux")
+        return max_lux
+
+    def import_csv_pattern():
+        """Import and render a CSV pattern file on the wall."""
+        nonlocal imported_csv_handles
+        filepath = csv_import_path.value.strip()
+        if not filepath:
+            csv_import_status.content = "<div style='font-size:11px;color:#f44;'>⚠ Enter a file path first</div>"
+            return
+        if not os.path.isfile(filepath):
+            csv_import_status.content = f"<div style='font-size:11px;color:#f44;'>⚠ File not found: {filepath}</div>"
+            return
+        try:
+            result = _parse_benchmark_csv(filepath)
+            grid, wall_size_cm, desc = result[0], result[1], result[2]
+            y_min, y_max, x_min, x_max = result[3], result[4], result[5], result[6]
+            max_lux = _render_imported_csv_on_wall(grid, wall_size_cm, y_min, y_max, x_min, x_max)
+            csv_import_status.content = (
+                f"<div style='font-size:11px;color:#4CAF50;'>"
+                f"✓ {desc}<br>Peak: {max_lux:.1f} lux | Grid: {grid.shape[0]}×{grid.shape[1]}"
+                f"</div>"
+            )
+            # Compute stats from the imported CSV values
+            csv_vals = grid[grid > 0] if np.any(grid > 0) else grid.ravel()
+            csv_min = float(np.min(csv_vals))
+            csv_max = float(np.max(csv_vals))
+            csv_avg = float(np.mean(csv_vals))
+            csv_diff_html.content = (
+                "<div style='font-family:sans-serif;margin-top:6px;padding:6px;background:#1a1a2e;border-radius:4px;'>"
+                "<div style='font-weight:600;font-size:12px;color:#e0e0e0;margin-bottom:4px;'>CSV Stats (lux)</div>"
+                f"<div style='font-size:11px;color:#90caf9;'>Min: <b>{csv_min:.1f}</b></div>"
+                f"<div style='font-size:11px;color:#ef9a9a;'>Max: <b>{csv_max:.1f}</b></div>"
+                f"<div style='font-size:11px;color:#fff59d;'>Avg: <b>{csv_avg:.1f}</b></div>"
+                "</div>"
+            )
+            # Build color/value legend (fixed / auto, like main intensity legend)
+            _csv_cap = float(csv_legend_max_input.value)
+            csv_color_scale = _csv_cap if max_lux <= _csv_cap else max_lux
+            if csv_color_scale <= _csv_cap:
+                _csv_step = max(1, _csv_cap / 10)
+                legend_vals = np.arange(0, _csv_cap + 1, _csv_step)
+                mode_label = "FIXED"
+            else:
+                legend_vals = np.linspace(0, csv_color_scale, 11)
+                mode_label = "AUTO"
+            scale_label = f"(scale 0–{int(csv_color_scale)} lx, {mode_label})"
+            legend_lines = [
+                "<div style='font-family:sans-serif;margin-top:8px;'>",
+                "<div style='font-weight:600;margin-bottom:2px;font-size:12px;'>CSV Pattern Legend (lux)</div>",
+                f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} — peak {max_lux:.0f} lx</div>",
+            ]
+            for lux_val in reversed(legend_vals):
+                color = intensity_to_color(lux_val, csv_color_scale)
+                hex_c = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
+                legend_lines.append(
+                    f"<div style='display:flex;align-items:center;margin:1px 0;'>"
+                    f"<div style='width:18px;height:10px;background:{hex_c};margin-right:6px;"
+                    f"border:1px solid #333;'></div>"
+                    f"<span style='font-size:11px;'>{lux_val:.0f} lx</span></div>"
+                )
+            legend_lines.append("</div>")
+            csv_legend_html.content = "".join(legend_lines)
+        except Exception as e:
+            csv_import_status.content = f"<div style='font-size:11px;color:#f44;'>⚠ Error: {e}</div>"
+            csv_legend_html.content = ""
+            csv_diff_html.content = ""
+            print(f"[CSV Import] Error: {e}")
+
+    def clear_csv_pattern():
+        """Remove imported CSV pattern from the wall."""
+        nonlocal imported_csv_handles
+        for h in imported_csv_handles:
+            try:
+                h.remove()
+            except (KeyError, Exception):
+                pass
+        imported_csv_handles = []
+        csv_import_status.content = "<div style='font-size:11px;color:#888;'>No file imported</div>"
+        csv_legend_html.content = ""
+        csv_diff_html.content = ""
+        print("[CSV Import] Cleared imported pattern.")
+
+    def export_lux_matrix():
+        """Export a text file with lux values sampled every 10cm in ±40cm range on Y and Z axes."""
+        cache = _last_intensity_cache
+        if cache['grid'] is None:
+            print("[Export] No intensity data available. Run 'Update Intensity Map' first.")
+            return
+
+        grid = cache['grid']
+        wall_size_cm = cache['wall_size_cm']
+        wall_dist = cache['wall_dist']
+        grid_size = grid.shape[0]
+        cell_size = wall_size_cm / grid_size
+        half_size = wall_size_cm / 2.0
+
+        # Sample positions: -40 to +40 cm, step 10 cm
+        sample_positions = list(range(-40, 41, 10))  # [-40, -30, ..., 0, ..., 30, 40]
+
+        # Build the lux matrix: rows = Z (top to bottom), cols = Y (left to right)
+        lux_matrix = []
+        for z_cm in reversed(sample_positions):  # top to bottom
+            row = []
+            for y_cm in sample_positions:
+                # Convert cm to grid index
+                gy = int((y_cm + half_size) / cell_size)
+                gz = int((z_cm + half_size) / cell_size)
+                if 0 <= gy < grid_size and 0 <= gz < grid_size:
+                    row.append(grid[gz, gy])
+                else:
+                    row.append(0.0)
+            lux_matrix.append(row)
+
+        # Write to file
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_dir = "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        filename = f"lux_matrix_{ts}.txt"
+        filepath = os.path.join(export_dir, filename)
+
+        with open(filepath, 'w') as f:
+            f.write(f"Lux Matrix Export - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Wall distance: {wall_dist:.1f} cm\n")
+            f.write(f"Grid resolution: {grid_size}x{grid_size}\n")
+            f.write(f"Wall size: {wall_size_cm:.1f} cm\n")
+            f.write(f"Sample range: +-40 cm, step 10 cm\n")
+            f.write(f"Rows: Z axis (top +40 to bottom -40)\n")
+            f.write(f"Columns: Y axis (left -40 to right +40)\n")
+            f.write("\n")
+
+            # Header row with Y positions
+            header = "Z\\Y(cm)" + "\t" + "\t".join(f"{y:+d}" for y in sample_positions)
+            f.write(header + "\n")
+
+            # Data rows
+            for i, z_cm in enumerate(reversed(sample_positions)):
+                row_str = f"{z_cm:+d}" + "\t" + "\t".join(f"{v:.1f}" for v in lux_matrix[i])
+                f.write(row_str + "\n")
+
+        print(f"[Export] Lux matrix saved to {filepath}")
+
+    def run_benchmark():
+        """Run benchmark: center lux at multiple distances + uniformity grid at 50cm.
+        Exports a CSV file matching the NORMAL + UNIFORMITY format."""
+        import time as _time
+        from datetime import datetime
+
+        print("\n=== STARTING BENCHMARK ===")
+        t0 = _time.perf_counter()
+
+        leds, absorbers, stl_mesh_for_raytracing = _build_current_leds_and_absorbers()
+        grid_size = int(intensity_grid_size.value)
+        rays_per_pixel = int(intensity_rays_slider.value)
+
+        # --- NORMAL: center lux at multiple distances ---
+        normal_distances = [10, 20, 30, 50, 80]
+        normal_center_lux = {}
+        for dist in normal_distances:
+            print(f"  [Benchmark] Computing center lux at {dist} cm...")
+            # Wall size must cover at least +-40cm
+            w_size = max(80, int(wall_view_size.value))
+            grid, actual_ws = compute_wall_intensity(
+                leds, dist, rays_per_pixel, grid_size, w_size,
+                absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
+            )
+            grid = np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
+            center_idx = grid_size // 2
+            normal_center_lux[dist] = grid[center_idx, center_idx]
+            print(f"    Center lux: {normal_center_lux[dist]:.1f}")
+
+        # --- UNIFORMITY at 50cm: grid scan ---
+        unif_dist = 50
+        print(f"  [Benchmark] Computing uniformity grid at {unif_dist} cm...")
+        w_size = max(80, int(wall_view_size.value))
+        unif_grid, actual_ws = compute_wall_intensity(
+            leds, unif_dist, rays_per_pixel, grid_size, w_size,
+            absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
+        )
+        unif_grid = np.nan_to_num(unif_grid, nan=0.0, posinf=0.0, neginf=0.0)
+
+        cell_size = actual_ws / grid_size
+        half_size = actual_ws / 2.0
+
+        # X scan positions (horizontal on wall = Y axis): -400 to +400 mm step 100 = -40 to +40 cm step 10
+        x_scan_mm = list(range(-400, 401, 100))
+        x_scan_cm = [x / 10.0 for x in x_scan_mm]
+        # Y positions (vertical on wall = Z axis): +200, +100, 0, -100, -200 mm
+        y_positions_mm = [400, 300, 200, 100, 0, -100, -200, -300, -400]
+        y_positions_cm = [y / 10.0 for y in y_positions_mm]
+
+        uniformity_data = {}
+        for y_mm, y_cm in zip(y_positions_mm, y_positions_cm):
+            row_lux = []
+            for x_mm, x_cm in zip(x_scan_mm, x_scan_cm):
+                gy = min(int(round((x_cm + half_size) / cell_size)), grid_size - 1)
+                gz = min(int(round((y_cm + half_size) / cell_size)), grid_size - 1)
+                if 0 <= gy < grid_size and 0 <= gz < grid_size:
+                    row_lux.append(unif_grid[gz, gy])
+                else:
+                    row_lux.append(0.0)
+            uniformity_data[y_mm] = row_lux
+
+        # --- Write CSV ---
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_dir = "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        filename = f"benchmark_{ts}.txt"
+        filepath = os.path.join(export_dir, filename)
+
+        COL1 = 16  # first column width
+        COLN = 10  # data column width
+
+        with open(filepath, 'w') as f:
+            # NORMAL section
+            f.write("NORMAL\n")
+            f.write("DISTANCE cm".ljust(COL1) + "".join(str(d).rjust(COLN) for d in normal_distances) + "\n")
+            f.write("Simulator".ljust(COL1) + "".join(f"{normal_center_lux[d]:.1f}".rjust(COLN) for d in normal_distances) + "\n")
+            f.write("DFRobot lux\n")
+            f.write("\n")
+
+            # UNIFORMITY section
+            f.write(f"UNIFORMITY\n")
+            f.write(f"DISTANCE {unif_dist}CM\n")
+            f.write("\n")
+
+            for y_mm in y_positions_mm:
+                if y_mm == 0:
+                    label = "Y center"
+                else:
+                    label = f"Y {y_mm:+d}"
+                f.write(f"{label}\n")
+                f.write("X scan".ljust(COL1) + "".join(str(x).rjust(COLN) for x in x_scan_mm) + "\n")
+                f.write("Simulator".ljust(COL1) + "".join(f"{v:.1f}".rjust(COLN) for v in uniformity_data[y_mm]) + "\n")
+                f.write("DFRobot lux\n")
+                f.write("\n")
+
+        t1 = _time.perf_counter()
+        print(f"=== BENCHMARK COMPLETE ({t1 - t0:.1f}s) ===")
+        print(f"[Export] Benchmark saved to {filepath}")
+
     def draw_room_walls():
         """Draw room walls as wireframe/transparent boxes (no intensity calculation)."""
         nonlocal room_wall_handles
@@ -5671,45 +9287,41 @@ def main():
         # Prepare STL mesh data for ray tracing if enabled
         stl_mesh_for_raytracing = None
         if stl_absorber_enable.value and stl_mesh_data[0] is not None:
-            # Prepare transformation matrix for STL mesh
-            mesh = stl_mesh_data[0].copy()
-            
-            # Build transformation matrix
-            transform = np.eye(4)
-            
-            # Apply scale
-            scale = float(stl_scale.value)
-            if np.isfinite(scale) and scale > 0:
-                transform[:3, :3] *= scale
-            
-            # Apply rotations
-            rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
-            rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
-            rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
-            
-            if rot_x != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
-                transform = rot_mat @ transform
-            if rot_y != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
-                transform = rot_mat @ transform
-            if rot_z != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
-                transform = rot_mat @ transform
-            
-            # Apply translation (convert cm to same units as LED positions)
-            pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
-            pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
-            pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
-            transform[:3, 3] = [pos_x, pos_y, pos_z]
-            
+            mesh_ref = stl_mesh_data[0]
+            transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
+            # Apply global Z rotation to STL transform (room mode)
+            _g_rot_room = global_rotation_z_slider.value
+            if abs(_g_rot_room) > 0.01:
+                T_global_room = np.eye(4)
+                _gr = np.radians(_g_rot_room)
+                T_global_room[:3, :3] = np.array([[np.cos(_gr), -np.sin(_gr), 0],
+                                                   [np.sin(_gr),  np.cos(_gr), 0],
+                                                   [0,            0,           1]])
+                transform = T_global_room @ transform
             stl_mesh_for_raytracing = {
-                'vertices': mesh.vertices,
-                'faces': mesh.faces,
+                'vertices': mesh_ref.vertices,
+                'faces': mesh_ref.faces,
                 'transform': transform
             }
-            print(f"STL mesh enabled as light absorber ({len(mesh.faces)} triangles)")
+            print(f"STL mesh enabled as light absorber ({len(mesh_ref.faces)} triangles)")
         
+        # ── Apply global Z rotation to absorbers (room mode) ──
+        _g_rot_room_deg = global_rotation_z_slider.value
+        if abs(_g_rot_room_deg) > 0.01:
+            _gr2 = np.radians(_g_rot_room_deg)
+            _cg2, _sg2 = np.cos(_gr2), np.sin(_gr2)
+            for a in absorbers:
+                cx, cy, cz = a['center']
+                a['center'] = (_cg2 * cx - _sg2 * cy, _sg2 * cx + _cg2 * cy, cz)
+                if a.get('rotation') is not None:
+                    qw0, qx0, qy0, qz0 = a['rotation']
+                    _hf = _gr2 / 2.0
+                    gqw, gqz = np.cos(_hf), np.sin(_hf)
+                    a['rotation'] = (gqw*qw0 - gqz*qz0, gqw*qx0 - gqz*qy0, gqw*qy0 + gqz*qx0, gqw*qz0 + gqz*qw0)
+                else:
+                    _hf = _gr2 / 2.0
+                    a['rotation'] = (np.cos(_hf), 0.0, 0.0, np.sin(_hf))
+
         grids, wall_specs = compute_room_intensity(
             leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, 
             back_dist=room_back_dist.value if show_back_wall.value else None,
@@ -5718,6 +9330,9 @@ def main():
         
         # Find max lux across all walls for color normalization
         max_lux = max(grid.max() for grid in grids.values()) if grids else 0.0
+        # Use fixed lx scale; fall back to actual max if it exceeds the cap
+        _legend_cap = float(legend_max_input.value)
+        color_scale_max = _legend_cap if max_lux <= _legend_cap else max_lux
         
         print(f"\n=== ROOM INTENSITY VISUALIZATION ===")
         print(f"Max illuminance across all walls: {max_lux:.4f} lux")
@@ -5735,115 +9350,191 @@ def main():
             total_lumen = np.sum(grid) * cell_area_m2
             print(f"  {wall_name.capitalize()}: {cells_with_intensity} cells with intensity (total: {total_lumen:.1f} lm)")
         
-        # Visualize each wall
+        # Visualize each wall using batched meshes with flat shading (no 3D lighting artifacts)
         cells_created = {'front': 0, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
         if show_back_wall.value and 'back' in grids:
             cells_created['back'] = 0
+        gap = 0.025  # 2.5% gap between cells
+        inward_offset = 0.003  # 3mm inward offset to avoid z-fighting with room walls
+        
         for wall_name, intensity_grid in grids.items():
             wall_spec = wall_specs[wall_name]
-            grid_shape = intensity_grid.shape  # Get actual grid dimensions for this wall
+            grid_shape = intensity_grid.shape
+            
+            positions_list = []
+            colors_list = []
             
             for gi in range(grid_shape[0]):
                 for gj in range(grid_shape[1]):
                     intensity = intensity_grid[gi, gj]
-                    # Create ALL cells (even with zero intensity) to show full wall dimensions
-                    color = intensity_to_color(intensity, max_lux)
+                    color = intensity_to_color(intensity, color_scale_max)
+                    color_uint8 = [int(c * 255) for c in color]
                     
-                    # Calculate cell position based on wall orientation
-                    # Position cells exactly on wall surfaces (same as gray walls)
                     if wall_name == 'front':
-                        # YZ plane at x=front_dist
                         size_y = wall_spec['size_y']
                         size_z = wall_spec['size_z']
                         grid_y = wall_spec['grid_y']
                         grid_z = wall_spec['grid_z']
                         cell_size_y = size_y / grid_y
                         cell_size_z = size_z / grid_z
-                        x_pos = front_dist / 100.0
-                        y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
-                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                        dims = (0.01, cell_size_y / 100.0 * 0.98, cell_size_z / 100.0 * 0.98)
-                    
-                    elif wall_name == 'left':
-                        # XZ plane at y=-side_dist
-                        size_x = wall_spec['size_x']
-                        size_z = wall_spec['size_z']
-                        grid_x = wall_spec['grid_x']
-                        grid_z = wall_spec['grid_z']
-                        x_min = wall_spec['x_min']
-                        cell_size_x = size_x / grid_x
-                        cell_size_z = size_z / grid_z
-                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                        y_pos = -side_dist / 100.0
-                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                        dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
-                    
-                    elif wall_name == 'right':
-                        # XZ plane at y=+side_dist
-                        size_x = wall_spec['size_x']
-                        size_z = wall_spec['size_z']
-                        grid_x = wall_spec['grid_x']
-                        grid_z = wall_spec['grid_z']
-                        x_min = wall_spec['x_min']
-                        cell_size_x = size_x / grid_x
-                        cell_size_z = size_z / grid_z
-                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                        y_pos = side_dist / 100.0
-                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                        dims = (cell_size_x / 100.0 * 0.98, 0.01, cell_size_z / 100.0 * 0.98)
-                    
-                    elif wall_name == 'top':
-                        # XY plane at z=+top_bottom_dist
-                        size_x = wall_spec['size_x']
-                        size_y = wall_spec['size_y']
-                        grid_x = wall_spec['grid_x']
-                        grid_y = wall_spec['grid_y']
-                        x_min = wall_spec['x_min']
-                        cell_size_x = size_x / grid_x
-                        cell_size_y = size_y / grid_y
-                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                        y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
-                        z_pos = top_bottom_dist / 100.0
-                        dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
-                    
-                    elif wall_name == 'bottom':
-                        # XY plane at z=-top_bottom_dist
-                        size_x = wall_spec['size_x']
-                        size_y = wall_spec['size_y']
-                        grid_x = wall_spec['grid_x']
-                        grid_y = wall_spec['grid_y']
-                        x_min = wall_spec['x_min']
-                        cell_size_x = size_x / grid_x
-                        cell_size_y = size_y / grid_y
-                        x_pos = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
-                        y_pos = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
-                        z_pos = -top_bottom_dist / 100.0
-                        dims = (cell_size_x / 100.0 * 0.98, cell_size_y / 100.0 * 0.98, 0.01)
+                        x_pos = front_dist / 100.0 - inward_offset
+                        y_c = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
+                        z_c = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        positions_list.append([x_pos, y_c, z_c])
                     
                     elif wall_name == 'back':
-                        # YZ plane at x=-back_dist (symmetric to front wall)
                         size_y = wall_spec['size_y']
                         size_z = wall_spec['size_z']
                         grid_y = wall_spec['grid_y']
                         grid_z = wall_spec['grid_z']
                         cell_size_y = size_y / grid_y
                         cell_size_z = size_z / grid_z
-                        back_x_pos = -room_back_dist.value
-                        x_pos = back_x_pos / 100.0
-                        y_pos = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
-                        z_pos = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
-                        dims = (0.01, cell_size_y / 100.0 * 0.98, cell_size_z / 100.0 * 0.98)
+                        x_pos = -room_back_dist.value / 100.0 + inward_offset
+                        y_c = (-size_y/2 + gj * cell_size_y + cell_size_y / 2) / 100.0
+                        z_c = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        positions_list.append([x_pos, y_c, z_c])
+                    
+                    elif wall_name == 'left':
+                        size_x = wall_spec['size_x']
+                        size_z = wall_spec['size_z']
+                        grid_x = wall_spec['grid_x']
+                        grid_z = wall_spec['grid_z']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_z = size_z / grid_z
+                        x_c = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_pos = -side_dist / 100.0 + inward_offset
+                        z_c = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        positions_list.append([x_c, y_pos, z_c])
+                    
+                    elif wall_name == 'right':
+                        size_x = wall_spec['size_x']
+                        size_z = wall_spec['size_z']
+                        grid_x = wall_spec['grid_x']
+                        grid_z = wall_spec['grid_z']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_z = size_z / grid_z
+                        x_c = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_pos = side_dist / 100.0 - inward_offset
+                        z_c = (-size_z/2 + gi * cell_size_z + cell_size_z / 2) / 100.0
+                        positions_list.append([x_c, y_pos, z_c])
+                    
+                    elif wall_name == 'top':
+                        size_x = wall_spec['size_x']
+                        size_y = wall_spec['size_y']
+                        grid_x = wall_spec['grid_x']
+                        grid_y = wall_spec['grid_y']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_y = size_y / grid_y
+                        x_c = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_c = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
+                        z_pos = top_bottom_dist / 100.0 - inward_offset
+                        positions_list.append([x_c, y_c, z_pos])
+                    
+                    elif wall_name == 'bottom':
+                        size_x = wall_spec['size_x']
+                        size_y = wall_spec['size_y']
+                        grid_x = wall_spec['grid_x']
+                        grid_y = wall_spec['grid_y']
+                        x_min = wall_spec['x_min']
+                        cell_size_x = size_x / grid_x
+                        cell_size_y = size_y / grid_y
+                        x_c = (x_min + gj * cell_size_x + cell_size_x / 2) / 100.0
+                        y_c = (-size_y/2 + gi * cell_size_y + cell_size_y / 2) / 100.0
+                        z_pos = -top_bottom_dist / 100.0 + inward_offset
+                        positions_list.append([x_c, y_c, z_pos])
                     else:
                         continue
                     
-                    handle = server.scene.add_box(
-                        f"/room_intensity/{wall_name}/cell_{gi}_{gj}",
-                        dimensions=dims,
-                        color=color,
-                        position=(x_pos, y_pos, z_pos),
-                    )
-                    room_intensity_handles.append(handle)
+                    colors_list.append(color_uint8)
                     cells_created[wall_name] += 1
+            
+            # Create batched mesh for this wall
+            if len(positions_list) > 0:
+                n_cells = len(positions_list)
+                positions_np = np.array(positions_list, dtype=np.float32)
+                colors_np = np.array(colors_list, dtype=np.uint8)
+                
+                # Build wall-specific scaled quad vertices
+                if wall_name == 'front':
+                    cell_h = (wall_spec['size_y'] / wall_spec['grid_y']) / 100.0 * (1.0 - gap)
+                    cell_v = (wall_spec['size_z'] / wall_spec['grid_z']) / 100.0 * (1.0 - gap)
+                    # Quad in YZ plane, normal -X (inward)
+                    wall_verts = np.array([
+                        [0.0, -cell_h/2, -cell_v/2],
+                        [0.0, -cell_h/2,  cell_v/2],
+                        [0.0,  cell_h/2,  cell_v/2],
+                        [0.0,  cell_h/2, -cell_v/2],
+                    ], dtype=np.float32)
+                elif wall_name == 'back':
+                    cell_h = (wall_spec['size_y'] / wall_spec['grid_y']) / 100.0 * (1.0 - gap)
+                    cell_v = (wall_spec['size_z'] / wall_spec['grid_z']) / 100.0 * (1.0 - gap)
+                    # Quad in YZ plane, normal +X (inward)
+                    wall_verts = np.array([
+                        [0.0, -cell_h/2, -cell_v/2],
+                        [0.0,  cell_h/2, -cell_v/2],
+                        [0.0,  cell_h/2,  cell_v/2],
+                        [0.0, -cell_h/2,  cell_v/2],
+                    ], dtype=np.float32)
+                elif wall_name in ('left', 'right'):
+                    cell_h = (wall_spec['size_x'] / wall_spec['grid_x']) / 100.0 * (1.0 - gap)
+                    cell_v = (wall_spec['size_z'] / wall_spec['grid_z']) / 100.0 * (1.0 - gap)
+                    # Quad in XZ plane (left: normal +Y inward, right: normal -Y inward)
+                    if wall_name == 'left':
+                        wall_verts = np.array([
+                            [-cell_h/2, 0.0, -cell_v/2],
+                            [-cell_h/2, 0.0,  cell_v/2],
+                            [ cell_h/2, 0.0,  cell_v/2],
+                            [ cell_h/2, 0.0, -cell_v/2],
+                        ], dtype=np.float32)
+                    else:  # right
+                        wall_verts = np.array([
+                            [-cell_h/2, 0.0, -cell_v/2],
+                            [ cell_h/2, 0.0, -cell_v/2],
+                            [ cell_h/2, 0.0,  cell_v/2],
+                            [-cell_h/2, 0.0,  cell_v/2],
+                        ], dtype=np.float32)
+                elif wall_name == 'top':
+                    cell_h = (wall_spec['size_x'] / wall_spec['grid_x']) / 100.0 * (1.0 - gap)
+                    cell_v = (wall_spec['size_y'] / wall_spec['grid_y']) / 100.0 * (1.0 - gap)
+                    # Quad in XY plane, normal -Z (inward, visible from below)
+                    wall_verts = np.array([
+                        [-cell_h/2, -cell_v/2, 0.0],
+                        [-cell_h/2,  cell_v/2, 0.0],
+                        [ cell_h/2,  cell_v/2, 0.0],
+                        [ cell_h/2, -cell_v/2, 0.0],
+                    ], dtype=np.float32)
+                else:  # bottom
+                    cell_h = (wall_spec['size_x'] / wall_spec['grid_x']) / 100.0 * (1.0 - gap)
+                    cell_v = (wall_spec['size_y'] / wall_spec['grid_y']) / 100.0 * (1.0 - gap)
+                    # Quad in XY plane, normal +Z (inward, visible from above)
+                    wall_verts = np.array([
+                        [-cell_h/2, -cell_v/2, 0.0],
+                        [ cell_h/2, -cell_v/2, 0.0],
+                        [ cell_h/2,  cell_v/2, 0.0],
+                        [-cell_h/2,  cell_v/2, 0.0],
+                    ], dtype=np.float32)
+                
+                wall_faces = np.array([[0,1,2],[0,2,3]], dtype=np.uint32)
+                q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                wxyzs_np = np.tile(q, (n_cells, 1)).astype(np.float32)
+                
+                handle = server.scene.add_batched_meshes_simple(
+                    name=f"/room_intensity/{wall_name}",
+                    vertices=wall_verts,
+                    faces=wall_faces,
+                    batched_wxyzs=wxyzs_np,
+                    batched_positions=positions_np,
+                    batched_colors=colors_np,
+                    flat_shading=True,
+                    side='front',
+                    cast_shadow=False,
+                    receive_shadow=False,
+                    visible=True,
+                )
+                room_intensity_handles.append(handle)
         
         print(f"Cells visualized:")
         for wall_name, count in cells_created.items():
@@ -5851,8 +9542,13 @@ def main():
         print(f"===================================\n")
         
         # Update legend (grid stores lux)
-        legend_steps = 6
-        legend_vals_lux = np.linspace(0, max_lux, legend_steps)
+        # Fixed legend ticks at absolute values up to color_scale_max
+        _legend_cap = float(legend_max_input.value)
+        if color_scale_max <= _legend_cap:
+            _step = max(1, _legend_cap / 8)
+            legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
+        else:
+            legend_vals_lux = np.linspace(0, color_scale_max, 9)
         # Calculate average cell area across all walls for lux to lumen conversion
         total_cells = 0
         total_area_cm2 = 0
@@ -5874,21 +9570,28 @@ def main():
         avg_cell_area_cm2 = total_area_cm2 / total_cells if total_cells > 0 else 1.0
         avg_cell_area_m2 = avg_cell_area_cm2 / 10000.0
         
+        scale_label = f"(scale 0–{int(color_scale_max)} lx" + (", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
         html_lines = ["<div style='font-family: sans-serif;'>",
-                      "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend (lux)</div>"]
+                      f"<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
+                      f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} — peak {max_lux:.0f} lx</div>"]
         for lux_val in reversed(legend_vals_lux):
-            color = intensity_to_color(lux_val, max_lux)
+            color = intensity_to_color(lux_val, color_scale_max)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
             # Convert lux to lumens using average cell area: Lumen = Lux × Area
             lumen_val = lux_val * avg_cell_area_m2
             html_lines.append(
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{lux_val:.1f} lx</div>"
+                f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
                 f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell avg)</div></div>"
             )
         html_lines.append("</div>")
-        legend_html.content = "".join(html_lines)
+        # --- Uniformity metrics (combine all room wall grids) ---
+        all_active = np.concatenate([g[g > 0] for g in grids.values() if g[g > 0].size > 0]) if grids else np.array([])
+        room_uniformity_grid = all_active.reshape(-1) if all_active.size > 0 else np.zeros(1)
+        # Build a pseudo-2D array so the helper works (it just needs grid > 0)
+        uniformity_html = _compute_uniformity_html(room_uniformity_grid.reshape(1, -1))
+        legend_html.content = "".join(html_lines) + uniformity_html
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
@@ -6072,6 +9775,11 @@ def main():
                 if original_row_dirs:
                     rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
                     config['led_row_directions'] = rotated_row_dirs
+            # Pass lumens override for custom group
+            if group.get('lumens_override') and group['lumens_override'].value:
+                config['lumens_override'] = float(group['lumens_value'].value)
+            else:
+                config['lumens_override'] = None
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -6089,7 +9797,17 @@ def main():
                 'size': led['size'].value,
                 'viewing_angle': led['viewing_angle'].value,
                 'square_roll': led['square_roll'].value,
+                'beam_tilt': led['beam_tilt'].value,
             }
+            # Pass lumens override for individual LED
+            if led.get('lumens_override') and led['lumens_override'].value:
+                config['lumens_override'] = float(led['lumens_value'].value)
+            else:
+                config['lumens_override'] = None
+            # Pass external lens settings
+            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
+                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
+                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
             individual_leds_configs.append(config)
         
         leds = create_leds(
@@ -6108,6 +9826,41 @@ def main():
             create_base_groups=any(led_states[:48]),
         )
         
+        # ── Apply global Z rotation to all LEDs ──
+        global_rot_z_deg = global_rotation_z_slider.value
+        if abs(global_rot_z_deg) > 0.01:
+            g_rad = np.radians(global_rot_z_deg)
+            cg, sg = np.cos(g_rad), np.sin(g_rad)
+            Rg = np.array([[cg, -sg, 0],
+                           [sg,  cg, 0],
+                           [0,   0,  1]], dtype=float)
+            for led in leds:
+                led.position = Rg @ led.position
+                led.direction = Rg @ led.direction
+                if hasattr(led, 'row_direction') and led.row_direction is not None:
+                    led.row_direction = Rg @ np.asarray(led.row_direction)
+                if hasattr(led, 'square_normal') and led.square_normal is not None:
+                    led.square_normal = Rg @ np.asarray(led.square_normal)
+
+        # ── Apply global position offset to all LEDs ──
+        _gp_x = global_pos_x_slider.value
+        _gp_y = global_pos_y_slider.value
+        _gp_z = global_pos_z_slider.value
+        if abs(_gp_x) > 0.001 or abs(_gp_y) > 0.001 or abs(_gp_z) > 0.001:
+            _gp_offset = np.array([_gp_x, _gp_y, _gp_z], dtype=float)
+            for led in leds:
+                led.position = led.position + _gp_offset
+
+        # ── Apply diffuser lens effect ──
+        # A diffuser lens scatters light, widening the viewing angle toward
+        # a near-Lambertian distribution.  The transmission loss is applied
+        # separately in the simulation functions (lumens_per_led *= transmission).
+        if diffuser_enable_chk.value:
+            diff_angle = float(diffuser_angle_slider.value)
+            for led in leds:
+                # Widen to diffuser output angle (only if wider than native)
+                led.viewing_angle = max(led.viewing_angle, diff_angle)
+
         # Save LEDs for reuse in room intensity calculation
         current_leds = leds
         
@@ -6195,6 +9948,29 @@ def main():
                 'rotation': (qw, qx, qy, qz),
             })
 
+        # ── Apply global Z rotation to absorbers ──
+        if abs(global_rot_z_deg) > 0.01:
+            for a in absorbers:
+                cx, cy, cz = a['center']
+                new_cx = cg * cx - sg * cy
+                new_cy = sg * cx + cg * cy
+                a['center'] = (new_cx, new_cy, cz)
+                # Compose global rotation with existing quaternion rotation
+                if a.get('rotation') is not None:
+                    qw0, qx0, qy0, qz0 = a['rotation']
+                    # Quaternion for Rg around Z: (cos(a/2), 0, 0, sin(a/2))
+                    half = g_rad / 2.0
+                    gqw, gqx, gqy, gqz = np.cos(half), 0.0, 0.0, np.sin(half)
+                    # q_new = q_global * q_existing
+                    nw = gqw*qw0 - gqx*qx0 - gqy*qy0 - gqz*qz0
+                    nx = gqw*qx0 + gqx*qw0 + gqy*qz0 - gqz*qy0
+                    ny = gqw*qy0 - gqx*qz0 + gqy*qw0 + gqz*qx0
+                    nz = gqw*qz0 + gqx*qy0 - gqy*qx0 + gqz*qw0
+                    a['rotation'] = (nw, nx, ny, nz)
+                else:
+                    half = g_rad / 2.0
+                    a['rotation'] = (np.cos(half), 0.0, 0.0, np.sin(half))
+
         # Draw absorber boxes (red) in the scene
         for idx, a in enumerate(absorbers):
             cx, cy, cz = a['center']
@@ -6227,8 +10003,9 @@ def main():
                 led_enabled = not (hasattr(led, 'enabled') and not led.enabled)
                 
                 # Build local coordinate system for LED
-                # z_axis = LED direction (normal to square)
-                z_axis = led.direction / np.linalg.norm(led.direction)
+                # Use square_normal (original direction) for mesh if beam_tilt is applied
+                square_dir = getattr(led, 'square_normal', led.direction)
+                z_axis = square_dir / np.linalg.norm(square_dir)
                 
                 # Use row_direction as reference for consistent square orientation across all rows
                 row_dir = getattr(led, 'row_direction', None)
@@ -6323,40 +10100,16 @@ def main():
         # Prepare STL mesh data for ray tracing visualization if enabled
         stl_mesh_for_raytracing = None
         if stl_absorber_enable.value and stl_mesh_data[0] is not None:
-            mesh = stl_mesh_data[0].copy()
-            
-            # Build transformation matrix
-            transform = np.eye(4)
-            
-            # Apply scale
-            scale = float(stl_scale.value)
-            if np.isfinite(scale) and scale > 0:
-                transform[:3, :3] *= scale
-            
-            # Apply rotations
-            rot_x = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
-            rot_y = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0  
-            rot_z = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
-            
-            if rot_x != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_x), [1, 0, 0])
-                transform = rot_mat @ transform
-            if rot_y != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_y), [0, 1, 0])
-                transform = rot_mat @ transform
-            if rot_z != 0:
-                rot_mat = trimesh.transformations.rotation_matrix(np.radians(rot_z), [0, 0, 1])
-                transform = rot_mat @ transform
-            
-            # Apply translation
-            pos_x = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
-            pos_y = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
-            pos_z = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
-            transform[:3, 3] = [pos_x, pos_y, pos_z]
-            
+            mesh_ref = stl_mesh_data[0]
+            transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
+            # Apply global Z rotation to STL transform
+            if abs(global_rot_z_deg) > 0.01:
+                T_global = np.eye(4)
+                T_global[:3, :3] = Rg
+                transform = T_global @ transform
             stl_mesh_for_raytracing = {
-                'vertices': mesh.vertices,
-                'faces': mesh.faces,
+                'vertices': mesh_ref.vertices,
+                'faces': mesh_ref.faces,
                 'transform': transform
             }
 
@@ -6462,16 +10215,14 @@ def main():
                     for k in range(num_random_rays):
                         # Random direction within viewing cone using cosine power distribution
                         u1, u2 = np.random.uniform(0, 1, 2)
-                        max_theta = np.radians(led.viewing_angle / 2.0)  # Half-angle for proper cone - use LED's specific viewing angle
                         
                         uniformity = float(ray_uniformity_slider.value)
-                        n = 1.0 + uniformity * 3.0  # Exponent from 1 to 4
+                        n = _get_effective_n(led, uniformity)
                         
-                        # Cosine power distribution sampling with clamping
+                        _vis_angle = getattr(led, 'ext_lens_angle', None) or led.viewing_angle
+                        max_theta = np.radians(_vis_angle / 2.0)
                         cos_max = np.cos(max_theta)
-                        base = 1 - u1 * (1 - np.power(cos_max, n + 1))
-                        base = np.clip(base, 0.0, 1.0)
-                        cos_theta_sampled = np.power(base, 1.0 / (n + 1))
+                        cos_theta_sampled = 1.0 - u1 * (1.0 - cos_max)
                         cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)
                         theta = np.arccos(cos_theta_sampled)
                         phi = 2 * np.pi * u2
@@ -6608,7 +10359,14 @@ def main():
             # Draw FOV border lines only (no fill)
             half_w = fov_width_cm / 200.0  # Half width in meters
             half_h = fov_height_cm / 200.0  # Half height in meters
-            wall_x = wall_dist / 100.0 - 0.008
+            wall_x = wall_dist / 100.0 - 0.008  # Slightly in front of wall
+
+            # In room mode, clamp the FOV rectangle to the front wall boundaries
+            if room_mode_enable.value:
+                max_half_w = room_side_dist.value / 100.0        # wall half-width in m
+                max_half_h = room_top_bottom_dist.value / 100.0  # wall half-height in m
+                half_w = min(half_w, max_half_w)
+                half_h = min(half_h, max_half_h)
             
             # Four corner lines
             corners = [
@@ -6629,9 +10387,10 @@ def main():
     # Add static elements
     # Wall (at x = wall_dist)
     wall_dist_init = wall_dist_slider.value
+    wall_size_init = wall_view_size.value / 100.0  # cm -> m
     wall_handle = server.scene.add_box(
         "/wall",
-        dimensions=(0.01, 2.0, 2.0),  # 200cm x 200cm wall, thin
+        dimensions=(0.01, wall_size_init, wall_size_init),
         color=(0.5, 0.5, 0.5),
         position=(wall_dist_init / 100.0, 0.0, 0.0),
     )
@@ -6669,24 +10428,24 @@ def main():
         line_width=3.0,
     )
 
-    # Callback to update wall position
+    # Callback to update wall position and size
     def update_wall():
         nonlocal wall_handle
         if room_mode_enable.value:
             # In room mode, don't update main wall
             return
+        wall_dist = wall_dist_slider.value
+        wall_size_m = wall_view_size.value / 100.0  # cm -> m
         try:
-            wall_dist = wall_dist_slider.value
-            wall_handle.position = (wall_dist / 100.0, 0.0, 0.0)
+            wall_handle.remove()
         except (AttributeError, KeyError):
-            # Wall handle doesn't exist, recreate it
-            wall_dist = wall_dist_slider.value
-            wall_handle = server.scene.add_box(
-                "/wall",
-                dimensions=(0.01, 2.0, 2.0),
-                color=(0.5, 0.5, 0.5),
-                position=(wall_dist / 100.0, 0.0, 0.0),
-            )
+            pass
+        wall_handle = server.scene.add_box(
+            "/wall",
+            dimensions=(0.01, wall_size_m, wall_size_m),
+            color=(0.5, 0.5, 0.5),
+            position=(wall_dist / 100.0, 0.0, 0.0),
+        )
 
     # Function to update cell area info
     def update_cell_area_info():
@@ -6707,6 +10466,8 @@ def main():
 
     # Register callbacks
     viewing_angle_slider.on_update(lambda _: update_scene())
+    diffuser_enable_chk.on_update(lambda _: update_scene())
+    diffuser_angle_slider.on_update(lambda _: update_scene())
     rot_front_pos.on_update(lambda _: update_scene())
     rot_front_neg.on_update(lambda _: update_scene())
     rot_side_pos.on_update(lambda _: update_scene())
@@ -6730,6 +10491,25 @@ def main():
     offset_side_neg_z.on_update(lambda _: update_scene())
     radius_slider.on_update(lambda _: update_scene())
     circle_center_slider.on_update(lambda _: update_scene())
+    def _on_global_rotation_change(_):
+        """Handle global rotation slider: update LEDs immediately, debounce mesh update."""
+        update_scene()
+        # Schedule mesh update with debounce to avoid recomputing on every tick
+        import threading
+        if hasattr(_on_global_rotation_change, '_timer') and _on_global_rotation_change._timer is not None:
+            _on_global_rotation_change._timer.cancel()
+        def _deferred_mesh():
+            try:
+                update_stl_mesh(skip_lighting=True)
+            except Exception:
+                pass
+        _on_global_rotation_change._timer = threading.Timer(0.3, _deferred_mesh)
+        _on_global_rotation_change._timer.start()
+    _on_global_rotation_change._timer = None
+    global_rotation_z_slider.on_update(_on_global_rotation_change)
+    global_pos_x_slider.on_update(_on_global_rotation_change)
+    global_pos_y_slider.on_update(_on_global_rotation_change)
+    global_pos_z_slider.on_update(_on_global_rotation_change)
     ray_length_slider.on_update(lambda _: update_scene())
     led_lumens_slider.on_update(lambda _: None)  # No auto-update, use manual button
     show_random_rays.on_update(lambda _: update_scene())
@@ -6741,10 +10521,10 @@ def main():
     row3_chk.on_update(lambda _: update_scene())
     row4_chk.on_update(lambda _: update_scene())
     absorbers_enable.on_update(lambda _: (update_scene(), update_ui_visibility()))
-    show_camera_fov.on_update(lambda _: update_scene())
-    camera_fov_h.on_update(lambda _: update_scene())
-    camera_fov_v.on_update(lambda _: update_scene())
-    camera_pos_x.on_update(lambda _: update_scene())
+    show_camera_fov.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    camera_fov_h.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     abs0_off_x.on_update(lambda _: update_scene())
     abs0_off_y.on_update(lambda _: update_scene())
     abs0_off_z.on_update(lambda _: update_scene())
@@ -6791,9 +10571,10 @@ def main():
             room_wall_handles.clear()
             # Restore main wall
             wall_dist = wall_dist_slider.value
+            wall_size_m = wall_view_size.value / 100.0
             wall_handle = server.scene.add_box(
                 "/wall",
-                dimensions=(0.01, 2.0, 2.0),
+                dimensions=(0.01, wall_size_m, wall_size_m),
                 color=(0.5, 0.5, 0.5),
                 position=(wall_dist / 100.0, 0.0, 0.0),
             )
@@ -6801,13 +10582,33 @@ def main():
     room_mode_enable.on_update(on_room_mode_toggle)
     show_room_walls.on_update(lambda _: draw_room_walls())
     show_room_intensity.on_update(lambda _: (update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else draw_room_walls()) if room_mode_enable.value else None)
-    room_front_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
-    room_side_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
-    room_top_bottom_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
+    room_front_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
+    room_side_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
+    room_top_bottom_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     show_back_wall.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     room_back_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
-    wall_view_size.on_update(lambda _: None)  # No auto-update for expensive params
-    wall_dist_slider.on_update(lambda _: (update_wall(), update_scene()))
+    wall_view_size.on_update(lambda _: (update_wall(), update_cell_area_info()))  # Update wall size and cell area
+
+    def on_wall_dist_change(_):
+        """Clear stale intensity map when wall distance changes."""
+        # Remove old intensity visualization (values are no longer valid)
+        for h in intensity_handles:
+            try:
+                h.remove()
+            except KeyError:
+                pass
+        intensity_handles.clear()
+        # Update legend to inform user that recalculation is needed
+        legend_html.content = (
+            "<div style='font-family: sans-serif;'>"
+            "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+            "<div style='color:#F0AD4E;font-size:12px;'>⚠ Wall distance changed.<br>Click 'Update Intensity Map' to recalculate.</div>"
+            "</div>"
+        )
+        update_wall()
+        update_scene()
+
+    wall_dist_slider.on_update(on_wall_dist_change)
     
     # Register LED control button callbacks
     # Group buttons
@@ -6856,6 +10657,16 @@ def main():
     # Button for manual intensity map update
     update_intensity_button.on_click(lambda _: update_intensity_map())
     
+    # Button for exporting lux matrix
+    export_lux_matrix_button.on_click(lambda _: export_lux_matrix())
+    
+    # Button for running benchmark (multi-distance)
+    run_benchmark_button.on_click(lambda _: run_benchmark())
+    
+    # Buttons for CSV pattern import
+    csv_import_btn.on_click(lambda _: import_csv_pattern())
+    csv_clear_btn.on_click(lambda _: clear_csv_pattern())
+
     # Button for capturing FOV intensity image
     capture_fov_btn.on_click(lambda _: capture_camera_fov_image())
     
