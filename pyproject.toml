@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
     "numpy<2.0",
-    "pillow>=10.0.0",
+    "pillow>=12.3.0",
     "pvtrace>=2.1.6",
     "viser>=0.2.0",
     "trimesh>=4.0.0",
