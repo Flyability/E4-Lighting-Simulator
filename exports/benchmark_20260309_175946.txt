@@ -1,0 +1,33 @@
+NORMAL
+DISTANCE cm             10        20        30        50        80
+Simulator          92468.9   23168.7   10319.9    3708.5    1449.4
+DFRobot lux
+
+UNIFORMITY
+DISTANCE 50CM
+
+Y +200
+X scan                -400      -300      -200      -100         0       100       200       300       400
+Simulator              0.0       0.0       0.0       0.0       0.0       0.0       0.0       0.0       0.0
+DFRobot lux
+
+Y +100
+X scan                -400      -300      -200      -100         0       100       200       300       400
+Simulator              0.0       0.0       0.0       0.0    2842.6       0.0       0.0       0.0       0.0
+DFRobot lux
+
+Y center
+X scan                -400      -300      -200      -100         0       100       200       300       400
+Simulator              0.0       0.0       0.0    2911.3    3699.8    2842.7       0.0       0.0       0.0
+DFRobot lux
+
+Y -100
+X scan                -400      -300      -200      -100         0       100       200       300       400
+Simulator              0.0       0.0       0.0       0.0    2911.4       0.0       0.0       0.0       0.0
+DFRobot lux
+
+Y -200
+X scan                -400      -300      -200      -100         0       100       200       300       400
+Simulator              0.0       0.0       0.0       0.0       0.0       0.0       0.0       0.0       0.0
+DFRobot lux
+

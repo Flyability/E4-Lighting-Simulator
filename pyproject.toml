@@ -3,10 +3,21 @@ name = "e4-lightingdesign"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
     "numpy<2.0",
+    "pillow>=10.0.0",
     "pvtrace>=2.1.6",
     "viser>=0.2.0",
+    "trimesh>=4.0.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    # cupy 14.x requires numpy>=2.0, which conflicts with our numpy<2.0 pin (pvtrace)
+    "cupy-cuda12x>=13.0.0,<14",
+    "nvidia-cuda-nvrtc-cu12>=12.9.86",
+    "nvidia-cuda-runtime-cu12>=12.9.79",
+    "nvidia-curand-cu12>=10.3.10.19",
 ]

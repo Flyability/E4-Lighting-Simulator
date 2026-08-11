@@ -30,11 +30,11 @@ except ImportError as e:
 
 class LED:
     """
-    Square planar LED with hemispherical (Lambertian) emission pattern.
+    Square planar LED with uniform emission pattern across viewing cone.
     
     Attributes:
         width: Width and height of the square LED (cm)
-        viewing_angle: Half-angle of emission cone (degrees), 90 = hemisphere
+        viewing_angle: Half-angle of emission cone (degrees)
         power: Electrical power (Watts)
         efficiency: Luminous efficacy (lumens/Watt)
         position: (x, y, z) position in world coordinates
@@ -53,7 +53,7 @@ class LED:
     
     def emit_rays(self, num_rays):
         """
-        Generate rays with Lambertian (hemispherical) distribution.
+        Generate rays with uniform distribution across the viewing cone.
         Returns list of (position, direction) tuples in world coordinates.
         """
         rays = []
@@ -68,29 +68,32 @@ class LED:
         x_axis = x_axis / np.linalg.norm(x_axis)
         y_axis = np.cross(z_axis, x_axis)
         
-        for _ in range(num_rays):
-            # Lambertian distribution: cos(theta) weighted
-            # theta = arcsin(sqrt(random)), phi = 2*pi*random
-            u1, u2 = np.random.uniform(0, 1, 2)
-            theta = np.arcsin(np.sqrt(u1))  # Lambertian
-            phi = 2 * np.pi * u2
+        # Uniform grid sampling for uniform beam coverage
+        # From center (theta=0) to edge (theta=viewing_angle)
+        n_theta = max(10, int(np.sqrt(num_rays)))
+        n_phi = n_theta * 4  # More azimuthal samples for complete coverage
+        
+        for i_theta in range(n_theta + 1):  # +1 to include edge at viewing_angle
+            # At center (theta=0), all phi directions are the same, so only need 1 ray
+            n_phi_actual = 1 if i_theta == 0 else n_phi
             
-            # Limit to viewing angle
-            max_theta = np.radians(self.viewing_angle)
-            theta = theta * (max_theta / (np.pi/2))  # Scale to viewing angle
-            
-            # Local direction
-            local_dir = np.array([
-                np.sin(theta) * np.cos(phi),
-                np.sin(theta) * np.sin(phi),
-                np.cos(theta)
-            ])
-            
-            # Transform to world coordinates
-            world_dir = local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis
-            world_dir = world_dir / np.linalg.norm(world_dir)
-            
-            rays.append((self.position.copy(), world_dir))
+            for i_phi in range(n_phi_actual):
+                # Sample from 0 to viewing_angle (inclusive)
+                theta = i_theta / n_theta * np.radians(self.viewing_angle)
+                phi = i_phi / n_phi * 2 * np.pi if i_theta > 0 else 0
+                
+                # Local direction
+                local_dir = np.array([
+                    np.sin(theta) * np.cos(phi),
+                    np.sin(theta) * np.sin(phi),
+                    np.cos(theta)
+                ])
+                
+                # Transform to world coordinates
+                world_dir = local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis
+                world_dir = world_dir / np.linalg.norm(world_dir)
+                
+                rays.append((self.position.copy(), world_dir))
         
         return rays
     
@@ -130,7 +133,11 @@ class LED:
 def main():
     parser = argparse.ArgumentParser(description="Lighting Simulation")
     parser.add_argument("--visualize", action="store_true", help="Enable 3D visualization")
-    parser.add_argument("--rays", type=int, default=1000, help="Rays per light source for heatmap")
+    parser.add_argument("--rays", type=int, default=5000, help="Rays per light source for heatmap")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--show-rays", dest="show_rays", action="store_true", help="Show rays in 3D visualization")
+    group.add_argument("--hide-rays", dest="show_rays", action="store_false", help="Hide rays in 3D visualization")
+    parser.set_defaults(show_rays=True)
     args = parser.parse_args()
 
     # Units: cm
@@ -190,7 +197,7 @@ def main():
     
     # LED parameters
     led_width = 1.0  # cm (square LED)
-    led_viewing_angle = 60  # degrees half-angle (typical LED)
+    led_viewing_angle = 10  # degrees half-angle (typical LED)
     led_power = 1.0  # Watts
     led_efficiency = 100.0  # lumens/Watt
     
@@ -207,26 +214,81 @@ def main():
         x = circle_center_x + radius * np.cos(angle_rad)
         y = radius * np.sin(angle_rad)
         z = 0.0
-        position = (x, y, z)
         
-        # Direction: Normal to circumference = radially outward from circle center
+        # Direction: Normal to circumference = radially outward from circle center (before offset)
         # Vector from circle center to LED position
         dir_x = x - circle_center_x  # = radius * cos(angle)
         dir_y = y - 0  # = radius * sin(angle)
         dir_z = 0
+        
+        # Apply Y offset (green axis) based on group type to position only
+        # Front groups (i=0, i=1): ±6.5 cm (13 cm apart)
+        # Side groups (i=2, i=3): ±11.75 cm (23.5 cm apart)
+        if i in (0, 1):  # Front
+            y_offset = 6.5 if i == 0 else -6.5
+        else:  # Side (i in (2, 3))
+            y_offset = 11.75 if i == 2 else -11.75
+        y = y + y_offset
+        
+        position = (x, y, z)
         direction = (dir_x, dir_y, dir_z)
         
-        led = LED(
-            width=led_width,
-            viewing_angle=led_viewing_angle,
-            power=led_power,
-            efficiency=led_efficiency,
-            position=position,
-            direction=direction,
-            color=light_colors[i % len(light_colors)]
-        )
-        leds.append(led)
-        print(f"LED {i}: angle={angle_deg}°, pos=({x:.1f}, {y:.1f}, {z:.1f}), dir=({dir_x:.2f}, {dir_y:.2f}, {dir_z:.2f})")
+        # Create 4 rows, each with 3 sub-LEDs. Rows spaced by 5mm, LEDs in row spaced by 3mm.
+        z_axis = np.array(direction, dtype=float)
+        if np.linalg.norm(z_axis) == 0:
+            z_axis = np.array((1.0, 0.0, 0.0))
+        else:
+            z_axis = z_axis / np.linalg.norm(z_axis)
+
+        if abs(z_axis[2]) < 0.9:
+            x_axis = np.cross(z_axis, [0, 0, 1])
+        else:
+            x_axis = np.cross(z_axis, [0, 1, 0])
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+
+        led_spacing_cm = 0.3  # 3 mm
+        row_spacing_cm = 1 # 5 mm
+        inclinations = [-90, 30, -30, 90]
+        row_offsets = [(-1.5 * row_spacing_cm), (-0.5 * row_spacing_cm), (0.5 * row_spacing_cm), (1.5 * row_spacing_cm)]
+
+        for row_idx, alpha_deg in enumerate(inclinations):
+            alpha = np.radians(alpha_deg)
+            # Row direction: along X-axis (which is Y-green in the LED plane coordinate system)
+            row_dir = x_axis
+
+            # Center point for this row: distributed along Z axis (blue axis, vertical)
+            center_off = row_offsets[row_idx]
+            row_center = np.array((x, y, z)) + np.array([0, 0, 1]) * center_off
+
+            # If row 1 or 4 (indices 0 or 3), move row center 1 cm back toward circle center
+            if row_idx in (0, 1, 2, 3):
+                row_center = row_center - radial_unit * 1.0
+
+            # Compute rotated LED direction for this row
+            # Base azimuth: radial direction in XY plane (points toward group's angle)
+            radial = np.array((dir_x, dir_y, 0.0), dtype=float)
+            if np.linalg.norm(radial) == 0:
+                radial_unit = np.array((1.0, 0.0, 0.0))
+            else:
+                radial_unit = radial / np.linalg.norm(radial)
+            z_unit = np.array((0.0, 0.0, 1.0))
+            rotated_dir = np.cos(alpha) * radial_unit + (-np.sin(alpha)) * z_unit
+            rotated_dir = rotated_dir / np.linalg.norm(rotated_dir)
+
+            for off in [-led_spacing_cm, 0.0, led_spacing_cm]:
+                pos_off = tuple(row_center + row_dir * off)
+                led = LED(
+                    width=led_width,
+                    viewing_angle=led_viewing_angle,
+                    power=led_power,
+                    efficiency=led_efficiency,
+                    position=pos_off,
+                    direction=tuple(rotated_dir),
+                    color=light_colors[i % len(light_colors)]
+                )
+                leds.append(led)
+        print(f"LED group {i}: angle={angle_deg}°, center_pos=({x:.1f}, {y:.1f}, {z:.1f}), dir=({dir_x:.2f}, {dir_y:.2f}, {dir_z:.2f}) -> 4 rows x 3 LEDs")
 
     # 4. Run Simulation
     scene = Scene(world)
@@ -375,6 +437,7 @@ def main():
     # Visualization rays are separate (drawn below)
 
     hit_points = []
+    hit_weights = []
     
     print(f"Simulating {len(leds)} LEDs with {num_rays_per_light} rays each for heatmap...")
     
@@ -399,47 +462,48 @@ def main():
     # Ray tracing for heatmap AND visualization
     for led_idx, led in enumerate(leds):
         
-        # If visualizing, draw rays from this LED
+        # If visualizing, draw rays from this LED (optional)
         if renderer:
-            # Get visualization rays (chief + 4 marginals)
-            vis_rays = led.get_visualization_rays()
-            
-            # Also get 100 random rays for better coverage visualization
-            random_vis_rays = led.emit_rays(100)
-            
-            all_rays_to_draw = vis_rays + random_vis_rays
-            
-            for pos, direction in all_rays_to_draw:
-                # Create ray
-                r = Ray(
-                    position=tuple(pos),
-                    direction=tuple(direction),
-                    wavelength=555.0
-                )
-                
-                # Trace this ray
-                history = follow(scene, r)
-                
-                # Draw all segments but STOP at wall (x=50) to show solid wall
-                path_points = [ray_step.position for ray_step, evt in history]
-                
-                for j in range(len(path_points) - 1):
-                    start = path_points[j]
-                    end = path_points[j+1]
-                    
-                    # If ray crosses wall plane (x=50), clip it there
-                    if start[0] < 50.0 and end[0] >= 50.0:
-                        if abs(end[0] - start[0]) > 1e-6:
-                            t = (50.0 - start[0]) / (end[0] - start[0])
-                            end = (
-                                50.0,
-                                start[1] + t * (end[1] - start[1]),
-                                start[2] + t * (end[2] - start[2])
-                            )
-                        renderer.add_line_segment(start, end, colour=led.color)
-                        break  # Stop drawing - wall is solid
-                    else:
-                        renderer.add_line_segment(start, end, colour=led.color)
+            if args.show_rays:
+                # Get visualization rays (chief + 4 marginals)
+                vis_rays = led.get_visualization_rays()
+
+                # Also get 100 random rays for better coverage visualization
+                random_vis_rays = led.emit_rays(100)
+
+                all_rays_to_draw = vis_rays + random_vis_rays
+
+                for pos, direction in all_rays_to_draw:
+                    # Create ray
+                    r = Ray(
+                        position=tuple(pos),
+                        direction=tuple(direction),
+                        wavelength=555.0
+                    )
+
+                    # Trace this ray
+                    history = follow(scene, r)
+
+                    # Draw all segments but STOP at wall (x=50) to show solid wall
+                    path_points = [ray_step.position for ray_step, evt in history]
+
+                    for j in range(len(path_points) - 1):
+                        start = path_points[j]
+                        end = path_points[j+1]
+
+                        # If ray crosses wall plane (x=50), clip it there
+                        if start[0] < 50.0 and end[0] >= 50.0:
+                            if abs(end[0] - start[0]) > 1e-6:
+                                t = (50.0 - start[0]) / (end[0] - start[0])
+                                end = (
+                                    50.0,
+                                    start[1] + t * (end[1] - start[1]),
+                                    start[2] + t * (end[2] - start[2])
+                                )
+                            renderer.add_line_segment(start, end, colour=led.color)
+                            break  # Stop drawing - wall is solid
+                        else:
+                            renderer.add_line_segment(start, end, colour=led.color)
 
         # Heatmap rays (always run for PNG generation)
         rays_data = led.emit_rays(num_rays_per_light)
@@ -458,7 +522,10 @@ def main():
             for ray_step, event in history:
                 p = ray_step.position
                 if 49.9 < p[0] < 50.6:
+                    # Convert hit count to lumens using LED lumens and total rays per light
+                    lumens_per_ray = led.lumens / max(1, num_rays_per_light)
                     hit_points.append((p[1], p[2]))
+                    hit_weights.append(lumens_per_ray)
                     all_hit_points_3d.append((p[0], p[1], p[2], led.color))
                     wall_hits += 1
                     break
@@ -501,13 +568,14 @@ def main():
     if hit_points:
         hits_y = [p[0] for p in hit_points]
         hits_z = [p[1] for p in hit_points]
+        weights = hit_weights if hit_weights else None
         
         plt.figure(figsize=(10, 8))
         # 2D Histogram
         # Bin range should cover the wall size (-100 to 100)
         bins = 100
-        plt.hist2d(hits_y, hits_z, bins=bins, range=[[-100, 100], [-100, 100]], cmap='inferno')
-        plt.colorbar(label='Intensity (Ray Counts)')
+        plt.hist2d(hits_y, hits_z, bins=bins, range=[[-100, 100], [-100, 100]], cmap='inferno', weights=weights)
+        plt.colorbar(label='Intensity (Lumens)')
         plt.title(f'Lighting Intensity on Wall (Distance {wall_dist}cm)\n'
                   f'4 LEDs at ±{angles_deg[0]}°, ±{angles_deg[2]}° | '
                   f'Viewing angle: {led_viewing_angle}° | Circle radius: {radius}cm')

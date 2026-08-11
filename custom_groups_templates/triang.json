@@ -1,0 +1,54 @@
+{
+    "name": "Triang",
+    "groups": [],
+    "individual_leds": [
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "pos_z": 0.5,
+            "rot_x": 0,
+            "rot_y": -45,
+            "rot_z": 0,
+            "size": 0.5,
+            "viewing_angle": 60,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": 0.5,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 20,
+            "rot_z": 30,
+            "size": 0.5,
+            "viewing_angle": 60,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        },
+        {
+            "enabled": true,
+            "led_on": true,
+            "pos_x": 0.0,
+            "pos_y": -0.5,
+            "pos_z": 0.0,
+            "rot_x": 0,
+            "rot_y": 20,
+            "rot_z": -30,
+            "size": 0.5,
+            "viewing_angle": 60,
+            "square_roll": 0,
+            "beam_tilt": 0,
+            "lumens_override_enabled": false,
+            "lumens_value": 100
+        }
+    ]
+}

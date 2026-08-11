@@ -1,0 +1,98 @@
+{
+    "name": "Elios 3",
+    "description": "Configurazione standard: front +/-, side +/-",
+    "viewing_angle": 120,
+    "radius": 35,
+    "circle_center_x": -35,
+    "group_rotations": [
+        0.7,
+        -0.7,
+        18,
+        -18
+    ],
+    "group_rotations_y": [
+        0,
+        0,
+        0,
+        0
+    ],
+    "group_offsets": [
+        [
+            0.0,
+            1.6,
+            0.0
+        ],
+        [
+            0.0,
+            -1.6,
+            0.0
+        ],
+        [
+            -1.3,
+            -33.1,
+            0.0
+        ],
+        [
+            -1.3,
+            33.1,
+            0.0
+        ]
+    ],
+    "row_enabled": [
+        false,
+        true,
+        true,
+        false
+    ],
+    "led_states": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+    ],
+    "custom_groups": []
+}
