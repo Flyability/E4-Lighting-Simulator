@@ -2449,6 +2449,7 @@ def main():
             } if stl_mesh_data[0] is not None else None,
             "vio_cameras": {
                 "show": show_vio_fov.value,
+                "fill": vio_fill_fov.value,
                 "position": [vio_pos_x.value, vio_pos_y.value, vio_pos_z.value],
                 "cam1_pitch": vio_cam1_pitch.value,
                 "cam1_yaw": vio_cam1_yaw.value,
@@ -3236,6 +3237,7 @@ def main():
         vio_cfg = cfg.get("vio_cameras")
         if vio_cfg:
             show_vio_fov.value = vio_cfg.get("show", True)
+            vio_fill_fov.value = vio_cfg.get("fill", False)
             pos = vio_cfg.get("position", [3.0, 0.0, 0.0])
             vio_pos_x.value = pos[0]
             vio_pos_y.value = pos[1] if len(pos) > 1 else 0.0
@@ -4872,6 +4874,7 @@ def main():
     # VIO cameras (2× VD66GY equidistant fisheye)
     with server.gui.add_folder("VIO Cameras"):
         show_vio_fov = server.gui.add_checkbox("Show VIO FOV", initial_value=True)
+        vio_fill_fov = server.gui.add_checkbox("Fill VIO FOV", initial_value=False)
         vio_pos_x = server.gui.add_slider(
             "VIO X pos (cm)", min=-100, max=100, step=0.5, initial_value=3.0
         )
@@ -4908,7 +4911,7 @@ def main():
             "<div style='font-size:12px;margin-top:4px;'>"
             "<span style='color:#ff00ff;'>● Cam 1 (up)</span> &nbsp; "
             "<span style='color:#00ffff;'>● Cam 2 (down)</span>"
-            "<br><span style='color:#888;'>Semi-transparent fills show coverage; overlap is the mixed region.</span>"
+            "<br><span style='color:#888;'>Outline always shown. Enable Fill VIO FOV for semi-transparent coverage (hides intensity under the fill).</span>"
             "</div>"
         )
 
@@ -10721,7 +10724,7 @@ def main():
                     vio_wall_dist, vio_half_y, vio_half_z, n_grid=90,
                 )
                 verts, faces, segs_m = fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m)
-                if len(faces) > 0:
+                if vio_fill_fov.value and len(faces) > 0:
                     fill = server.scene.add_mesh_simple(
                         name=f"/vio_cam{cam_id}/fov_fill",
                         vertices=verts,
@@ -10902,6 +10905,7 @@ def main():
     camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     show_vio_fov.on_update(lambda _: update_scene())
+    vio_fill_fov.on_update(lambda _: update_scene())
     vio_pos_x.on_update(lambda _: update_scene())
     vio_pos_y.on_update(lambda _: update_scene())
     vio_pos_z.on_update(lambda _: update_scene())
