@@ -532,6 +532,7 @@ def create_leds(
                     led.led_index = led_index  # Store the global index
                     led.row_direction = rotated_row_dir.copy()  # Store rotated row direction for consistent square orientation
                     led.lumens = None  # No per-LED lumens override for base groups
+                    led.owner = ('base_group', i)
                     leds.append(led)
                     led_index += 1
 
@@ -608,6 +609,7 @@ def create_leds(
                 led.is_custom = True  # Mark as custom group LED
                 led.is_dynamic_group = True  # Mark as dynamic group LED
                 led.lumens = custom_group_config.get('lumens_override', None)  # Per-group lumens override
+                led.owner = custom_group_config.get('owner')
                 leds.append(led)
                 led_index += 1
         else:
@@ -755,6 +757,7 @@ def create_leds(
                     led.row_direction = rotated_row_dir.copy()
                     led.is_custom = True  # Mark as custom group LED
                     led.lumens = custom_group_config.get('lumens_override', None)  # Per-group lumens override
+                    led.owner = custom_group_config.get('owner')
                     leds.append(led)
                     led_index += 1
 
@@ -860,6 +863,7 @@ def create_leds(
         led.square_normal = direction  # Store original direction for square mesh orientation
         led.is_individual = True  # Mark as individual LED
         led.lumens = individual_led_config.get('lumens_override', None)  # Per-LED lumens override
+        led.owner = individual_led_config.get('owner')
         # Apply external collimating lens (per-LED)
         ext_lens_angle = individual_led_config.get('ext_lens_angle', None)
         if ext_lens_angle is not None:
@@ -2066,8 +2070,8 @@ def main():
     # Create Viser server — bind to 0.0.0.0 so other computers on the LAN can connect
     server = viser.ViserServer(host="0.0.0.0", port=8080)
     
-    # Allow users to collapse/hide the control panel
-    server.gui.configure_theme(control_layout="collapsible", dark_mode=True)
+    # Dark theme; panel placement is handled via main_panel.dock_right() below
+    server.gui.configure_theme(dark_mode=True)
     
     # Get local IP for LAN access
     import socket as _socket
@@ -2172,6 +2176,44 @@ def main():
     
     # Group colors (defined early for use in config functions)
     group_colors_hex = ["#FF3333", "#33FF33", "#3333FF", "#FFFF33"]
+
+    # --- UI layout: docked/floating panels + main-panel tabs (viser 1.1+) ---
+    server.gui.set_panel_label("Controls")
+    server.gui.main_panel.dock_right()
+    server.gui.main_panel.set_width(400)
+
+    main_tabs = server.gui.add_tab_group()
+    tab_project = main_tabs.add_tab("Project")
+    tab_panels = main_tabs.add_tab("Panels & LEDs")
+    tab_fov = main_tabs.add_tab("FOV")
+    tab_advanced = main_tabs.add_tab("Advanced")
+
+    # Small single-tab panel (renders as a plain header) with the intensity
+    # quick controls, docked at the top-left above the tabbed panel.
+    quick_panel = server.gui.add_panel()
+    quick_tab = quick_panel.add_tab("Intensity Map")
+    quick_panel.dock_left()
+    quick_panel.set_width(320)
+
+    left_panel = server.gui.add_panel()
+    toolbar_tab = left_panel.add_tab("Display")
+    global_tab = left_panel.add_tab("Global")
+    left_panel.dock_below(quick_panel)
+    left_panel.set_width(320)
+
+    inspector_panel = server.gui.add_panel()
+    inspector_tab = inspector_panel.add_tab("Selected")
+    inspector_panel.float(x=-12, y=48)
+    inspector_panel.set_width(340)
+
+    selected_owner = [None]
+    _just_clicked_mesh = [False]
+    _inspector_handles = []
+    _inspector_syncing = [False]
+    _select_panel_impl = [lambda owner: None]
+
+    def select_panel(owner):
+        _select_panel_impl[0](owner)
 
     def get_current_config():
         """Retrieve current GUI values for saving."""
@@ -2519,6 +2561,7 @@ def main():
         """Update GUI elements with values from config."""
         nonlocal loading_in_progress
         loading_in_progress[0] = True  # Disable callbacks during loading
+        select_panel(None)
         
         # Clear all existing custom groups first (this calls update_scene())
         clear_all_custom_groups()
@@ -2670,7 +2713,8 @@ def main():
             print(f"Recreating template folder: {template_name} with {len(template_groups_cfg)} group(s)")
             
             # Create master folder
-            template_folder = server.gui.add_folder(f"Template: {template_name}")
+            with tab_panels:
+                template_folder = server.gui.add_folder(f"Template: {template_name}")
             
             with template_folder:
                 master_enable = server.gui.add_checkbox("Enable All", initial_value=True)
@@ -3295,6 +3339,8 @@ def main():
         
         print("Creating new empty project...")
         
+        select_panel(None)
+        
         # Clear current config name
         current_config_name[0] = ""
         
@@ -3445,7 +3491,8 @@ def main():
             }]
         
         # Create a master folder with shared controls for this template
-        template_folder = server.gui.add_folder(f"Template: {template.get('name', template_name)}")
+        with tab_panels:
+            template_folder = server.gui.add_folder(f"Template: {template.get('name', template_name)}")
         
         with template_folder:
             master_enable = server.gui.add_checkbox("Enable All", initial_value=True)
@@ -4080,7 +4127,9 @@ def main():
         return created_groups
 
     # --- GUI Controls ---
-    with server.gui.add_folder("Project Management"):
+    with tab_project:
+        _project_folder = server.gui.add_folder("Project Management")
+    with _project_folder:
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Start a new project or load existing</div>")
         
         new_project_btn = server.gui.add_button("🆕 New Project (Empty)", color="#4CAF50")
@@ -4225,7 +4274,8 @@ def main():
     # Store reference to LED Configuration folder and visibility state
     base_groups_active = [False]  # Track if base LED groups are active in current project
     
-    led_config_folder = server.gui.add_folder("LED Configuration (Base Groups)")
+    with tab_panels:
+        led_config_folder = server.gui.add_folder("LED Configuration (Base Groups)")
     led_config_folder.visible = False  # Hidden by default (empty project)
     
     with led_config_folder:
@@ -4267,7 +4317,8 @@ def main():
                 offset_side_neg_y = server.gui.add_slider("Offset Y (cm)", min=-40, max=50, step=0.1, initial_value=33.1)
                 offset_side_neg_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
 
-    with server.gui.add_folder("Geometry"):
+    with global_tab:
+        server.gui.add_markdown("**Geometry**")
         radius_slider = server.gui.add_slider(
             "Circle radius (cm)", min=10, max=60, step=1, initial_value=35
         )
@@ -4291,8 +4342,33 @@ def main():
         global_pos_z_slider = server.gui.add_slider(
             "Global offset Z (cm)", min=-100, max=100, step=0.5, initial_value=0
         )
+        server.gui.add_html("<hr style='margin:8px 0;'><b>Wall Settings:</b>")
+        intensity_grid_size = server.gui.add_slider(
+            "Wall grid resolution", min=5, max=1000 , step=5, initial_value=30
+        )
+        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=100)
+        bw_scale_chk = server.gui.add_checkbox("B/W Scale", initial_value=False)
+        legend_max_input = server.gui.add_number("Legend max (lux)", initial_value=3500, min=1, max=100000, step=50)
+        server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap: colors scale 0–this value. If peak exceeds it, switches to AUTO.</div>")
+        cell_area_html = server.gui.add_html(
+            "<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
+            "Cell area: calculating..."
+            "</div>"
+        )
+        legend_html = server.gui.add_html(
+            "<div style='font-family: sans-serif;'>"
+            "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+            "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click<br>'Update Intensity Map' to populate legend</div>"
+            "</div>"
+        )
 
-    with server.gui.add_folder("Display"):
+    with quick_tab:
+        update_intensity_button = server.gui.add_button("Update Intensity Map")
+        show_intensity_map = server.gui.add_checkbox(
+            "Show intensity on wall", initial_value=False
+        )
+
+    with toolbar_tab:
         ray_length_slider = server.gui.add_slider(
             "Ray length (cm)", min=20, max=100, step=5, initial_value=60
         )
@@ -4305,9 +4381,6 @@ def main():
         show_led_markers = server.gui.add_checkbox(
             "Show LED markers", initial_value=True
         ) 
-        show_intensity_map = server.gui.add_checkbox(
-            "Show intensity on wall", initial_value=False
-        )
         intensity_rays_slider = server.gui.add_slider(
             "Rays per pixel (↑quality, ↓speed)", min=10, max=500000, step=10, initial_value=10500
         )
@@ -4336,33 +4409,13 @@ def main():
         calibration_factor_slider = server.gui.add_slider(
             "Calibration factor", min=0.5, max=1.5, step=0.001, initial_value=1.0
         )
-        intensity_grid_size = server.gui.add_slider(
-            "Wall grid resolution", min=5, max=1000 , step=5, initial_value=30
-        )
-        # Cell area info (updated dynamically)
-        cell_area_html = server.gui.add_html(
-            "<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
-            "Cell area: calculating..."
-            "</div>"
-        )
-        # Intensity legend shown under the sliders as HTML with color swatches
-        legend_html = server.gui.add_html(
-            "<div style='font-family: sans-serif;'>"
-            "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-            "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click<br>'Update Intensity Map' to populate legend</div>"
-            "</div>"
-        )
-        bw_scale_chk = server.gui.add_checkbox("B/W Scale", initial_value=False)
-        legend_max_input = server.gui.add_number("Legend max (lux)", initial_value=3500, min=1, max=100000, step=50)
-        server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap: colors scale 0–this value. If peak exceeds it, switches to AUTO.</div>")
-        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=100)
-        # Manual update button for intensity map (computationally expensive)
-        update_intensity_button = server.gui.add_button("Update Intensity Map")
-        export_lux_matrix_button = server.gui.add_button("Export Lux Matrix (±40cm)")
         run_benchmark_button = server.gui.add_button("Run Benchmark (multi-distance)")
+        export_lux_matrix_button = server.gui.add_button("Export Lux Matrix (±40cm)")
 
     # --- CSV Pattern Import (initially collapsed) ---
-    with server.gui.add_folder("📊 Import CSV Pattern", expand_by_default=False):
+    with tab_advanced:
+        _csv_folder = server.gui.add_folder("📊 Import CSV Pattern", expand_by_default=False)
+    with _csv_folder:
         server.gui.add_html(
             "<div style='color:#888;font-size:11px;margin-bottom:6px;'>"
             "Import a benchmark or FOV intensity CSV and overlay the measured pattern on the wall."
@@ -4430,7 +4483,9 @@ def main():
         transform[:3, 3] = [px, py, pz]
         return transform
 
-    with server.gui.add_folder("3D Models (STL)"):
+    with tab_advanced:
+        _stl_folder = server.gui.add_folder("3D Models (STL)")
+    with _stl_folder:
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Import 3D CAD models</div>")
         stl_file_path = server.gui.add_text("STL File Path", initial_value=r"C:\Users\gianmatteo.marietti_\Downloads\109045 E3 CAGE ASSEMBLY_Coarse.STL")
         stl_load_button = server.gui.add_button("📂 Load STL", color="#4CAF50")
@@ -4803,7 +4858,9 @@ def main():
         stl_absorber_enable.on_update(safe_update_stl_absorber)
 
     # Room Mode - Cubic room with 5 or 6 walls (back wall optional)
-    with server.gui.add_folder("Room Mode"):
+    with tab_advanced:
+        _room_folder = server.gui.add_folder("Room Mode")
+    with _room_folder:
         room_mode_enable = server.gui.add_checkbox("Enable Room Mode", initial_value=False)
         show_room_walls = server.gui.add_checkbox("Show Room Walls", initial_value=True)
         show_room_intensity = server.gui.add_checkbox("Show Room Intensity", initial_value=False)
@@ -4858,7 +4915,9 @@ def main():
                 custom_reflectance_slider.value = _MATERIAL_REFLECTANCE[mat]
 
     # Camera FOV visualization
-    with server.gui.add_folder("Camera FOV"):
+    with tab_fov:
+        _cam_folder = server.gui.add_folder("Camera FOV")
+    with _cam_folder:
         show_camera_fov = server.gui.add_checkbox("Show Camera FOV", initial_value=True)
         camera_fov_h = server.gui.add_slider(
             "Horizontal FOV (°)", min=10, max=120, step=1, initial_value=75
@@ -4872,7 +4931,9 @@ def main():
         capture_fov_btn = server.gui.add_button("Capture FOV Image", color="green")
 
     # VIO cameras (2× VD66GY equidistant fisheye)
-    with server.gui.add_folder("VIO Cameras"):
+    with tab_fov:
+        _vio_folder = server.gui.add_folder("VIO Cameras")
+    with _vio_folder:
         show_vio_fov = server.gui.add_checkbox("Show VIO FOV", initial_value=True)
         vio_fill_fov = server.gui.add_checkbox("Fill VIO FOV", initial_value=False)
         vio_pos_x = server.gui.add_slider(
@@ -5052,7 +5113,8 @@ def main():
         return final_colors
 
     # Absorbers folder (separate group for easier access)
-    absorbers_folder = server.gui.add_folder("Absorbers")
+    with tab_advanced:
+        absorbers_folder = server.gui.add_folder("Absorbers")
     absorbers_folder.visible = False  # Hidden by default
     
     with absorbers_folder:
@@ -5073,7 +5135,9 @@ def main():
         abs3_rot_z = server.gui.add_slider("Abs3 rotation Z (deg)", min=-180, max=180, step=1, initial_value=14)
 
     # Custom LED Groups folder (dynamic groups)
-    custom_groups_folder = server.gui.add_folder("Custom LED Groups")
+    with tab_panels:
+        custom_groups_folder = server.gui.add_folder("Custom LED Groups")
+        server.gui.add_markdown("Click a panel or LED group in the 3D view to edit its parameters.")
     template_dropdown = None  # Will be initialized later
     
     def create_custom_group(skip_update_scene=False, num_leds=12, led_rows=None, group_name=None):
@@ -5112,6 +5176,7 @@ def main():
         with custom_groups_folder:
             folder_name = group_name if group_name else f"Custom Group {group_id}"
             group_folder = server.gui.add_folder(folder_name)
+            group_folder.visible = False  # Edited via 3D click → inspector panel
         
         with group_folder:
             enable_chk = server.gui.add_checkbox("Enable", initial_value=True)
@@ -5238,9 +5303,13 @@ def main():
         
         def on_remove(_):
             """Remove this group."""
-            custom_groups.remove(group_data)
+            if group_data in custom_groups:
+                custom_groups.remove(group_data)
             group_folder.remove()
-            update_scene()
+            if selected_owner[0] == ('custom_group', group_id):
+                select_panel(None)
+            else:
+                update_scene()
         
         all_btn.on_click(on_all_click)
         for row_idx, led_indices in enumerate(led_rows):
@@ -5362,6 +5431,7 @@ def main():
         # Only update scene if not skipping (e.g., when manually adding a group)
         if not skip_update_scene:
             update_scene()
+            select_panel(('custom_group', group_id))
         
         return group_data
     
@@ -5664,7 +5734,9 @@ def main():
         mode_label = "Individual LEDs" if as_individual else "Solid Group"
 
         # Create a master folder for this slot
-        slot_folder = server.gui.add_folder(f"Slot {slot_label}: {template_display} ({mode_label})")
+        with tab_panels:
+            slot_folder = server.gui.add_folder(f"Slot {slot_label}: {template_display} ({mode_label})")
+        slot_folder.visible = False  # Edited via 3D click → inspector panel
 
         with slot_folder:
             slot_enable = server.gui.add_checkbox("Enable Slot", initial_value=True)
@@ -5681,6 +5753,8 @@ def main():
 
         created_groups = []
         created_individual_leds = []
+        _slot_led_buttons = []
+        _update_slot_btn_colors = None
 
         if as_individual:
             # --- Load as individual LEDs ---
@@ -6088,6 +6162,21 @@ def main():
             'folder': slot_folder,
             'groups': created_groups,
             'individual_leds': created_individual_leds,
+            'slot_label': slot_label,
+            'template_display': template_display,
+            'controls': {
+                'enable': slot_enable,
+                'pos_x': slot_pos_x,
+                'pos_y': slot_pos_y,
+                'pos_z': slot_pos_z,
+                'rot_x': slot_rot_x,
+                'rot_y': slot_rot_y,
+                'rot_z': slot_rot_z,
+                'lumens_chk': slot_lumens_chk,
+                'lumens_slider': slot_lumens_slider,
+            },
+            'led_button_groups': _slot_led_buttons,
+            'update_btn_colors': _update_slot_btn_colors,
         }
 
         # Also register in template_folders for cleanup on new project
@@ -6098,6 +6187,7 @@ def main():
 
         loading_in_progress[0] = False
         update_scene()
+        select_panel(('slot', slot_idx))
         print(f"✓ Panel Configurator: Loaded '{template_display}' into slot {slot_label} ({mode_label})")
 
     def _clear_panel_slot(slot_idx):
@@ -6132,9 +6222,12 @@ def main():
                 template_folders.remove(tf)
                 break
         _panel_slot_data[slot_idx] = None
+        if selected_owner[0] == ('slot', slot_idx):
+            select_panel(None)
 
     # --- Panel Configurator UI ---
-    panel_config_folder = server.gui.add_folder("Panel Configurator (Elios 3 Slots)", expand_by_default=False)
+    with tab_panels:
+        panel_config_folder = server.gui.add_folder("Panel Configurator (Elios 3 Slots)", expand_by_default=False)
 
     _panel_dropdowns = []
     _panel_mode_dropdowns = []
@@ -6394,7 +6487,8 @@ def main():
         print("  Edit each LED individually - they will be saved as a group when you save the project")
 
     # Individual LEDs folder (single LED management)
-    individual_leds_folder = server.gui.add_folder("Individual LEDs")
+    with tab_panels:
+        individual_leds_folder = server.gui.add_folder("Individual LEDs")
     
     def create_individual_led(skip_update_scene=False):
         """Create a new individual LED with position and rotation controls."""
@@ -7897,6 +7991,10 @@ def main():
                 config['lumens_override'] = float(group['lumens_value'].value)
             else:
                 config['lumens_override'] = None
+            if group.get('panel_slot') is not None:
+                config['owner'] = ('slot', group['panel_slot'])
+            else:
+                config['owner'] = ('custom_group', group['id'])
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -7925,6 +8023,10 @@ def main():
             if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
                 config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
                 config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
+            for _si, _pdata in enumerate(_panel_slot_data):
+                if _pdata and led in _pdata.get('individual_leds', []):
+                    config['owner'] = ('slot', _si)
+                    break
             individual_leds_configs.append(config)
         
         leds = create_leds(
@@ -8440,6 +8542,10 @@ def main():
                 config['lumens_override'] = float(group['lumens_value'].value)
             else:
                 config['lumens_override'] = None
+            if group.get('panel_slot') is not None:
+                config['owner'] = ('slot', group['panel_slot'])
+            else:
+                config['owner'] = ('custom_group', group['id'])
             custom_groups_configs.append(config)
 
         individual_leds_configs = []
@@ -8460,6 +8566,10 @@ def main():
             if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
                 config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
                 config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
+            for _si, _pdata in enumerate(_panel_slot_data):
+                if _pdata and led in _pdata.get('individual_leds', []):
+                    config['owner'] = ('slot', _si)
+                    break
             individual_leds_configs.append(config)
 
         leds = create_leds(
@@ -9906,6 +10016,288 @@ def main():
         # Build a pseudo-2D array so the helper works (it just needs grid > 0)
         uniformity_html = _compute_uniformity_html(room_uniformity_grid.reshape(1, -1))
         legend_html.content = "".join(html_lines) + uniformity_html
+
+    def _clear_inspector():
+        for h in _inspector_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        _inspector_handles.clear()
+
+    def _inspector_add(handle):
+        _inspector_handles.append(handle)
+        return handle
+
+    def _mirror_slider(label, src, minv, maxv, step):
+        sl = server.gui.add_slider(label, min=minv, max=maxv, step=step, initial_value=src.value)
+        _inspector_add(sl)
+
+        def _on(_):
+            if _inspector_syncing[0]:
+                return
+            _inspector_syncing[0] = True
+            try:
+                src.value = sl.value
+            finally:
+                _inspector_syncing[0] = False
+
+        sl.on_update(_on)
+        return sl
+
+    def _mirror_checkbox(label, src):
+        chk = server.gui.add_checkbox(label, initial_value=bool(src.value))
+        _inspector_add(chk)
+
+        def _on(_):
+            if _inspector_syncing[0]:
+                return
+            _inspector_syncing[0] = True
+            try:
+                src.value = chk.value
+            finally:
+                _inspector_syncing[0] = False
+
+        chk.on_update(_on)
+        return chk
+
+    def _inspector_led_matrix(group):
+        """ALL / Row / LED on-off buttons that write into group['led_states']."""
+        led_states_g = group['led_states']
+        led_rows = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
+        num_leds = group.get('num_leds', len(led_states_g))
+
+        def _refresh_hidden_colors():
+            if callable(group.get('update_button_colors')):
+                group['update_button_colors']()
+            for _si, _pdata in enumerate(_panel_slot_data):
+                if _pdata and group in _pdata.get('groups', []):
+                    uf = _pdata.get('update_btn_colors')
+                    if callable(uf):
+                        uf()
+
+        _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
+        all_btn = _inspector_add(server.gui.add_button(
+            "ALL LEDs", color="#FF00FF" if any(led_states_g) else "#666666"
+        ))
+
+        def _on_all(_):
+            new_state = not all(led_states_g)
+            for i in range(len(led_states_g)):
+                led_states_g[i] = new_state
+            _refresh_hidden_colors()
+            update_scene()
+            populate_inspector(selected_owner[0])
+
+        all_btn.on_click(_on_all)
+
+        for row_idx, led_indices in enumerate(led_rows):
+            any_on = any(led_states_g[i] for i in led_indices if i < len(led_states_g))
+            row_btn = _inspector_add(server.gui.add_button(
+                f"Row {row_idx + 1}", color="#FF00FF" if any_on else "#666666"
+            ))
+
+            def _make_row(indices):
+                def _on(_):
+                    new_state = not all(led_states_g[i] for i in indices if i < len(led_states_g))
+                    for i in indices:
+                        if i < len(led_states_g):
+                            led_states_g[i] = new_state
+                    _refresh_hidden_colors()
+                    update_scene()
+                    populate_inspector(selected_owner[0])
+                return _on
+
+            row_btn.on_click(_make_row(list(led_indices)))
+
+        for led_idx in range(num_leds):
+            if led_idx >= len(led_states_g):
+                break
+            color = "#FF00FF" if led_states_g[led_idx] else "#444444"
+            led_btn = _inspector_add(server.gui.add_button(f"L{led_idx + 1}", color=color))
+
+            def _make_led(idx):
+                def _on(_):
+                    led_states_g[idx] = not led_states_g[idx]
+                    _refresh_hidden_colors()
+                    update_scene()
+                    populate_inspector(selected_owner[0])
+                return _on
+
+            led_btn.on_click(_make_led(led_idx))
+
+    def populate_inspector(owner):
+        """Rebuild the floating inspector for the given owner (or empty state)."""
+        _clear_inspector()
+        with inspector_tab:
+            if owner is None:
+                _inspector_add(server.gui.add_markdown(
+                    "Click a panel or LED group in the 3D view to edit it."
+                ))
+                return
+
+            kind, key = owner
+            deselect_btn = _inspector_add(server.gui.add_button("Deselect"))
+
+            @deselect_btn.on_click
+            def _(_):
+                select_panel(None)
+
+            if kind == 'slot':
+                data = _panel_slot_data[key] if 0 <= key < len(_panel_slot_data) else None
+                if data is None:
+                    _inspector_add(server.gui.add_markdown("This slot is empty."))
+                    return
+                slot_name = data.get('slot_label', _ELIOS3_SLOTS[key]['name'])
+                tmpl = data.get('template_display', data.get('template_name', ''))
+                _inspector_add(server.gui.add_markdown(
+                    f"**Slot {slot_name}**  \n{tmpl}"
+                    + ("  \n*Loaded as individual LEDs*" if data.get('as_individual') else "")
+                ))
+                ctrl = data.get('controls') or {}
+                if ctrl.get('enable') is not None:
+                    _mirror_checkbox("Enable Slot", ctrl['enable'])
+                    _mirror_slider("Offset X (cm)", ctrl['pos_x'], -50, 50, 0.1)
+                    _mirror_slider("Offset Y (cm)", ctrl['pos_y'], -50, 50, 0.1)
+                    _mirror_slider("Offset Z (cm)", ctrl['pos_z'], -50, 50, 0.1)
+                    _mirror_slider("Ruota su se stesso (°)", ctrl['rot_x'], -180, 180, 1)
+                    _mirror_slider("Inclina Alto/Basso (°)", ctrl['rot_y'], -180, 180, 1)
+                    _mirror_slider("Inclina Sinistra/Destra (°)", ctrl['rot_z'], -180, 180, 1)
+                    _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
+                    _mirror_checkbox("Enable custom lumens", ctrl['lumens_chk'])
+                    _mirror_slider("Lumens per LED (lm)", ctrl['lumens_slider'], 1, 900000, 1)
+                if data.get('as_individual'):
+                    _inspector_add(server.gui.add_markdown(
+                        "Per-LED edits are in the **Individual LEDs** folder."
+                    ))
+                else:
+                    for g_idx, group in enumerate(data.get('groups', [])):
+                        _inspector_add(server.gui.add_html(
+                            f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
+                        ))
+                        _inspector_led_matrix(group)
+                remove_btn = _inspector_add(server.gui.add_button("Rimuovi Slot", color="red"))
+
+                @remove_btn.on_click
+                def _(_):
+                    _clear_panel_slot(key)
+                    if key < len(_panel_dropdowns):
+                        _panel_dropdowns[key].value = "-- Nessuno --"
+                    update_scene()
+
+            elif kind == 'custom_group':
+                group = next((g for g in custom_groups if g.get('id') == key), None)
+                if group is None:
+                    _inspector_add(server.gui.add_markdown("This group no longer exists."))
+                    return
+                title = group.get('template_name') or f"Custom Group {key}"
+                _inspector_add(server.gui.add_markdown(f"**{title}**"))
+                _mirror_checkbox("Enable", group['enable'])
+                _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
+                _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
+                _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
+                _mirror_slider("Inclina Sinistra/Destra (°)", group['rot_tilt_lr'], -180, 180, 1)
+                _mirror_slider("Inclina Alto/Basso (°)", group['rot_tilt_ud'], -180, 180, 1)
+                _mirror_slider("Ruota su se stesso (°)", group['rot_roll'], -180, 180, 1)
+                if group.get('lumens_override') is not None:
+                    _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
+                    _mirror_checkbox("Enable custom lumens", group['lumens_override'])
+                    _mirror_slider("Lumens per LED (lm)", group['lumens_value'], 1, 900000, 1)
+                _inspector_led_matrix(group)
+                remove_btn = _inspector_add(server.gui.add_button("Remove Group", color="red"))
+
+                @remove_btn.on_click
+                def _(_):
+                    if group in custom_groups:
+                        custom_groups.remove(group)
+                    try:
+                        group['folder'].remove()
+                    except Exception:
+                        pass
+                    select_panel(None)
+
+            elif kind == 'base_group':
+                names = ["Front+", "Front-", "Side+", "Side-"]
+                rot_z = [rot_front_pos, rot_front_neg, rot_side_pos, rot_side_neg]
+                rot_y = [rot_y_front_pos, rot_y_front_neg, rot_y_side_pos, rot_y_side_neg]
+                off_x = [offset_front_pos_x, offset_front_neg_x, offset_side_pos_x, offset_side_neg_x]
+                off_y = [offset_front_pos_y, offset_front_neg_y, offset_side_pos_y, offset_side_neg_y]
+                off_z = [offset_front_pos_z, offset_front_neg_z, offset_side_pos_z, offset_side_neg_z]
+                if key < 0 or key > 3:
+                    _inspector_add(server.gui.add_markdown("Unknown base group."))
+                    return
+                _inspector_add(server.gui.add_markdown(f"**Base group: {names[key]}**"))
+                _mirror_slider(f"Rotate {names[key]} Z (°)", rot_z[key], -180, 180, 1)
+                _mirror_slider(f"Rotate {names[key]} local Y (tilt °)", rot_y[key], -180, 180, 1)
+                ymin, ymax = ((-40, 40) if key == 2 else (-40, 50) if key == 3 else (-30, 30))
+                _mirror_slider("Offset X (cm)", off_x[key], -30, 30, 0.1)
+                _mirror_slider("Offset Y (cm)", off_y[key], ymin, ymax, 0.1)
+                _mirror_slider("Offset Z (cm)", off_z[key], -30, 30, 0.1)
+                _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
+                color_hex = group_colors_hex[key]
+                start = key * 12
+                any_on = any(led_states[start:start + 12])
+                all_btn = _inspector_add(server.gui.add_button("ALL", color=color_hex if any_on else "#444444"))
+
+                def _on_all(_):
+                    new_state = not all(led_states[start:start + 12])
+                    for i in range(start, start + 12):
+                        led_states[i] = new_state
+                    update_all_led_buttons()
+                    update_scene()
+                    update_ui_visibility()
+                    populate_inspector(selected_owner[0])
+
+                all_btn.on_click(_on_all)
+                for row_idx in range(4):
+                    r0 = start + row_idx * 3
+                    any_row = any(led_states[r0:r0 + 3])
+                    row_btn = _inspector_add(server.gui.add_button(
+                        f"Row {row_idx + 1}", color=color_hex if any_row else "#666666"
+                    ))
+
+                    def _make_row(s):
+                        def _on(_):
+                            new_state = not all(led_states[s:s + 3])
+                            for i in range(s, s + 3):
+                                led_states[i] = new_state
+                            update_all_led_buttons()
+                            update_scene()
+                            update_ui_visibility()
+                            populate_inspector(selected_owner[0])
+                        return _on
+
+                    row_btn.on_click(_make_row(r0))
+                for li in range(12):
+                    gi = start + li
+                    on = led_states[gi]
+                    led_btn = _inspector_add(server.gui.add_button(
+                        f"L{li + 1}", color=color_hex if on else "#444444"
+                    ))
+
+                    def _make_led(idx):
+                        def _on(_):
+                            led_states[idx] = not led_states[idx]
+                            update_all_led_buttons()
+                            update_scene()
+                            update_ui_visibility()
+                            populate_inspector(selected_owner[0])
+                        return _on
+
+                    led_btn.on_click(_make_led(gi))
+
+            else:
+                _inspector_add(server.gui.add_markdown(f"Unknown selection: `{kind}`"))
+
+    def _select_panel_real(owner):
+        if selected_owner[0] == owner:
+            return
+        selected_owner[0] = owner
+        populate_inspector(owner)
+        update_scene()
+
+    _select_panel_impl[0] = _select_panel_real
+    populate_inspector(None)
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
@@ -10095,6 +10487,10 @@ def main():
                 config['lumens_override'] = float(group['lumens_value'].value)
             else:
                 config['lumens_override'] = None
+            if group.get('panel_slot') is not None:
+                config['owner'] = ('slot', group['panel_slot'])
+            else:
+                config['owner'] = ('custom_group', group['id'])
             custom_groups_configs.append(config)
         
         # Build individual LEDs configs list
@@ -10123,6 +10519,10 @@ def main():
             if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
                 config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
                 config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
+            for _si, _pdata in enumerate(_panel_slot_data):
+                if _pdata and led in _pdata.get('individual_leds', []):
+                    config['owner'] = ('slot', _si)
+                    break
             individual_leds_configs.append(config)
         
         leds = create_leds(
@@ -10389,8 +10789,11 @@ def main():
                 square_thickness = 0.0002  # Very thin (0.2mm)
                 dims = (square_thickness, square_size, square_size)
                 
-                # White color: bright if enabled, dim if disabled
+                # White color: bright if enabled, dim if disabled; cyan if this panel is selected
                 square_color = (1.0, 1.0, 1.0) if led_enabled else (0.3, 0.3, 0.3)
+                _owner = getattr(led, 'owner', None)
+                if selected_owner[0] is not None and _owner == selected_owner[0]:
+                    square_color = (0.15, 1.0, 1.0) if led_enabled else (0.08, 0.45, 0.45)
                 
                 # Draw square base with rotation
                 handle = server.scene.add_box(
@@ -10401,6 +10804,13 @@ def main():
                     wxyz=tuple(quat_wxyz),
                 )
                 led_handles.append(handle)
+                if _owner is not None:
+                    def _make_owner_click(own):
+                        def _on_click(_event):
+                            _just_clicked_mesh[0] = True
+                            select_panel(own)
+                        return _on_click
+                    handle.on_click(_make_owner_click(_owner))
                 
                 # Draw small center source sphere (only if enabled)
                 if led_enabled:
@@ -10411,6 +10821,8 @@ def main():
                         position=tuple(led.position / 100.0),
                     )
                     led_handles.append(handle)
+                    if _owner is not None:
+                        handle.on_click(_make_owner_click(_owner))
 
         # Prepare STL mesh data for ray tracing visualization if enabled
         stl_mesh_for_raytracing = None
@@ -10762,6 +11174,14 @@ def main():
                     line_width=4.0,
                 )
                 vio_fov_handles.append(axis_h)
+
+    @server.scene.on_click()
+    def _on_scene_background_click(_event):
+        if _just_clicked_mesh[0]:
+            _just_clicked_mesh[0] = False
+            return
+        if selected_owner[0] is not None:
+            select_panel(None)
 
     # Add static elements
     # Wall (at x = wall_dist)
