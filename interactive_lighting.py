@@ -92,6 +92,241 @@ class LED:
         return rays
 
 
+# VD66GY native resolution (short × long). Equidistant fisheye: r = f·θ.
+VD66GY_SHORT_PX = 1124
+VD66GY_LONG_PX = 1364
+
+
+def vio_hfov_vfov_deg(long_fov_deg, landscape):
+    """Return (HFOV, VFOV) in degrees for a VD66GY given FOV on the long side."""
+    short_fov = float(long_fov_deg) * VD66GY_SHORT_PX / VD66GY_LONG_PX
+    if landscape:
+        return float(long_fov_deg), short_fov
+    return short_fov, float(long_fov_deg)
+
+
+def compute_fisheye_fov_wall_segments(
+    cam_pos,
+    pitch_deg,
+    yaw_deg,
+    hfov_deg,
+    vfov_deg,
+    wall_dist,
+    wall_half_y,
+    wall_half_z,
+    n_samples=720,
+):
+    """Project an equidistant-fisheye FOV border onto the wall plane x = wall_dist.
+
+    Camera frame: optical axis +X, sensor +u (right) → −Y, sensor +v (up) → +Z.
+    Image circle is limited to the long-side half-angle (corners are rounded).
+    Pitch > 0 looks up (+Z); yaw > 0 rotates toward +Y.
+
+    Returns an array of shape (K, 2, 3) with wall hit points in cm, or (0, 2, 3).
+    """
+    cam_pos = np.asarray(cam_pos, dtype=float)
+    long_fov = max(float(hfov_deg), float(vfov_deg))
+    long_half_px = VD66GY_LONG_PX / 2.0
+    f = long_half_px / np.radians(long_fov / 2.0)
+
+    half_u = f * np.radians(float(hfov_deg) / 2.0)
+    half_v = f * np.radians(float(vfov_deg) / 2.0)
+    r_circle = long_half_px
+
+    n_side = max(2, int(n_samples) // 4)
+    u = np.concatenate([
+        np.linspace(-half_u, half_u, n_side, endpoint=False),
+        np.full(n_side, half_u),
+        np.linspace(half_u, -half_u, n_side, endpoint=False),
+        np.full(n_side, -half_u),
+    ])
+    v = np.concatenate([
+        np.full(n_side, -half_v),
+        np.linspace(-half_v, half_v, n_side, endpoint=False),
+        np.full(n_side, half_v),
+        np.linspace(half_v, -half_v, n_side, endpoint=False),
+    ])
+
+    r = np.hypot(u, v)
+    r_safe = np.maximum(r, 1e-12)
+    scale = np.minimum(1.0, r_circle / r_safe)
+    u = u * scale
+    v = v * scale
+    r = np.hypot(u, v)
+    theta = r / f
+    st = np.sin(theta)
+    ct = np.cos(theta)
+    inv_r = 1.0 / np.maximum(r, 1e-12)
+    dir_cam = np.stack([ct, -st * u * inv_r, st * v * inv_r], axis=1)
+
+    p = np.radians(pitch_deg)
+    yaw = np.radians(yaw_deg)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    r_pitch = np.array([[cp, 0.0, -sp], [0.0, 1.0, 0.0], [sp, 0.0, cp]])
+    r_yaw = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    dir_w = (r_yaw @ r_pitch @ dir_cam.T).T
+
+    dx = dir_w[:, 0]
+    valid_dir = dx > 1e-8
+    t = np.full(len(dx), np.nan)
+    t[valid_dir] = (wall_dist - cam_pos[0]) / dx[valid_dir]
+    pts = cam_pos[None, :] + t[:, None] * dir_w
+    in_wall = (
+        valid_dir
+        & (t > 1e-8)
+        & (np.abs(pts[:, 1]) <= wall_half_y + 1e-6)
+        & (np.abs(pts[:, 2]) <= wall_half_z + 1e-6)
+    )
+
+    n = len(pts)
+    segs = []
+    for i in range(n):
+        j = (i + 1) % n
+        if in_wall[i] and in_wall[j]:
+            segs.append([pts[i], pts[j]])
+    if not segs:
+        return np.zeros((0, 2, 3))
+    return np.asarray(segs, dtype=float)
+
+
+def vio_optical_axis(pitch_deg, yaw_deg):
+    """World-space optical-axis unit vector (camera +X after pitch then yaw)."""
+    p = np.radians(pitch_deg)
+    yaw = np.radians(yaw_deg)
+    axis = np.array([np.cos(p), 0.0, np.sin(p)])
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([cy * axis[0] - sy * axis[1], sy * axis[0] + cy * axis[1], axis[2]])
+
+
+def _vio_fisheye_intrinsics(hfov_deg, vfov_deg):
+    """Equidistant fisheye: f in px/rad, sensor half-extents, image-circle radius."""
+    long_fov = max(float(hfov_deg), float(vfov_deg))
+    long_half_px = VD66GY_LONG_PX / 2.0
+    f = long_half_px / np.radians(long_fov / 2.0)
+    half_u = f * np.radians(float(hfov_deg) / 2.0)
+    half_v = f * np.radians(float(vfov_deg) / 2.0)
+    return f, half_u, half_v, long_half_px
+
+
+def _vio_cam_rotations(pitch_deg, yaw_deg):
+    """Return R (cam→world) and R_inv (world→cam). Pitch then yaw."""
+    p = np.radians(pitch_deg)
+    yaw = np.radians(yaw_deg)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    r_pitch = np.array([[cp, 0.0, -sp], [0.0, 1.0, 0.0], [sp, 0.0, cp]])
+    r_yaw = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    r = r_yaw @ r_pitch
+    return r, r.T
+
+
+def wall_yz_in_fisheye_fov(cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, wall_dist, y, z):
+    """Boolean mask: wall points (wall_dist, y, z) inside the equidistant FOV."""
+    cam_pos = np.asarray(cam_pos, dtype=float)
+    y = np.asarray(y, dtype=float)
+    z = np.asarray(z, dtype=float)
+    dx = float(wall_dist) - cam_pos[0]
+    if dx <= 1e-8:
+        return np.zeros(np.broadcast(y, z).shape, dtype=bool)
+
+    dy = y - cam_pos[1]
+    dz = z - cam_pos[2]
+    dir_w = np.stack([np.broadcast_to(dx, dy.shape), dy, dz], axis=-1)
+    norms = np.linalg.norm(dir_w, axis=-1, keepdims=True)
+    dir_w = dir_w / np.maximum(norms, 1e-12)
+
+    _, r_inv = _vio_cam_rotations(pitch_deg, yaw_deg)
+    dir_cam = dir_w.reshape(-1, 3) @ r_inv.T
+    cx = dir_cam[:, 0].reshape(dy.shape)
+    cy_c = dir_cam[:, 1].reshape(dy.shape)
+    cz_c = dir_cam[:, 2].reshape(dy.shape)
+
+    f, half_u, half_v, r_circle = _vio_fisheye_intrinsics(hfov_deg, vfov_deg)
+    in_front = cx > 1e-8
+    rho = np.hypot(cy_c, cz_c)
+    theta = np.arctan2(rho, np.maximum(cx, 1e-12))
+    r_px = f * theta
+    inv_rho = 1.0 / np.maximum(rho, 1e-12)
+    u = np.where(rho < 1e-12, 0.0, r_px * (-cy_c) * inv_rho)
+    v = np.where(rho < 1e-12, 0.0, r_px * cz_c * inv_rho)
+    return (
+        in_front
+        & (np.abs(u) <= half_u + 1e-6)
+        & (np.abs(v) <= half_v + 1e-6)
+        & (r_px <= r_circle + 1e-6)
+    )
+
+
+def rasterize_fisheye_fov_on_wall(
+    cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg,
+    wall_dist, wall_half_y, wall_half_z, n_grid=100,
+):
+    """Cell-centered occupancy of the FOV on the wall. Returns (mask, ys, zs)."""
+    n_grid = int(n_grid)
+    ys = np.linspace(-wall_half_y, wall_half_y, n_grid, endpoint=False) + wall_half_y / n_grid
+    zs = np.linspace(-wall_half_z, wall_half_z, n_grid, endpoint=False) + wall_half_z / n_grid
+    yy, zz = np.meshgrid(ys, zs, indexing="ij")
+    mask = wall_yz_in_fisheye_fov(
+        cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, wall_dist, yy, zz
+    )
+    return mask, ys, zs
+
+
+def fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m):
+    """Build wall-plane quads (meters) and silhouette segments from a Y×Z occupancy mask."""
+    n_y, n_z = mask.shape
+    dy = (ys[1] - ys[0]) if n_y > 1 else 0.0
+    dz = (zs[1] - zs[0]) if n_z > 1 else 0.0
+    hy_m, hz_m = dy / 200.0, dz / 200.0
+
+    ii, jj = np.nonzero(mask)
+    if ii.size == 0:
+        empty_v = np.zeros((0, 3), np.float32)
+        empty_f = np.zeros((0, 3), np.uint32)
+        empty_s = np.zeros((0, 2, 3), np.float32)
+        return empty_v, empty_f, empty_s
+
+    y0 = ys[ii] / 100.0
+    z0 = zs[jj] / 100.0
+    n = ii.size
+    verts = np.empty((n * 4, 3), dtype=np.float32)
+    verts[:, 0] = wall_x_m
+    verts[0::4, 1] = y0 - hy_m
+    verts[0::4, 2] = z0 - hz_m
+    verts[1::4, 1] = y0 + hy_m
+    verts[1::4, 2] = z0 - hz_m
+    verts[2::4, 1] = y0 + hy_m
+    verts[2::4, 2] = z0 + hz_m
+    verts[3::4, 1] = y0 - hy_m
+    verts[3::4, 2] = z0 + hz_m
+    faces = np.empty((n * 2, 3), dtype=np.uint32)
+    base = (np.arange(n, dtype=np.uint32) * 4)
+    faces[0::2, 0] = base
+    faces[0::2, 1] = base + 1
+    faces[0::2, 2] = base + 2
+    faces[1::2, 0] = base
+    faces[1::2, 1] = base + 2
+    faces[1::2, 2] = base + 3
+
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    segs = []
+    for k in range(n):
+        i, j = int(ii[k]), int(jj[k])
+        yi, zi = y0[k], z0[k]
+        pi, pj = i + 1, j + 1
+        if not padded[pi - 1, pj]:
+            segs.append([[wall_x_m, yi - hy_m, zi - hz_m], [wall_x_m, yi - hy_m, zi + hz_m]])
+        if not padded[pi + 1, pj]:
+            segs.append([[wall_x_m, yi + hy_m, zi - hz_m], [wall_x_m, yi + hy_m, zi + hz_m]])
+        if not padded[pi, pj - 1]:
+            segs.append([[wall_x_m, yi - hy_m, zi - hz_m], [wall_x_m, yi + hy_m, zi - hz_m]])
+        if not padded[pi, pj + 1]:
+            segs.append([[wall_x_m, yi - hy_m, zi + hz_m], [wall_x_m, yi + hy_m, zi + hz_m]])
+    segs_np = np.asarray(segs, dtype=np.float32) if segs else np.zeros((0, 2, 3), np.float32)
+    return verts, faces, segs_np
+
+
 def create_leds(
     front_angle_deg,
     side_angle_deg,
@@ -2211,7 +2446,17 @@ def main():
                 "rotation": [stl_rot_x.value, stl_rot_y.value, stl_rot_z.value],
                 "opacity": stl_opacity.value,
                 "wireframe": stl_wireframe.value
-            } if stl_mesh_data[0] is not None else None
+            } if stl_mesh_data[0] is not None else None,
+            "vio_cameras": {
+                "show": show_vio_fov.value,
+                "position": [vio_pos_x.value, vio_pos_y.value, vio_pos_z.value],
+                "cam1_pitch": vio_cam1_pitch.value,
+                "cam1_yaw": vio_cam1_yaw.value,
+                "cam2_pitch": vio_cam2_pitch.value,
+                "cam2_yaw": vio_cam2_yaw.value,
+                "long_fov": vio_long_fov.value,
+                "landscape": vio_landscape.value,
+            },
         }
 
     def clear_all_custom_groups():
@@ -2987,6 +3232,21 @@ def main():
                 led_data['ext_lens_enable'].value = True
                 led_data['ext_lens_angle'].value = led_cfg.get('ext_lens_angle', 30)
                 led_data['ext_lens_efficiency'].value = led_cfg.get('ext_lens_efficiency', 80)
+        
+        vio_cfg = cfg.get("vio_cameras")
+        if vio_cfg:
+            show_vio_fov.value = vio_cfg.get("show", True)
+            pos = vio_cfg.get("position", [3.0, 0.0, 0.0])
+            vio_pos_x.value = pos[0]
+            vio_pos_y.value = pos[1] if len(pos) > 1 else 0.0
+            vio_pos_z.value = pos[2] if len(pos) > 2 else 0.0
+            vio_cam1_pitch.value = vio_cfg.get("cam1_pitch", 45)
+            vio_cam1_yaw.value = vio_cfg.get("cam1_yaw", 0)
+            vio_cam2_pitch.value = vio_cfg.get("cam2_pitch", -45)
+            vio_cam2_yaw.value = vio_cfg.get("cam2_yaw", 0)
+            vio_long_fov.value = vio_cfg.get("long_fov", 170)
+            vio_landscape.value = vio_cfg.get("landscape", True)
+            _refresh_vio_fov_label()
         
         # Re-enable callbacks and do final scene update
         loading_in_progress[0] = False
@@ -4609,8 +4869,59 @@ def main():
         )
         capture_fov_btn = server.gui.add_button("Capture FOV Image", color="green")
 
+    # VIO cameras (2× VD66GY equidistant fisheye)
+    with server.gui.add_folder("VIO Cameras"):
+        show_vio_fov = server.gui.add_checkbox("Show VIO FOV", initial_value=True)
+        vio_pos_x = server.gui.add_slider(
+            "VIO X pos (cm)", min=-100, max=100, step=0.5, initial_value=3.0
+        )
+        vio_pos_y = server.gui.add_slider(
+            "VIO Y pos (cm)", min=-50, max=50, step=0.5, initial_value=0.0
+        )
+        vio_pos_z = server.gui.add_slider(
+            "VIO Z pos (cm)", min=-50, max=50, step=0.5, initial_value=0.0
+        )
+        vio_cam1_pitch = server.gui.add_slider(
+            "Cam 1 pitch (°)", min=-90, max=90, step=1, initial_value=45
+        )
+        vio_cam1_yaw = server.gui.add_slider(
+            "Cam 1 yaw (°)", min=-180, max=180, step=1, initial_value=0
+        )
+        vio_cam2_pitch = server.gui.add_slider(
+            "Cam 2 pitch (°)", min=-90, max=90, step=1, initial_value=-45
+        )
+        vio_cam2_yaw = server.gui.add_slider(
+            "Cam 2 yaw (°)", min=-180, max=180, step=1, initial_value=0
+        )
+        vio_long_fov = server.gui.add_slider(
+            "Long-side FOV (°)", min=60, max=180, step=1, initial_value=170
+        )
+        vio_landscape = server.gui.add_checkbox(
+            "Landscape mount (long side horizontal)", initial_value=True
+        )
+        _hfov0, _vfov0 = vio_hfov_vfov_deg(170, True)
+        vio_derived_fov_html = server.gui.add_html(
+            f"<div style='color:#ccc;font-size:12px;'>HFOV = {_hfov0:.1f}° &nbsp; VFOV = {_vfov0:.1f}°"
+            f"<br>(VD66GY 1124×1364, equidistant fisheye)</div>"
+        )
+        server.gui.add_html(
+            "<div style='font-size:12px;margin-top:4px;'>"
+            "<span style='color:#ff00ff;'>● Cam 1 (up)</span> &nbsp; "
+            "<span style='color:#00ffff;'>● Cam 2 (down)</span>"
+            "<br><span style='color:#888;'>Semi-transparent fills show coverage; overlap is the mixed region.</span>"
+            "</div>"
+        )
+
+        def _refresh_vio_fov_label(_=None):
+            hfov, vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
+            vio_derived_fov_html.content = (
+                f"<div style='color:#ccc;font-size:12px;'>HFOV = {hfov:.1f}° &nbsp; VFOV = {vfov:.1f}°"
+                f"<br>(VD66GY 1124×1364, equidistant fisheye)</div>"
+            )
+
     # Store handles for dynamic objects
     camera_fov_handles = []
+    vio_fov_handles = []
     led_handles = []
     ray_handles = []
     intensity_handles = []
@@ -9595,7 +9906,7 @@ def main():
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, current_leds
+        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, current_leds
 
         # Ray-box intersection helper for update_scene (positions in cm)
         def ray_box_intersection(pos, direction, box):
@@ -9640,7 +9951,7 @@ def main():
             return tmin if tmin > 0 else (tmax if tmax > 0 else None)
 
         # Clear previous objects (safely ignore already-removed handles)
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles:
+        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles:
             try:
                 handle.remove()
             except KeyError:
@@ -9649,6 +9960,7 @@ def main():
         ray_handles = []
         absorber_handles = []
         camera_fov_handles = []
+        vio_fov_handles = []
 
         # Get current values (fixed angles: front=0°, side=90°)
         front_angle = 0.0  # Fixed front angle
@@ -10384,6 +10696,70 @@ def main():
             )
             camera_fov_handles.append(handle)
 
+        # Draw VIO fisheye FOV footprints on the front wall
+        if show_vio_fov.value:
+            if room_mode_enable.value:
+                vio_wall_dist = room_front_dist.value
+                vio_half_y = room_side_dist.value
+                vio_half_z = room_top_bottom_dist.value
+            else:
+                vio_wall_dist = wall_dist_slider.value
+                vio_half_y = wall_view_size.value / 2.0
+                vio_half_z = wall_view_size.value / 2.0
+
+            vio_hfov, vio_vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
+            cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
+            axis_len_cm = 8.0
+            marker_specs = [
+                (1, vio_cam1_pitch.value, vio_cam1_yaw.value, (1.0, 0.0, 1.0), -0.008),  # magenta
+                (2, vio_cam2_pitch.value, vio_cam2_yaw.value, (0.0, 1.0, 1.0), -0.012),  # cyan
+            ]
+            for cam_id, pitch, yaw, color, x_off in marker_specs:
+                wall_x_m = vio_wall_dist / 100.0 + x_off
+                mask, ys, zs = rasterize_fisheye_fov_on_wall(
+                    cam_pos, pitch, yaw, vio_hfov, vio_vfov,
+                    vio_wall_dist, vio_half_y, vio_half_z, n_grid=90,
+                )
+                verts, faces, segs_m = fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m)
+                if len(faces) > 0:
+                    fill = server.scene.add_mesh_simple(
+                        name=f"/vio_cam{cam_id}/fov_fill",
+                        vertices=verts,
+                        faces=faces,
+                        color=tuple(int(c * 255) for c in color),
+                        opacity=0.28,
+                        flat_shading=True,
+                        side="double",
+                    )
+                    vio_fov_handles.append(fill)
+                if len(segs_m) > 0:
+                    handle = server.scene.add_line_segments(
+                        f"/vio_cam{cam_id}/fov_border",
+                        points=segs_m,
+                        colors=color,
+                        line_width=4.0,
+                    )
+                    vio_fov_handles.append(handle)
+
+                axis = vio_optical_axis(pitch, yaw)
+                pos_m = cam_pos / 100.0
+                axis_end_m = (cam_pos + axis * axis_len_cm) / 100.0
+                marker_pos = pos_m + axis * 0.008
+                sph = server.scene.add_icosphere(
+                    f"/vio_cam{cam_id}/marker",
+                    radius=0.006,
+                    color=color,
+                    position=tuple(marker_pos),
+                )
+                vio_fov_handles.append(sph)
+                axis_h = server.scene.add_line_segments(
+                    f"/vio_cam{cam_id}/axis",
+                    points=np.array([[pos_m, axis_end_m]]),
+                    colors=color,
+                    line_width=4.0,
+                )
+                vio_fov_handles.append(axis_h)
+
     # Add static elements
     # Wall (at x = wall_dist)
     wall_dist_init = wall_dist_slider.value
@@ -10525,6 +10901,16 @@ def main():
     camera_fov_h.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    show_vio_fov.on_update(lambda _: update_scene())
+    vio_pos_x.on_update(lambda _: update_scene())
+    vio_pos_y.on_update(lambda _: update_scene())
+    vio_pos_z.on_update(lambda _: update_scene())
+    vio_cam1_pitch.on_update(lambda _: update_scene())
+    vio_cam1_yaw.on_update(lambda _: update_scene())
+    vio_cam2_pitch.on_update(lambda _: update_scene())
+    vio_cam2_yaw.on_update(lambda _: update_scene())
+    vio_long_fov.on_update(lambda _: (_refresh_vio_fov_label(), update_scene()))
+    vio_landscape.on_update(lambda _: (_refresh_vio_fov_label(), update_scene()))
     abs0_off_x.on_update(lambda _: update_scene())
     abs0_off_y.on_update(lambda _: update_scene())
     abs0_off_z.on_update(lambda _: update_scene())
@@ -10587,7 +10973,7 @@ def main():
     room_top_bottom_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     show_back_wall.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
     room_back_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
-    wall_view_size.on_update(lambda _: (update_wall(), update_cell_area_info()))  # Update wall size and cell area
+    wall_view_size.on_update(lambda _: (update_wall(), update_cell_area_info(), update_scene()))  # Update wall size, cell area, VIO FOV clip
 
     def on_wall_dist_change(_):
         """Clear stale intensity map when wall distance changes."""
