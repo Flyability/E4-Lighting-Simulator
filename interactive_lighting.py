@@ -4528,6 +4528,10 @@ def main():
         )
         legend_max_input = server.gui.add_number("Legend max (lux)", initial_value=3500, min=1, max=100000, step=50)
         server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap: colors scale 0–this value. If peak exceeds it, switches to AUTO.</div>")
+        intensity_threshold_slider = server.gui.add_slider(
+            "Black threshold (lux)", min=0, max=10000, step=10, initial_value=0
+        )
+        server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Cells below this lux are drawn pitch black (0 = off). Applies to wall and room maps after the next update.</div>")
         cell_area_html = server.gui.add_html(
             "<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
             "Cell area: calculating..."
@@ -8715,6 +8719,10 @@ def main():
         """Convert intensity to colormap (inferno-like or black-to-white)."""
         # Handle invalid values
         if max_val == 0 or not np.isfinite(value) or not np.isfinite(max_val):
+            return (0.0, 0.0, 0.0)
+        
+        # Below-threshold cells are rendered pitch black (threshold in lux, 0 = off)
+        if value < float(intensity_threshold_slider.value):
             return (0.0, 0.0, 0.0)
         
         t = np.clip(value / max_val, 0.0, 1.0)
