@@ -1304,9 +1304,10 @@ def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None,
     (centred on the wall) is analysed.
 
     Alternatively, *fov_trapezoid* may be given as
-    (z_bottom_cm, z_top_cm, half_width_bottom_cm, half_width_top_cm) — the
-    footprint of a pitched camera (see _camera_fov_wall_trapezoid) — and only
-    cells inside that trapezoid are analysed.
+    (z_bottom_cm, z_top_cm, half_width_bottom_cm, half_width_top_cm,
+    y_center_cm) — the footprint of a pitched camera at Y = y_center_cm
+    (see _camera_fov_wall_trapezoid) — and only cells inside that trapezoid
+    are analysed.
 
     Returns an HTML string to be appended below the intensity legend.
     Metrics computed (excluding zero-lux cells outside the light cone):
@@ -1317,7 +1318,7 @@ def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None,
     """
     # --- Crop to pitched-camera trapezoid if requested ---
     if fov_trapezoid is not None and wall_size_cm is not None:
-        z_bot, z_top, w_bot, w_top = fov_trapezoid
+        z_bot, z_top, w_bot, w_top, y_center = fov_trapezoid
         gz, gy = grid.shape  # rows=Z, cols=Y
         cell_cm = wall_size_cm / gy
         half_wall = wall_size_cm / 2.0
@@ -1328,7 +1329,9 @@ def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None,
         frac = np.clip((z_centers - z_bot) / z_span, 0.0, 1.0)
         half_w_at_z = w_bot + (w_top - w_bot) * frac
         in_z = (z_centers >= z_bot) & (z_centers <= z_top)
-        mask = in_z[:, None] & (np.abs(y_centers)[None, :] <= half_w_at_z[:, None])
+        mask = in_z[:, None] & (
+            np.abs(y_centers - y_center)[None, :] <= half_w_at_z[:, None]
+        )
         grid = np.where(mask, grid, 0.0)
     # --- Crop to FOV rectangle if requested ---
     elif fov_bounds is not None and wall_size_cm is not None:
@@ -4392,7 +4395,7 @@ def main():
         intensity_grid_size = server.gui.add_slider(
             "Wall grid resolution", min=5, max=1000 , step=5, initial_value=30
         )
-        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=100)
+        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=500)
         bw_scale_chk = server.gui.add_checkbox("B/W Scale", initial_value=False)
 
     with quick_tab:
@@ -4972,7 +4975,10 @@ def main():
             "Vertical FOV (°)", min=10, max=120, step=1, initial_value=60
         )
         camera_pos_x = server.gui.add_slider(
-            "Camera X pos (cm)", min=-100, max=100, step=1, initial_value=0
+            "Camera X pos (cm)", min=-100, max=100, step=1, initial_value=10
+        )
+        camera_pos_y = server.gui.add_slider(
+            "Camera Y pos (cm)", min=-100, max=100, step=1, initial_value=-4
         )
         camera_pitch = server.gui.add_slider(
             "Camera pitch (°)", min=-60, max=60, step=1, initial_value=0
@@ -4986,7 +4992,7 @@ def main():
         show_vio_fov = server.gui.add_checkbox("Show VIO FOV", initial_value=True)
         vio_fill_fov = server.gui.add_checkbox("Fill VIO FOV", initial_value=False)
         vio_pos_x = server.gui.add_slider(
-            "VIO X pos (cm)", min=-100, max=100, step=0.5, initial_value=3.0
+            "VIO X pos (cm)", min=-100, max=100, step=0.5, initial_value=10.0
         )
         vio_pos_y = server.gui.add_slider(
             "VIO Y pos (cm)", min=-50, max=50, step=0.5, initial_value=0.0
@@ -7897,6 +7903,7 @@ def main():
             wall_dist = wall_dist_slider.value
         
         cam_x = camera_pos_x.value
+        cam_y = camera_pos_y.value
         fov_h_deg = camera_fov_h.value
         fov_v_deg = camera_fov_v.value
         pitch_deg = camera_pitch.value
@@ -8321,17 +8328,18 @@ def main():
                 hit_y = led.position[1] + world_dirs[vi2, 1] * t2
                 hit_z = led.position[2] + world_dirs[vi2, 2] * t2
                 
-                # Keep only hits inside the (possibly pitched) FOV trapezoid
+                # Keep only hits inside the (possibly pitched) FOV trapezoid,
+                # centred at the camera's Y position
                 z_span = max(fov_z_top - fov_z_bot, 1e-9)
                 frac_z = np.clip((hit_z - fov_z_bot) / z_span, 0.0, 1.0)
                 half_w_at_z = fov_w_bot + (fov_w_top - fov_w_bot) * frac_z
                 in_fov = (
                     (hit_z >= fov_z_bot) & (hit_z <= fov_z_top)
-                    & (np.abs(hit_y) <= half_w_at_z)
+                    & (np.abs(hit_y - cam_y) <= half_w_at_z)
                 )
                 fi = np.where(in_fov)[0]
                 
-                grid_x = ((hit_y[fi] + fov_half_w_max) / cell_size_cm).astype(int)
+                grid_x = ((hit_y[fi] - cam_y + fov_half_w_max) / cell_size_cm).astype(int)
                 grid_y = ((hit_z[fi] - fov_z_bot) / cell_size_cm).astype(int)
                 
                 in_bounds = (grid_x >= 0) & (grid_x < grid_width) & (grid_y >= 0) & (grid_y < grid_height)
@@ -8501,7 +8509,7 @@ def main():
         )
         uniformity_html = _compute_uniformity_html(
             grid,
-            fov_trapezoid=_trap,
+            fov_trapezoid=(*_trap, camera_pos_y.value),
             wall_size_cm=wall_size_cm,
         )
         legend_html.content = "".join(html_lines) + uniformity_html
@@ -8954,7 +8962,7 @@ def main():
         )
         uniformity_html = _compute_uniformity_html(
             intensity_grid,
-            fov_trapezoid=_trap,
+            fov_trapezoid=(*_trap, camera_pos_y.value),
             wall_size_cm=actual_wall_size,
         )
         legend_html.content = "".join(html_lines) + uniformity_html
@@ -11127,6 +11135,7 @@ def main():
                 wall_dist = wall_dist_slider.value
             
             cam_x = camera_pos_x.value
+            cam_y = camera_pos_y.value
 
             # Footprint of the (possibly pitched) camera FOV on the wall.
             # With pitch != 0 this is a trapezoid, not a rectangle.
@@ -11138,23 +11147,29 @@ def main():
             z_top = z_top_cm / 100.0
             w_bot = w_bot_cm / 100.0
             w_top = w_top_cm / 100.0
+            y_c = cam_y / 100.0  # camera Y offset shifts the footprint sideways
             wall_x = wall_dist / 100.0 - 0.008  # Slightly in front of wall
+
+            y_bot_l, y_bot_r = y_c - w_bot, y_c + w_bot
+            y_top_l, y_top_r = y_c - w_top, y_c + w_top
 
             # In room mode, clamp the FOV footprint to the front wall boundaries
             if room_mode_enable.value:
                 max_half_w = room_side_dist.value / 100.0        # wall half-width in m
                 max_half_h = room_top_bottom_dist.value / 100.0  # wall half-height in m
-                w_bot = min(w_bot, max_half_w)
-                w_top = min(w_top, max_half_w)
+                y_bot_l = float(np.clip(y_bot_l, -max_half_w, max_half_w))
+                y_bot_r = float(np.clip(y_bot_r, -max_half_w, max_half_w))
+                y_top_l = float(np.clip(y_top_l, -max_half_w, max_half_w))
+                y_top_r = float(np.clip(y_top_r, -max_half_w, max_half_w))
                 z_bot = float(np.clip(z_bot, -max_half_h, max_half_h))
                 z_top = float(np.clip(z_top, -max_half_h, max_half_h))
             
             # Four corner lines
             corners = [
-                [[wall_x, -w_bot, z_bot], [wall_x, w_bot, z_bot]],   # Bottom
-                [[wall_x, w_bot, z_bot], [wall_x, w_top, z_top]],    # Right
-                [[wall_x, w_top, z_top], [wall_x, -w_top, z_top]],   # Top
-                [[wall_x, -w_top, z_top], [wall_x, -w_bot, z_bot]],  # Left
+                [[wall_x, y_bot_l, z_bot], [wall_x, y_bot_r, z_bot]],  # Bottom
+                [[wall_x, y_bot_r, z_bot], [wall_x, y_top_r, z_top]],  # Right
+                [[wall_x, y_top_r, z_top], [wall_x, y_top_l, z_top]],  # Top
+                [[wall_x, y_top_l, z_top], [wall_x, y_bot_l, z_bot]],  # Left
             ]
             
             handle = server.scene.add_line_segments(
@@ -11164,6 +11179,26 @@ def main():
                 line_width=6.0,  # Linee più spesse
             )
             camera_fov_handles.append(handle)
+
+            # Main-camera marker + optical-axis vector (like the VIO cameras)
+            cam_pos_cm = np.array([cam_x, cam_y, 0.0], dtype=float)
+            cam_axis = vio_optical_axis(camera_pitch.value, 0.0)
+            cam_pos_m = cam_pos_cm / 100.0
+            cam_axis_end_m = (cam_pos_cm + cam_axis * 8.0) / 100.0
+            cam_sph = server.scene.add_icosphere(
+                "/camera/marker",
+                radius=0.006,
+                color=(0.0, 1.0, 0.0),
+                position=tuple(cam_pos_m + cam_axis * 0.008),
+            )
+            camera_fov_handles.append(cam_sph)
+            cam_axis_h = server.scene.add_line_segments(
+                "/camera/axis",
+                points=np.array([[cam_pos_m, cam_axis_end_m]]),
+                colors=(0.0, 1.0, 0.0),
+                line_width=4.0,
+            )
+            camera_fov_handles.append(cam_axis_h)
 
         # Draw VIO fisheye FOV footprints on the front wall
         if show_vio_fov.value:
@@ -11378,6 +11413,7 @@ def main():
     camera_fov_h.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    camera_pos_y.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     show_vio_fov.on_update(lambda _: update_scene())
     vio_fill_fov.on_update(lambda _: update_scene())
