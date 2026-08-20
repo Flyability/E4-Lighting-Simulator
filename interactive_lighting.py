@@ -4395,7 +4395,7 @@ def main():
         intensity_grid_size = server.gui.add_slider(
             "Wall grid resolution", min=5, max=1000 , step=5, initial_value=30
         )
-        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=500)
+        wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=250)
         bw_scale_chk = server.gui.add_checkbox("B/W Scale", initial_value=False)
 
     with quick_tab:
