@@ -1273,12 +1273,40 @@ def _ray_box_intersection_batch_np(origins, directions, absorbers):
     return absorbed
 
 
-def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None):
+def _camera_fov_wall_trapezoid(dist_cm, pitch_deg, fov_h_deg, fov_v_deg):
+    """Project a pitched pinhole-camera FOV onto the wall plane.
+
+    The camera sits on the X axis at ``dist_cm`` from the wall, pitched
+    up/down by ``pitch_deg`` (positive = looking up). The footprint on the
+    wall is a trapezoid symmetric about Y=0. Returns
+    ``(z_bottom_cm, z_top_cm, half_width_bottom_cm, half_width_top_cm)``.
+    With pitch = 0 this reduces to the usual centred rectangle.
+    """
+    half_v = fov_v_deg / 2.0
+    half_h_tan = np.tan(np.radians(fov_h_deg / 2.0))
+    cos_half_v = np.cos(np.radians(half_v))
+    # Clamp elevation so boundary rays always intersect the wall plane.
+    v_lo = np.clip(pitch_deg - half_v, -89.0, 89.0)
+    v_hi = np.clip(pitch_deg + half_v, -89.0, 89.0)
+    z_bot = dist_cm * np.tan(np.radians(v_lo))
+    z_top = dist_cm * np.tan(np.radians(v_hi))
+    half_w_bot = dist_cm * half_h_tan * cos_half_v / np.cos(np.radians(v_lo))
+    half_w_top = dist_cm * half_h_tan * cos_half_v / np.cos(np.radians(v_hi))
+    return float(z_bot), float(z_top), float(half_w_bot), float(half_w_top)
+
+
+def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None,
+                             fov_trapezoid=None):
     """Compute illuminotechnical uniformity metrics from a 2D lux grid.
 
     If *fov_bounds* is given as (fov_width_cm, fov_height_cm) and
     *wall_size_cm* is provided, only the sub-grid inside the FOV rectangle
     (centred on the wall) is analysed.
+
+    Alternatively, *fov_trapezoid* may be given as
+    (z_bottom_cm, z_top_cm, half_width_bottom_cm, half_width_top_cm) — the
+    footprint of a pitched camera (see _camera_fov_wall_trapezoid) — and only
+    cells inside that trapezoid are analysed.
 
     Returns an HTML string to be appended below the intensity legend.
     Metrics computed (excluding zero-lux cells outside the light cone):
@@ -1287,8 +1315,23 @@ def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None):
         - CV = sigma / Eavg   (Coefficient of Variation)
         - deltaEV  (perceptual stop range) with diagnostic classification
     """
+    # --- Crop to pitched-camera trapezoid if requested ---
+    if fov_trapezoid is not None and wall_size_cm is not None:
+        z_bot, z_top, w_bot, w_top = fov_trapezoid
+        gz, gy = grid.shape  # rows=Z, cols=Y
+        cell_cm = wall_size_cm / gy
+        half_wall = wall_size_cm / 2.0
+        # Cell-centre coordinates; row 0 is the bottom of the wall.
+        z_centers = -half_wall + (np.arange(gz) + 0.5) * cell_cm
+        y_centers = -half_wall + (np.arange(gy) + 0.5) * cell_cm
+        z_span = max(z_top - z_bot, 1e-9)
+        frac = np.clip((z_centers - z_bot) / z_span, 0.0, 1.0)
+        half_w_at_z = w_bot + (w_top - w_bot) * frac
+        in_z = (z_centers >= z_bot) & (z_centers <= z_top)
+        mask = in_z[:, None] & (np.abs(y_centers)[None, :] <= half_w_at_z[:, None])
+        grid = np.where(mask, grid, 0.0)
     # --- Crop to FOV rectangle if requested ---
-    if fov_bounds is not None and wall_size_cm is not None:
+    elif fov_bounds is not None and wall_size_cm is not None:
         fov_w_cm, fov_h_cm = fov_bounds
         gz, gy = grid.shape  # rows=Z, cols=Y
         cell_cm = wall_size_cm / gy  # square grid assumed (gz == gy)
@@ -2188,18 +2231,21 @@ def main():
     tab_fov = main_tabs.add_tab("FOV")
     tab_advanced = main_tabs.add_tab("Advanced")
 
-    # Small single-tab panel (renders as a plain header) with the intensity
-    # quick controls, docked at the top-left above the tabbed panel.
-    quick_panel = server.gui.add_panel()
-    quick_tab = quick_panel.add_tab("Intensity Map")
-    quick_panel.dock_left()
-    quick_panel.set_width(320)
-
+    # Display / Global: full-height left dock. Intensity Map is *not* stacked
+    # above this (Viser's dock_below split defaults to 50/50 and cannot be
+    # weighted from Python), so these tabs get the whole column.
     left_panel = server.gui.add_panel()
     toolbar_tab = left_panel.add_tab("Display")
     global_tab = left_panel.add_tab("Global")
-    left_panel.dock_below(quick_panel)
+    left_panel.dock_left()
     left_panel.set_width(320)
+
+    # Intensity Map + legend, floating at the top-left of the 3D canvas
+    # (to the right of the docked Display/Global column). Auto-height wraps
+    # to the controls and legend so there is no empty splitter pane.
+    quick_panel = server.gui.add_panel()
+    quick_tab = quick_panel.add_tab("Intensity Map")
+    quick_panel.float(x=12, y=8, width=300)
 
     inspector_panel = server.gui.add_panel()
     inspector_tab = inspector_panel.add_tab("Selected")
@@ -4348,6 +4394,12 @@ def main():
         )
         wall_view_size = server.gui.add_slider("Wall view size (cm)", min=100, max=2000, step=10, initial_value=100)
         bw_scale_chk = server.gui.add_checkbox("B/W Scale", initial_value=False)
+
+    with quick_tab:
+        update_intensity_button = server.gui.add_button("Update Intensity Map")
+        show_intensity_map = server.gui.add_checkbox(
+            "Show intensity on wall", initial_value=False
+        )
         legend_max_input = server.gui.add_number("Legend max (lux)", initial_value=3500, min=1, max=100000, step=50)
         server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap: colors scale 0–this value. If peak exceeds it, switches to AUTO.</div>")
         cell_area_html = server.gui.add_html(
@@ -4360,12 +4412,6 @@ def main():
             "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
             "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click<br>'Update Intensity Map' to populate legend</div>"
             "</div>"
-        )
-
-    with quick_tab:
-        update_intensity_button = server.gui.add_button("Update Intensity Map")
-        show_intensity_map = server.gui.add_checkbox(
-            "Show intensity on wall", initial_value=False
         )
 
     with toolbar_tab:
@@ -4927,6 +4973,9 @@ def main():
         )
         camera_pos_x = server.gui.add_slider(
             "Camera X pos (cm)", min=-100, max=100, step=1, initial_value=0
+        )
+        camera_pitch = server.gui.add_slider(
+            "Camera pitch (°)", min=-60, max=60, step=1, initial_value=0
         )
         capture_fov_btn = server.gui.add_button("Capture FOV Image", color="green")
 
@@ -7850,12 +7899,15 @@ def main():
         cam_x = camera_pos_x.value
         fov_h_deg = camera_fov_h.value
         fov_v_deg = camera_fov_v.value
-        
-        # Calculate FOV dimensions on wall
-        fov_h_rad = np.radians(fov_h_deg)
-        fov_v_rad = np.radians(fov_v_deg)
-        fov_width_cm = 2 * (wall_dist - cam_x) * np.tan(fov_h_rad / 2)
-        fov_height_cm = 2 * (wall_dist - cam_x) * np.tan(fov_v_rad / 2)
+        pitch_deg = camera_pitch.value
+
+        # FOV footprint on the wall (trapezoid when the camera is pitched)
+        fov_z_bot, fov_z_top, fov_w_bot, fov_w_top = _camera_fov_wall_trapezoid(
+            wall_dist - cam_x, pitch_deg, fov_h_deg, fov_v_deg
+        )
+        fov_half_w_max = max(fov_w_bot, fov_w_top)
+        fov_width_cm = 2.0 * fov_half_w_max   # bounding-box width on wall
+        fov_height_cm = fov_z_top - fov_z_bot  # bounding-box height on wall
         
         # Cell resolution: 1cm × 1cm (10mm²)
         cell_size_cm = 1.0
@@ -8269,14 +8321,18 @@ def main():
                 hit_y = led.position[1] + world_dirs[vi2, 1] * t2
                 hit_z = led.position[2] + world_dirs[vi2, 2] * t2
                 
-                half_w = fov_width_cm / 2
-                half_h = fov_height_cm / 2
-                
-                in_fov = (hit_y >= -half_w) & (hit_y <= half_w) & (hit_z >= -half_h) & (hit_z <= half_h)
+                # Keep only hits inside the (possibly pitched) FOV trapezoid
+                z_span = max(fov_z_top - fov_z_bot, 1e-9)
+                frac_z = np.clip((hit_z - fov_z_bot) / z_span, 0.0, 1.0)
+                half_w_at_z = fov_w_bot + (fov_w_top - fov_w_bot) * frac_z
+                in_fov = (
+                    (hit_z >= fov_z_bot) & (hit_z <= fov_z_top)
+                    & (np.abs(hit_y) <= half_w_at_z)
+                )
                 fi = np.where(in_fov)[0]
                 
-                grid_x = ((hit_y[fi] + half_w) / cell_size_cm).astype(int)
-                grid_y = ((hit_z[fi] + half_h) / cell_size_cm).astype(int)
+                grid_x = ((hit_y[fi] + fov_half_w_max) / cell_size_cm).astype(int)
+                grid_y = ((hit_z[fi] - fov_z_bot) / cell_size_cm).astype(int)
                 
                 in_bounds = (grid_x >= 0) & (grid_x < grid_width) & (grid_y >= 0) & (grid_y < grid_height)
                 bi = np.where(in_bounds)[0]
@@ -8439,13 +8495,13 @@ def main():
 
         # Recalculate FOV crop and uniformity
         _cam_x = camera_pos_x.value
-        _fov_h_rad = np.radians(camera_fov_h.value)
-        _fov_v_rad = np.radians(camera_fov_v.value)
-        _fov_w_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_h_rad / 2.0)
-        _fov_h_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_v_rad / 2.0)
+        _trap = _camera_fov_wall_trapezoid(
+            wall_dist - _cam_x, camera_pitch.value,
+            camera_fov_h.value, camera_fov_v.value,
+        )
         uniformity_html = _compute_uniformity_html(
             grid,
-            fov_bounds=(_fov_w_cm, _fov_h_cm),
+            fov_trapezoid=_trap,
             wall_size_cm=wall_size_cm,
         )
         legend_html.content = "".join(html_lines) + uniformity_html
@@ -8890,15 +8946,15 @@ def main():
             )
         html_lines.append("</div>")
         # --- Uniformity metrics (FOV-only) ---
-        # Compute FOV footprint on wall so metrics cover only the green rectangle
+        # Compute FOV footprint on wall so metrics cover only the green outline
         _cam_x = camera_pos_x.value
-        _fov_h_rad = np.radians(camera_fov_h.value)
-        _fov_v_rad = np.radians(camera_fov_v.value)
-        _fov_w_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_h_rad / 2.0)
-        _fov_h_cm = 2.0 * (wall_dist - _cam_x) * np.tan(_fov_v_rad / 2.0)
+        _trap = _camera_fov_wall_trapezoid(
+            wall_dist - _cam_x, camera_pitch.value,
+            camera_fov_h.value, camera_fov_v.value,
+        )
         uniformity_html = _compute_uniformity_html(
             intensity_grid,
-            fov_bounds=(_fov_w_cm, _fov_h_cm),
+            fov_trapezoid=_trap,
             wall_size_cm=actual_wall_size,
         )
         legend_html.content = "".join(html_lines) + uniformity_html
@@ -11071,36 +11127,34 @@ def main():
                 wall_dist = wall_dist_slider.value
             
             cam_x = camera_pos_x.value
-            fov_h_deg = camera_fov_h.value
-            fov_v_deg = camera_fov_v.value
-            
-            # Calculate FOV dimensions on wall based on viewing angles
-            # Using simple trigonometry: width = 2 * distance * tan(angle/2)
-            fov_h_rad = np.radians(fov_h_deg)
-            fov_v_rad = np.radians(fov_v_deg)
-            
-            # FOV dimensions at wall distance (in cm)
-            fov_width_cm = 2 * (wall_dist - cam_x) * np.tan(fov_h_rad / 2)
-            fov_height_cm = 2 * (wall_dist - cam_x) * np.tan(fov_v_rad / 2)
-            
-            # Draw FOV border lines only (no fill)
-            half_w = fov_width_cm / 200.0  # Half width in meters
-            half_h = fov_height_cm / 200.0  # Half height in meters
+
+            # Footprint of the (possibly pitched) camera FOV on the wall.
+            # With pitch != 0 this is a trapezoid, not a rectangle.
+            z_bot_cm, z_top_cm, w_bot_cm, w_top_cm = _camera_fov_wall_trapezoid(
+                wall_dist - cam_x, camera_pitch.value,
+                camera_fov_h.value, camera_fov_v.value,
+            )
+            z_bot = z_bot_cm / 100.0  # metres
+            z_top = z_top_cm / 100.0
+            w_bot = w_bot_cm / 100.0
+            w_top = w_top_cm / 100.0
             wall_x = wall_dist / 100.0 - 0.008  # Slightly in front of wall
 
-            # In room mode, clamp the FOV rectangle to the front wall boundaries
+            # In room mode, clamp the FOV footprint to the front wall boundaries
             if room_mode_enable.value:
                 max_half_w = room_side_dist.value / 100.0        # wall half-width in m
                 max_half_h = room_top_bottom_dist.value / 100.0  # wall half-height in m
-                half_w = min(half_w, max_half_w)
-                half_h = min(half_h, max_half_h)
+                w_bot = min(w_bot, max_half_w)
+                w_top = min(w_top, max_half_w)
+                z_bot = float(np.clip(z_bot, -max_half_h, max_half_h))
+                z_top = float(np.clip(z_top, -max_half_h, max_half_h))
             
             # Four corner lines
             corners = [
-                [[wall_x, -half_w, -half_h], [wall_x, half_w, -half_h]],  # Bottom
-                [[wall_x, half_w, -half_h], [wall_x, half_w, half_h]],    # Right
-                [[wall_x, half_w, half_h], [wall_x, -half_w, half_h]],    # Top
-                [[wall_x, -half_w, half_h], [wall_x, -half_w, -half_h]],  # Left
+                [[wall_x, -w_bot, z_bot], [wall_x, w_bot, z_bot]],   # Bottom
+                [[wall_x, w_bot, z_bot], [wall_x, w_top, z_top]],    # Right
+                [[wall_x, w_top, z_top], [wall_x, -w_top, z_top]],   # Top
+                [[wall_x, -w_top, z_top], [wall_x, -w_bot, z_bot]],  # Left
             ]
             
             handle = server.scene.add_line_segments(
@@ -11324,6 +11378,7 @@ def main():
     camera_fov_h.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    camera_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     show_vio_fov.on_update(lambda _: update_scene())
     vio_fill_fov.on_update(lambda _: update_scene())
     vio_pos_x.on_update(lambda _: update_scene())
