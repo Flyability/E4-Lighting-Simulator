@@ -300,7 +300,7 @@ dependencies = [
     { name = "viser" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 gpu = [
     { name = "cupy-cuda12x" },
     { name = "nvidia-cuda-nvrtc-cu12" },
@@ -310,18 +310,21 @@ gpu = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cupy-cuda12x", marker = "extra == 'gpu'", specifier = ">=13.0.0,<14" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "numpy", specifier = "<2.0" },
-    { name = "nvidia-cuda-nvrtc-cu12", marker = "extra == 'gpu'", specifier = ">=12.9.86" },
-    { name = "nvidia-cuda-runtime-cu12", marker = "extra == 'gpu'", specifier = ">=12.9.79" },
-    { name = "nvidia-curand-cu12", marker = "extra == 'gpu'", specifier = ">=10.3.10.19" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pvtrace", specifier = ">=2.1.6" },
     { name = "trimesh", specifier = ">=4.0.0" },
     { name = "viser", specifier = ">=1.1.0" },
 ]
-provides-extras = ["gpu"]
+
+[package.metadata.requires-dev]
+gpu = [
+    { name = "cupy-cuda12x", specifier = ">=13.0.0,<14" },
+    { name = "nvidia-cuda-nvrtc-cu12", specifier = ">=12.9.86" },
+    { name = "nvidia-cuda-runtime-cu12", specifier = ">=12.9.79" },
+    { name = "nvidia-curand-cu12", specifier = ">=10.3.10.19" },
+]
 
 [[package]]
 name = "embreex"
