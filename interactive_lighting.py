@@ -252,6 +252,82 @@ def points_in_fisheye_fov(cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, point
     return mask.reshape(pts.shape[:-1])
 
 
+def points_in_pinhole_fov(cam_pos, pitch_deg, hfov_deg, vfov_deg, points):
+    """Boolean mask: world points (..., 3) inside a pitched pinhole-camera frustum.
+
+    Camera frame matches the main camera / VIO convention with yaw = 0:
+    optical axis +X, +Y horizontal, +Z up.  A point is inside if it is in
+    front of the camera and its angular offsets fit within HFOV / VFOV.
+    """
+    cam_pos = np.asarray(cam_pos, dtype=float)
+    pts = np.asarray(points, dtype=float)
+    dir_w = pts.reshape(-1, 3) - cam_pos[None, :]
+    _, r_inv = _vio_cam_rotations(pitch_deg, 0.0)
+    dir_cam = dir_w @ r_inv.T
+    cx = dir_cam[:, 0]
+    inv_x = 1.0 / np.maximum(cx, 1e-12)
+    tan_h = np.tan(np.radians(float(hfov_deg) / 2.0))
+    tan_v = np.tan(np.radians(float(vfov_deg) / 2.0))
+    mask = (
+        (cx > 1e-8)
+        & (np.abs(dir_cam[:, 1] * inv_x) <= tan_h + 1e-9)
+        & (np.abs(dir_cam[:, 2] * inv_x) <= tan_v + 1e-9)
+    )
+    return mask.reshape(pts.shape[:-1])
+
+
+def room_wall_cell_centers(wall_name, spec, front_dist, side_dist, top_bottom_dist, back_dist=None):
+    """World cell-center coordinates (cm) for a room-wall lux grid.
+
+    Grid indexing matches ``compute_room_intensity`` / visualization:
+    front/back ``[Z, Y]``, left/right ``[Z, X]``, top/bottom ``[Y, X]``.
+    Returns an array of shape ``grid_shape + (3,)``.
+    """
+    if wall_name in ('front', 'back'):
+        size_y = spec['size_y']
+        size_z = spec['size_z']
+        grid_y = spec['grid_y']
+        grid_z = spec['grid_z']
+        z_c = -size_z / 2.0 + (np.arange(grid_z) + 0.5) * (size_z / grid_z)
+        y_c = -size_y / 2.0 + (np.arange(grid_y) + 0.5) * (size_y / grid_y)
+        zz, yy = np.meshgrid(z_c, y_c, indexing='ij')
+        pts = np.empty(zz.shape + (3,), dtype=float)
+        pts[..., 0] = front_dist if wall_name == 'front' else -float(back_dist or 0.0)
+        pts[..., 1] = yy
+        pts[..., 2] = zz
+        return pts
+
+    if wall_name in ('left', 'right'):
+        size_x = spec['size_x']
+        size_z = spec['size_z']
+        grid_x = spec['grid_x']
+        grid_z = spec['grid_z']
+        x_min = spec['x_min']
+        z_c = -size_z / 2.0 + (np.arange(grid_z) + 0.5) * (size_z / grid_z)
+        x_c = x_min + (np.arange(grid_x) + 0.5) * (size_x / grid_x)
+        zz, xx = np.meshgrid(z_c, x_c, indexing='ij')
+        pts = np.empty(zz.shape + (3,), dtype=float)
+        pts[..., 0] = xx
+        pts[..., 1] = -side_dist if wall_name == 'left' else side_dist
+        pts[..., 2] = zz
+        return pts
+
+    # top / bottom: grid [Y, X]
+    size_x = spec['size_x']
+    size_y = spec['size_y']
+    grid_x = spec['grid_x']
+    grid_y = spec['grid_y']
+    x_min = spec['x_min']
+    y_c = -size_y / 2.0 + (np.arange(grid_y) + 0.5) * (size_y / grid_y)
+    x_c = x_min + (np.arange(grid_x) + 0.5) * (size_x / grid_x)
+    yy, xx = np.meshgrid(y_c, x_c, indexing='ij')
+    pts = np.empty(yy.shape + (3,), dtype=float)
+    pts[..., 0] = xx
+    pts[..., 1] = yy
+    pts[..., 2] = top_bottom_dist if wall_name == 'top' else -top_bottom_dist
+    return pts
+
+
 # For an axis-aligned plane with fixed world axis a, the patch spans the two
 # remaining axes (u, v) in ascending axis order.
 _PLANE_UV_AXES = {0: (1, 2), 1: (0, 2), 2: (0, 1)}
@@ -8746,31 +8822,30 @@ def main():
     # when FOV changes without re-running ray tracing
     _last_intensity_cache = {'grid': None, 'wall_size_cm': None, 'wall_dist': None,
                              'cell_area_m2': None, 'max_lux': None, 'color_scale_max': None}
+    _last_room_cache = {
+        'grids': None, 'wall_specs': None,
+        'front_dist': None, 'side_dist': None, 'top_bottom_dist': None, 'back_dist': None,
+        'max_lux': None, 'color_scale_max': None, 'avg_cell_area_m2': None,
+    }
+    # Guard programmatic checkbox writes in on_room_mode_toggle so we don't
+    # retrigger update_intensity_map / update_room_intensity_map.
+    _mode_toggle_syncing = [False]
 
-    def _refresh_uniformity():
-        """Recalculate FOV-only uniformity from cached intensity grid (cheap)."""
-        cache = _last_intensity_cache
-        if cache['grid'] is None:
-            return  # No intensity data yet
-        grid = cache['grid']
-        wall_size_cm = cache['wall_size_cm']
-        wall_dist = cache['wall_dist']
-        cell_area_m2 = cache['cell_area_m2']
-        max_lux = cache['max_lux']
-        color_scale_max = cache['color_scale_max']
-
-        # Rebuild the legend exactly as update_intensity_map does
-        grid_size = grid.shape[0]
+    def _build_lux_legend_html(max_lux, color_scale_max, cell_area_m2, cell_caption="lm/cell"):
+        """Intensity-scale HTML used by both wall and room legend panels."""
         _legend_cap = float(legend_max_input.value)
         if color_scale_max <= _legend_cap:
             _step = max(1, _legend_cap / 8)
             legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
         else:
             legend_vals_lux = np.linspace(0, color_scale_max, 9)
-        scale_label = f"(scale 0\u2013{int(color_scale_max)} lx" + (", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
-        html_lines = ["<div style='font-family: sans-serif;'>",
-                      f"<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
-                      f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} \u2014 peak {max_lux:.0f} lx</div>"]
+        scale_label = f"(scale 0\u2013{int(color_scale_max)} lx" + (
+            ", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
+        html_lines = [
+            "<div style='font-family: sans-serif;'>",
+            "<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
+            f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} \u2014 peak {max_lux:.0f} lx</div>",
+        ]
         for lux_val in reversed(legend_vals_lux):
             color = intensity_to_color(lux_val, color_scale_max)
             hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
@@ -8779,22 +8854,172 @@ def main():
                 f"<div style='display:flex;align-items:center;margin:2px 0;'>"
                 f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
                 f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
-                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
+                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} {cell_caption})</div></div>"
             )
         html_lines.append("</div>")
+        return "".join(html_lines)
 
-        # Recalculate FOV crop and uniformity
-        _cam_x = camera_pos_x.value
+    def _empty_fov_html():
+        return (
+            "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
+            "<div style='font-weight:600;margin-bottom:4px;'>Pattern Uniformity</div>"
+            "<div style='color:#888;font-size:12px;'>No intensity data inside camera FOV</div></div>"
+        )
+
+    def _wall_grid_cell_centers_cm(grid, wall_size_cm, wall_dist):
+        gz, gy = grid.shape
+        cell_cm = wall_size_cm / gy
+        half = wall_size_cm / 2.0
+        z_centers = -half + (np.arange(gz) + 0.5) * cell_cm
+        y_centers = -half + (np.arange(gy) + 0.5) * cell_cm
+        zz, yy = np.meshgrid(z_centers, y_centers, indexing='ij')
+        pts = np.empty(grid.shape + (3,), dtype=float)
+        pts[..., 0] = wall_dist
+        pts[..., 1] = yy
+        pts[..., 2] = zz
+        return pts
+
+    def _collect_room_fov_lux(cache):
+        """Lux values of room-wall cells that fall inside the main-camera FOV."""
+        grids = cache.get('grids')
+        specs = cache.get('wall_specs')
+        if not grids or not specs:
+            return np.array([])
+        cam_pos = np.array([camera_pos_x.value, camera_pos_y.value, 0.0], dtype=float)
+        parts = []
+        for name, grid in grids.items():
+            spec = specs.get(name)
+            if spec is None:
+                continue
+            pts = room_wall_cell_centers(
+                name, spec,
+                cache['front_dist'], cache['side_dist'],
+                cache['top_bottom_dist'], cache['back_dist'],
+            )
+            mask = points_in_pinhole_fov(
+                cam_pos, camera_pitch.value,
+                camera_fov_h.value, camera_fov_v.value, pts,
+            )
+            if np.any(mask):
+                parts.append(grid[mask])
+        if not parts:
+            return np.array([])
+        return np.concatenate(parts)
+
+    def _collect_active_cell_samples():
+        """(points_cm Nx3, lux N) for the active intensity mode, or (None, None)."""
+        if room_mode_enable.value:
+            cache = _last_room_cache
+            if cache['grids'] is None:
+                return None, None
+            pts_list, lux_list = [], []
+            for name, grid in cache['grids'].items():
+                spec = cache['wall_specs'].get(name)
+                if spec is None:
+                    continue
+                pts = room_wall_cell_centers(
+                    name, spec,
+                    cache['front_dist'], cache['side_dist'],
+                    cache['top_bottom_dist'], cache['back_dist'],
+                )
+                pts_list.append(pts.reshape(-1, 3))
+                lux_list.append(np.asarray(grid).reshape(-1))
+            if not pts_list:
+                return None, None
+            return np.concatenate(pts_list, axis=0), np.concatenate(lux_list)
+        cache = _last_intensity_cache
+        if cache['grid'] is None:
+            return None, None
+        pts = _wall_grid_cell_centers_cm(cache['grid'], cache['wall_size_cm'], cache['wall_dist'])
+        return pts.reshape(-1, 3), np.asarray(cache['grid']).reshape(-1)
+
+    def _compute_vio_occupancy_html():
+        """% of VIO-FOV wall cells whose lux is above the black threshold."""
+        pts, lux = _collect_active_cell_samples()
+        if pts is None or pts.size == 0:
+            return ""
+        threshold = float(intensity_threshold_slider.value)
+        cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
+        hfov, vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
+        mask1 = points_in_fisheye_fov(
+            cam_pos, vio_cam1_pitch.value, vio_cam1_yaw.value, hfov, vfov, pts)
+        mask2 = points_in_fisheye_fov(
+            cam_pos, vio_cam2_pitch.value, vio_cam2_yaw.value, hfov, vfov, pts)
+        good = lux > threshold
+
+        def _row(mask):
+            n = int(np.count_nonzero(mask))
+            if n == 0:
+                return None, "\u2014"
+            pct = 100.0 * float(np.count_nonzero(mask & good)) / n
+            return pct, f"{pct:.1f}%"
+
+        _, s1 = _row(mask1)
+        _, s2 = _row(mask2)
+        union_pct, s_u = _row(mask1 | mask2)
+        union_color = "#4CAF50" if (union_pct is not None and union_pct >= 50.0) else "#FF9800"
+        if union_pct is None:
+            union_color = "#888"
+        return (
+            "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
+            "<div style='font-weight:600;margin-bottom:4px;'>VIO FOV Lighting Occupancy</div>"
+            f"<div style='color:#888;font-size:10px;margin-bottom:6px;'>"
+            f"Share of FOV wall cells brighter than {threshold:.0f} lx"
+            f"{' (any light)' if threshold <= 0 else ''}</div>"
+            "<table style='font-size:11px;color:#ccc;border-collapse:collapse;width:100%;'>"
+            f"<tr><td style='padding:1px 6px 1px 0;color:#ff00ff;'>Cam 1 (up)</td><td>{s1}</td></tr>"
+            f"<tr><td style='padding:1px 6px 1px 0;color:#00ffff;'>Cam 2 (down)</td><td>{s2}</td></tr>"
+            f"<tr><td style='padding:1px 6px 1px 0;'>Union (Cam 1 \u222a Cam 2)</td>"
+            f"<td style='color:{union_color};font-weight:700;'>{s_u}</td></tr>"
+            "</table>"
+            "<div style='font-size:10px;color:#888;margin-top:6px;'>"
+            "Denominator is FOV-covered wall cells, not empty space.</div></div>"
+        )
+
+    def _wall_metrics_html(grid, wall_size_cm, wall_dist):
         _trap = _camera_fov_wall_trapezoid(
-            wall_dist - _cam_x, camera_pitch.value,
+            wall_dist - camera_pos_x.value, camera_pitch.value,
             camera_fov_h.value, camera_fov_v.value,
         )
-        uniformity_html = _compute_uniformity_html(
+        html = _compute_uniformity_html(
             grid,
             fov_trapezoid=(*_trap, camera_pos_y.value),
             wall_size_cm=wall_size_cm,
         )
-        legend_html.content = "".join(html_lines) + uniformity_html
+        if not html:
+            html = _empty_fov_html()
+        return html + _compute_vio_occupancy_html()
+
+    def _room_metrics_html():
+        fov_lux = _collect_room_fov_lux(_last_room_cache)
+        if fov_lux.size == 0:
+            html = _empty_fov_html()
+        else:
+            html = _compute_uniformity_html(fov_lux.reshape(1, -1)) or _empty_fov_html()
+        return html + _compute_vio_occupancy_html()
+
+    def _refresh_uniformity():
+        """Recalculate FOV-only uniformity (and VIO occupancy) from cache (cheap)."""
+        if room_mode_enable.value:
+            cache = _last_room_cache
+            if cache['grids'] is None:
+                return
+            legend = _build_lux_legend_html(
+                cache['max_lux'], cache['color_scale_max'],
+                cache['avg_cell_area_m2'], cell_caption="lm/cell avg",
+            )
+            legend_html.content = legend + _room_metrics_html()
+            return
+        cache = _last_intensity_cache
+        if cache['grid'] is None:
+            return
+        legend = _build_lux_legend_html(
+            cache['max_lux'], cache['color_scale_max'],
+            cache['cell_area_m2'], cell_caption="lm/cell",
+        )
+        legend_html.content = legend + _wall_metrics_html(
+            cache['grid'], cache['wall_size_cm'], cache['wall_dist'],
+        )
 
     def _build_current_leds_and_absorbers():
         """Build LEDs and absorbers from current GUI state."""
@@ -9065,6 +9290,15 @@ def main():
     def update_intensity_map():
         """Update only the intensity map on the wall (expensive operation)."""
         nonlocal intensity_handles, legend_html
+
+        if room_mode_enable.value:
+            legend_html.content = (
+                "<div style='font-family: sans-serif;'>"
+                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                "<div style='color:#888;font-size:12px;'>Room Mode is active — use 'Update Room Intensity' in Advanced → Room Mode.</div>"
+                "</div>"
+            )
+            return
         
         import time as _time
         t_total_start = _time.perf_counter()
@@ -9216,51 +9450,19 @@ def main():
         print(f"  [TIMING] Total update_intensity_map: {t_viz_end - t_total_start:.2f}s")
         
         # Update legend (grid now stores lux = lm/m²)
-        # Fixed legend ticks at absolute values up to color_scale_max
-        _legend_cap = float(legend_max_input.value)
-        if color_scale_max <= _legend_cap:
-            _step = max(1, _legend_cap / 8)
-            legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
-        else:
-            # Exceeded cap – uniform 9 ticks up to actual max
-            legend_vals_lux = np.linspace(0, color_scale_max, 9)
-        scale_label = f"(scale 0–{int(color_scale_max)} lx" + (", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
-        html_lines = ["<div style='font-family: sans-serif;'>",
-                      f"<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
-                      f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} — peak {max_lux:.0f} lx</div>"]
-        for lux_val in reversed(legend_vals_lux):
-            color = intensity_to_color(lux_val, color_scale_max)
-            hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            # Convert lux to lumens for this cell: Lumen = Lux × Area
-            lumen_val = lux_val * cell_area_m2
-            html_lines.append(
-                f"<div style='display:flex;align-items:center;margin:2px 0;'>"
-                f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
-                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell)</div></div>"
-            )
-        html_lines.append("</div>")
-        # --- Uniformity metrics (FOV-only) ---
-        # Compute FOV footprint on wall so metrics cover only the green outline
-        _cam_x = camera_pos_x.value
-        _trap = _camera_fov_wall_trapezoid(
-            wall_dist - _cam_x, camera_pitch.value,
-            camera_fov_h.value, camera_fov_v.value,
-        )
-        uniformity_html = _compute_uniformity_html(
-            intensity_grid,
-            fov_trapezoid=(*_trap, camera_pos_y.value),
-            wall_size_cm=actual_wall_size,
-        )
-        legend_html.content = "".join(html_lines) + uniformity_html
+        legend = _build_lux_legend_html(max_lux, color_scale_max, cell_area_m2, cell_caption="lm/cell")
 
-        # Cache grid so FOV changes can recalculate uniformity cheaply
+        # Cache grid so FOV / VIO / threshold changes can recalculate metrics cheaply
         _last_intensity_cache['grid'] = intensity_grid
         _last_intensity_cache['wall_size_cm'] = actual_wall_size
         _last_intensity_cache['wall_dist'] = wall_dist
         _last_intensity_cache['cell_area_m2'] = cell_area_m2
         _last_intensity_cache['max_lux'] = max_lux
         _last_intensity_cache['color_scale_max'] = color_scale_max
+
+        legend_html.content = legend + _wall_metrics_html(
+            intensity_grid, actual_wall_size, wall_dist,
+        )
 
     # ── CSV Pattern Import logic ──────────────────────────────────────────
     def _parse_benchmark_csv(filepath):
@@ -10316,14 +10518,6 @@ def main():
             print(f"  {wall_name.capitalize()}: {count} cells created")
         print(f"===================================\n")
         
-        # Update legend (grid stores lux)
-        # Fixed legend ticks at absolute values up to color_scale_max
-        _legend_cap = float(legend_max_input.value)
-        if color_scale_max <= _legend_cap:
-            _step = max(1, _legend_cap / 8)
-            legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
-        else:
-            legend_vals_lux = np.linspace(0, color_scale_max, 9)
         # Calculate average cell area across all walls for lux to lumen conversion
         total_cells = 0
         total_area_cm2 = 0
@@ -10344,29 +10538,21 @@ def main():
         
         avg_cell_area_cm2 = total_area_cm2 / total_cells if total_cells > 0 else 1.0
         avg_cell_area_m2 = avg_cell_area_cm2 / 10000.0
-        
-        scale_label = f"(scale 0–{int(color_scale_max)} lx" + (", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
-        html_lines = ["<div style='font-family: sans-serif;'>",
-                      f"<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
-                      f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} — peak {max_lux:.0f} lx</div>"]
-        for lux_val in reversed(legend_vals_lux):
-            color = intensity_to_color(lux_val, color_scale_max)
-            hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            # Convert lux to lumens using average cell area: Lumen = Lux × Area
-            lumen_val = lux_val * avg_cell_area_m2
-            html_lines.append(
-                f"<div style='display:flex;align-items:center;margin:2px 0;'>"
-                f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
-                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} lm/cell avg)</div></div>"
-            )
-        html_lines.append("</div>")
-        # --- Uniformity metrics (combine all room wall grids) ---
-        all_active = np.concatenate([g[g > 0] for g in grids.values() if g[g > 0].size > 0]) if grids else np.array([])
-        room_uniformity_grid = all_active.reshape(-1) if all_active.size > 0 else np.zeros(1)
-        # Build a pseudo-2D array so the helper works (it just needs grid > 0)
-        uniformity_html = _compute_uniformity_html(room_uniformity_grid.reshape(1, -1))
-        legend_html.content = "".join(html_lines) + uniformity_html
+
+        _last_room_cache['grids'] = grids
+        _last_room_cache['wall_specs'] = wall_specs
+        _last_room_cache['front_dist'] = front_dist
+        _last_room_cache['side_dist'] = side_dist
+        _last_room_cache['top_bottom_dist'] = top_bottom_dist
+        _last_room_cache['back_dist'] = room_back_dist.value if show_back_wall.value else None
+        _last_room_cache['max_lux'] = max_lux
+        _last_room_cache['color_scale_max'] = color_scale_max
+        _last_room_cache['avg_cell_area_m2'] = avg_cell_area_m2
+
+        legend = _build_lux_legend_html(
+            max_lux, color_scale_max, avg_cell_area_m2, cell_caption="lm/cell avg",
+        )
+        legend_html.content = legend + _room_metrics_html()
 
     def _clear_inspector():
         for h in _inspector_handles:
@@ -11785,7 +11971,7 @@ def main():
     show_random_rays.on_update(lambda _: update_scene())
     show_rays_output.on_update(lambda _: update_scene())
     show_led_markers.on_update(lambda _: update_scene())
-    show_intensity_map.on_update(lambda _: update_intensity_map())
+    show_intensity_map.on_update(lambda _: None if _mode_toggle_syncing[0] else update_intensity_map())
     row1_chk.on_update(lambda _: update_scene())
     row2_chk.on_update(lambda _: update_scene())
     row3_chk.on_update(lambda _: update_scene())
@@ -11799,15 +11985,15 @@ def main():
     camera_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     show_vio_fov.on_update(lambda _: update_scene())
     vio_fill_fov.on_update(lambda _: update_scene())
-    vio_pos_x.on_update(lambda _: update_scene())
-    vio_pos_y.on_update(lambda _: update_scene())
-    vio_pos_z.on_update(lambda _: update_scene())
-    vio_cam1_pitch.on_update(lambda _: update_scene())
-    vio_cam1_yaw.on_update(lambda _: update_scene())
-    vio_cam2_pitch.on_update(lambda _: update_scene())
-    vio_cam2_yaw.on_update(lambda _: update_scene())
-    vio_long_fov.on_update(lambda _: (_refresh_vio_fov_label(), update_scene()))
-    vio_landscape.on_update(lambda _: (_refresh_vio_fov_label(), update_scene()))
+    vio_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_pos_y.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_pos_z.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_cam1_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_cam1_yaw.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_cam2_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_cam2_yaw.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    vio_long_fov.on_update(lambda _: (_refresh_vio_fov_label(), update_scene(), _refresh_uniformity()))
+    vio_landscape.on_update(lambda _: (_refresh_vio_fov_label(), update_scene(), _refresh_uniformity()))
     abs0_off_x.on_update(lambda _: update_scene())
     abs0_off_y.on_update(lambda _: update_scene())
     abs0_off_z.on_update(lambda _: update_scene())
@@ -11824,18 +12010,36 @@ def main():
     abs3_rot_z.on_update(lambda _: update_scene())
     intensity_rays_slider.on_update(lambda _: None)  # No auto-update - manual button only
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
+    intensity_threshold_slider.on_update(lambda _: _refresh_uniformity())
     intensity_grid_size.on_update(lambda _: update_cell_area_info())  # Update cell area when resolution changes
     wall_view_size.on_update(lambda _: update_cell_area_info())  # Update cell area when wall size changes
     
     # Room mode callback - draw/clear room walls when toggled
     def on_room_mode_toggle(_):
-        nonlocal wall_handle
+        nonlocal wall_handle, intensity_handles
         if room_mode_enable.value:
             # Hide main wall and show room walls
             try:
                 wall_handle.remove()
             except (KeyError, AttributeError):
                 pass
+            for handle in intensity_handles:
+                try:
+                    handle.remove()
+                except KeyError:
+                    pass
+            intensity_handles = []
+            _mode_toggle_syncing[0] = True
+            try:
+                show_intensity_map.value = False
+            finally:
+                _mode_toggle_syncing[0] = False
+            legend_html.content = (
+                "<div style='font-family: sans-serif;'>"
+                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                "<div style='color:#888;font-size:12px;'>Room Mode is active. Enable 'Show Room Intensity' and click 'Update Room Intensity'.</div>"
+                "</div>"
+            )
             draw_room_walls()
         else:
             # Clear room intensity handles
@@ -11852,6 +12056,12 @@ def main():
                 except KeyError:
                     pass
             room_wall_handles.clear()
+            _mode_toggle_syncing[0] = True
+            try:
+                show_room_intensity.value = False
+            finally:
+                _mode_toggle_syncing[0] = False
+            _last_room_cache['grids'] = None
             # Restore main wall
             wall_dist = wall_dist_slider.value
             wall_size_m = wall_view_size.value / 100.0
@@ -11861,10 +12071,24 @@ def main():
                 color=(0.5, 0.5, 0.5),
                 position=(wall_dist / 100.0, 0.0, 0.0),
             )
+            if _last_intensity_cache['grid'] is not None:
+                _refresh_uniformity()
+            else:
+                legend_html.content = (
+                    "<div style='font-family: sans-serif;'>"
+                    "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                    "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click 'Update Intensity Map' to see the legend</div>"
+                    "</div>"
+                )
     
     room_mode_enable.on_update(on_room_mode_toggle)
     show_room_walls.on_update(lambda _: draw_room_walls())
-    show_room_intensity.on_update(lambda _: (update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else draw_room_walls()) if room_mode_enable.value else None)
+    show_room_intensity.on_update(
+        lambda _: None if _mode_toggle_syncing[0] else (
+            (update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else draw_room_walls())
+            if room_mode_enable.value else None
+        )
+    )
     room_front_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     room_side_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     room_top_bottom_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
