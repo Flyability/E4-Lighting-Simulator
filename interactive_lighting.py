@@ -2207,8 +2207,8 @@ def main():
     
     print(f"\n  🖥️  Local:   http://localhost:8080")
     print(f"  🌐  Network: http://{_local_ip}:8080")
-    print(f"\n  ⚠️  Se la connessione da rete non funziona, eseguire come Amministratore")
-    print(f"      oppure aprire manualmente porta 8080 nel Windows Firewall.")
+    print(f"\n  ⚠️  If network access does not work, run as Administrator")
+    print(f"      or manually open port 8080 in Windows Firewall.")
     print("\n" + "="*60)
     print("  LED Lighting Simulation - Interactive Tool")
     print("="*60)
@@ -2229,7 +2229,7 @@ def main():
     # Save the Elios 3 configuration if it doesn't exist
     elios3_config = {
         "name": "Elios 3",
-        "description": "Configurazione standard: front +/-, side +/-",
+        "description": "Standard configuration: front +/-, side +/-",
         "viewing_angle": 120,
         "radius": 35,
         "circle_center_x": -35,
@@ -2975,8 +2975,8 @@ def main():
                         
                         # Per-group rotation sliders
                         server.gui.add_html("<b>Rotation:</b>")
-                        grp_rot_lr = server.gui.add_slider("Sinistra/Destra (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0)
-                        grp_rot_ud = server.gui.add_slider("Alto/Basso (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0)
+                        grp_rot_lr = server.gui.add_slider("Left/Right (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0)
+                        grp_rot_ud = server.gui.add_slider("Up/Down (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0)
                         grp_rot_roll = server.gui.add_slider("Roll (\u00b0)", min=-180, max=180, step=1, initial_value=group['rot_roll'].value if 'rot_roll' in group else 0)
                         
                         per_group_pos_rot_controls.append({
@@ -3934,8 +3934,8 @@ def main():
                     
                     # Per-group rotation sliders
                     server.gui.add_html("<b>Rotation:</b>")
-                    grp_rot_lr = server.gui.add_slider("Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0)
-                    grp_rot_ud = server.gui.add_slider("Alto/Basso (°)", min=-180, max=180, step=1, initial_value=group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0)
+                    grp_rot_lr = server.gui.add_slider("Left/Right (°)", min=-180, max=180, step=1, initial_value=group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0)
+                    grp_rot_ud = server.gui.add_slider("Up/Down (°)", min=-180, max=180, step=1, initial_value=group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0)
                     grp_rot_roll = server.gui.add_slider("Roll (°)", min=-180, max=180, step=1, initial_value=group['rot_roll'].value if 'rot_roll' in group else 0)
                     
                     per_group_pos_rot_controls.append({
@@ -4482,7 +4482,7 @@ def main():
         )
         server.gui.add_html("<hr style='margin:8px 0;'><b>Global Rotation:</b>")
         global_rotation_z_slider = server.gui.add_slider(
-            "Ruota configurazione (°)", min=-180, max=180, step=1, initial_value=0
+            "Rotate configuration (°)", min=-180, max=180, step=1, initial_value=0
         )
         server.gui.add_html("<hr style='margin:8px 0;'><b>Global Position:</b>")
         global_pos_x_slider = server.gui.add_slider(
@@ -4546,8 +4546,8 @@ def main():
         server.gui.add_html("<hr style='margin:8px 0;'><b>Diffuser Lens:</b>")
         server.gui.add_html(
             "<div style='color:#888;font-size:11px;margin-bottom:4px;'>"
-            "Simula una lente diffusore davanti ai LED: allarga il fascio e lo rende più uniforme. "
-            "Trasmittanza tipica 85-95%.</div>"
+            "Simulates a diffuser lens in front of the LEDs: widens the beam and makes it more uniform. "
+            "Typical transmission 85-95%.</div>"
         )
         diffuser_enable_chk = server.gui.add_checkbox(
             "Enable diffuser lens", initial_value=False
@@ -5341,9 +5341,9 @@ def main():
             pos_x = server.gui.add_slider("Position X (cm)", min=-100, max=100, step=0.1, initial_value=0.0)
             pos_y = server.gui.add_slider("Position Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
             pos_z = server.gui.add_slider("Position Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-            rot_tilt_lr = server.gui.add_slider("Inclina Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=0)
-            rot_tilt_ud = server.gui.add_slider("Inclina Alto/Basso (°)", min=-180, max=180, step=1, initial_value=0)
-            rot_roll = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
+            rot_tilt_lr = server.gui.add_slider("Tilt Left/Right (°)", min=-180, max=180, step=1, initial_value=0)
+            rot_tilt_ud = server.gui.add_slider("Tilt Up/Down (°)", min=-180, max=180, step=1, initial_value=0)
+            rot_roll = server.gui.add_slider("Rotate on axis (°)", min=-180, max=180, step=1, initial_value=0)
             
             server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>")
             group_lumens_override_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
@@ -6043,13 +6043,13 @@ def main():
             slot_pos_x = server.gui.add_slider("Offset X (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
             slot_pos_y = server.gui.add_slider("Offset Y (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
             slot_pos_z = server.gui.add_slider("Offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-            slot_rot_x = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
-            slot_rot_y = server.gui.add_slider("Inclina Alto/Basso (°)", min=-180, max=180, step=1, initial_value=0)
-            slot_rot_z = server.gui.add_slider("Inclina Sinistra/Destra (°)", min=-180, max=180, step=1, initial_value=0)
+            slot_rot_x = server.gui.add_slider("Rotate on axis (°)", min=-180, max=180, step=1, initial_value=0)
+            slot_rot_y = server.gui.add_slider("Tilt Up/Down (°)", min=-180, max=180, step=1, initial_value=0)
+            slot_rot_z = server.gui.add_slider("Tilt Left/Right (°)", min=-180, max=180, step=1, initial_value=0)
             server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>")
             slot_lumens_chk = server.gui.add_checkbox("Enable custom lumens", initial_value=False)
             slot_lumens_slider = server.gui.add_slider("Lumens per LED (lm)", min=1, max=900000, step=1, initial_value=100)
-            slot_remove_btn = server.gui.add_button("Rimuovi Slot", color="red")
+            slot_remove_btn = server.gui.add_button("Remove Slot", color="red")
 
         created_groups = []
         created_individual_leds = []
@@ -6379,8 +6379,8 @@ def main():
 
             # -- Slot master callback (enable / offset / rotation) --
             # Uses the SAME rotation mechanism as standard Elios3 groups:
-            # slot_rot_x → rot_roll (Ruota su se stesso, around panel forward axis)
-            # slot_rot_y → rot_tilt_ud (Inclina Alto/Basso)
+            # slot_rot_x → rot_roll (Rotate on axis, around panel forward axis)
+            # slot_rot_y → rot_tilt_ud (Tilt Up/Down)
             # slot_rot_z → rot_tilt_lr = slot_angle + user_offset
             # R_total = Rz(slot_angle + user_z) @ Ry(user_y) @ Rx(user_roll)
             # Since Rx is applied FIRST to the +X-forward template, roll works
@@ -6557,8 +6557,8 @@ def main():
                     options=["Solid (Group)", "Individual LEDs"],
                     initial_value="Solid (Group)",
                 )
-                _load_btn = server.gui.add_button("✅ Carica Pannello", color="green")
-                _clear_btn = server.gui.add_button("🗑️ Rimuovi Pannello", color="red")
+                _load_btn = server.gui.add_button("✅ Load Panel", color="green")
+                _clear_btn = server.gui.add_button("🗑️ Remove Panel", color="red")
 
                 _panel_dropdowns.append(_tpl_dd)
                 _panel_mode_dropdowns.append(_mode_dd)
@@ -6826,7 +6826,7 @@ def main():
             viewing_angle_slider = server.gui.add_slider("Viewing angle (°)", min=10, max=130, step=5, initial_value=120)
             
             server.gui.add_html("<b>Rotazione quadrato:</b>")
-            square_roll_slider = server.gui.add_slider("Ruota su se stesso (°)", min=-180, max=180, step=1, initial_value=0)
+            square_roll_slider = server.gui.add_slider("Rotate on axis (°)", min=-180, max=180, step=1, initial_value=0)
             
             server.gui.add_html("<b>Beam Tilt:</b>")
             beam_tilt_slider = server.gui.add_slider("Tilt beam sopra/sotto (°)", min=-180, max=180, step=1, initial_value=0)
@@ -7333,13 +7333,13 @@ def main():
         
         server.gui.add_html("<hr style='margin:8px 0;'>")
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export Cover Panel (STEP)</div>")
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Superfici planari editabili in SolidWorks (selezionabili come piano, estrudibili). Una faccia per LED.</div>")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Editable planar surfaces in SolidWorks (selectable as a plane, extrudable). One face per LED.</div>")
         
         export_stl_btn = server.gui.add_button("📦 Export Panel STEP", color="#FF9800")
         
         server.gui.add_html("<hr style='margin:8px 0;'>")
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export CNC Cutting (DXF)</div>")
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>File DXF 2D per taglio CNC del pannello custom. Apribile in AutoCAD, LibreCAD, ecc.</div>")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>2D DXF file for CNC cutting of the custom panel. Can be opened in AutoCAD, LibreCAD, etc.</div>")
         
         export_cnc_btn = server.gui.add_button("🔩 Export CNC DXF", color="#2196F3")
         
@@ -10518,11 +10518,11 @@ def main():
                         _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
                         _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
                         if group.get('rot_tilt_lr') is not None:
-                            _mirror_slider("Inclina Sinistra/Destra (°)", group['rot_tilt_lr'], -180, 180, 1)
+                            _mirror_slider("Tilt Left/Right (°)", group['rot_tilt_lr'], -180, 180, 1)
                         if group.get('rot_tilt_ud') is not None:
-                            _mirror_slider("Inclina Alto/Basso (°)", group['rot_tilt_ud'], -180, 180, 1)
+                            _mirror_slider("Tilt Up/Down (°)", group['rot_tilt_ud'], -180, 180, 1)
                         if group.get('rot_roll') is not None:
-                            _mirror_slider("Ruota su se stesso (°)", group['rot_roll'], -180, 180, 1)
+                            _mirror_slider("Rotate on axis (°)", group['rot_roll'], -180, 180, 1)
                         if group.get('lumens_override') is not None:
                             _mirror_checkbox("Enable custom lumens", group['lumens_override'])
                             _mirror_slider("Lumens per LED (lm)", group['lumens_value'], 1, 900000, 1)
@@ -10541,9 +10541,9 @@ def main():
                     _mirror_slider("Offset X (cm)", ctrl['pos_x'], -50, 50, 0.1)
                     _mirror_slider("Offset Y (cm)", ctrl['pos_y'], -50, 50, 0.1)
                     _mirror_slider("Offset Z (cm)", ctrl['pos_z'], -50, 50, 0.1)
-                    _mirror_slider("Ruota su se stesso (°)", ctrl['rot_x'], -180, 180, 1)
-                    _mirror_slider("Inclina Alto/Basso (°)", ctrl['rot_y'], -180, 180, 1)
-                    _mirror_slider("Inclina Sinistra/Destra (°)", ctrl['rot_z'], -180, 180, 1)
+                    _mirror_slider("Rotate on axis (°)", ctrl['rot_x'], -180, 180, 1)
+                    _mirror_slider("Tilt Up/Down (°)", ctrl['rot_y'], -180, 180, 1)
+                    _mirror_slider("Tilt Left/Right (°)", ctrl['rot_z'], -180, 180, 1)
                     _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
                     _mirror_checkbox("Enable custom lumens", ctrl['lumens_chk'])
                     _mirror_slider("Lumens per LED (lm)", ctrl['lumens_slider'], 1, 900000, 1)
@@ -10557,7 +10557,7 @@ def main():
                             f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
                         ))
                         _inspector_led_matrix(group)
-                remove_btn = _inspector_add(server.gui.add_button("Rimuovi Slot", color="red"))
+                remove_btn = _inspector_add(server.gui.add_button("Remove Slot", color="red"))
 
                 @remove_btn.on_click
                 def _(_):
@@ -10578,9 +10578,9 @@ def main():
                 _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
                 _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
                 _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
-                _mirror_slider("Inclina Sinistra/Destra (°)", group['rot_tilt_lr'], -180, 180, 1)
-                _mirror_slider("Inclina Alto/Basso (°)", group['rot_tilt_ud'], -180, 180, 1)
-                _mirror_slider("Ruota su se stesso (°)", group['rot_roll'], -180, 180, 1)
+                _mirror_slider("Tilt Left/Right (°)", group['rot_tilt_lr'], -180, 180, 1)
+                _mirror_slider("Tilt Up/Down (°)", group['rot_tilt_ud'], -180, 180, 1)
+                _mirror_slider("Rotate on axis (°)", group['rot_roll'], -180, 180, 1)
                 if group.get('lumens_override') is not None:
                     _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
                     _mirror_checkbox("Enable custom lumens", group['lumens_override'])
@@ -11499,7 +11499,7 @@ def main():
                 "/camera/fov_border",
                 points=np.array(corners),
                 colors=(0.0, 1.0, 0.0),  # Green
-                line_width=6.0,  # Linee più spesse
+                line_width=6.0,  # Thicker lines
             )
             camera_fov_handles.append(handle)
 

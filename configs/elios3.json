@@ -1,6 +1,6 @@
 {
     "name": "Elios 3",
-    "description": "Configurazione standard: front +/-, side +/-",
+    "description": "Standard configuration: front +/-, side +/-",
     "viewing_angle": 120,
     "radius": 35,
     "circle_center_x": -35,
