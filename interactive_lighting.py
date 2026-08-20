@@ -221,64 +221,75 @@ def _vio_cam_rotations(pitch_deg, yaw_deg):
     return r, r.T
 
 
-def wall_yz_in_fisheye_fov(cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, wall_dist, y, z):
-    """Boolean mask: wall points (wall_dist, y, z) inside the equidistant FOV."""
+def points_in_fisheye_fov(cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, points):
+    """Boolean mask: world points (..., 3) inside the equidistant-fisheye FOV."""
     cam_pos = np.asarray(cam_pos, dtype=float)
-    y = np.asarray(y, dtype=float)
-    z = np.asarray(z, dtype=float)
-    dx = float(wall_dist) - cam_pos[0]
-    if dx <= 1e-8:
-        return np.zeros(np.broadcast(y, z).shape, dtype=bool)
-
-    dy = y - cam_pos[1]
-    dz = z - cam_pos[2]
-    dir_w = np.stack([np.broadcast_to(dx, dy.shape), dy, dz], axis=-1)
+    pts = np.asarray(points, dtype=float)
+    dir_w = pts.reshape(-1, 3) - cam_pos[None, :]
     norms = np.linalg.norm(dir_w, axis=-1, keepdims=True)
     dir_w = dir_w / np.maximum(norms, 1e-12)
 
     _, r_inv = _vio_cam_rotations(pitch_deg, yaw_deg)
-    dir_cam = dir_w.reshape(-1, 3) @ r_inv.T
-    cx = dir_cam[:, 0].reshape(dy.shape)
-    cy_c = dir_cam[:, 1].reshape(dy.shape)
-    cz_c = dir_cam[:, 2].reshape(dy.shape)
+    dir_cam = dir_w @ r_inv.T
+    cx = dir_cam[:, 0]
+    cy_c = dir_cam[:, 1]
+    cz_c = dir_cam[:, 2]
 
     f, half_u, half_v, r_circle = _vio_fisheye_intrinsics(hfov_deg, vfov_deg)
-    in_front = cx > 1e-8
     rho = np.hypot(cy_c, cz_c)
-    theta = np.arctan2(rho, np.maximum(cx, 1e-12))
+    # arctan2 handles theta up to 180 deg, so walls beside/behind the optical
+    # axis are still tested correctly (r_px <= r_circle caps at the FOV edge).
+    theta = np.arctan2(rho, cx)
     r_px = f * theta
     inv_rho = 1.0 / np.maximum(rho, 1e-12)
     u = np.where(rho < 1e-12, 0.0, r_px * (-cy_c) * inv_rho)
     v = np.where(rho < 1e-12, 0.0, r_px * cz_c * inv_rho)
-    return (
-        in_front
-        & (np.abs(u) <= half_u + 1e-6)
+    mask = (
+        (np.abs(u) <= half_u + 1e-6)
         & (np.abs(v) <= half_v + 1e-6)
         & (r_px <= r_circle + 1e-6)
     )
+    return mask.reshape(pts.shape[:-1])
 
 
-def rasterize_fisheye_fov_on_wall(
+# For an axis-aligned plane with fixed world axis a, the patch spans the two
+# remaining axes (u, v) in ascending axis order.
+_PLANE_UV_AXES = {0: (1, 2), 1: (0, 2), 2: (0, 1)}
+
+
+def rasterize_fisheye_fov_on_plane(
     cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg,
-    wall_dist, wall_half_y, wall_half_z, n_grid=100,
+    axis, plane_coord, u_min, u_max, v_min, v_max, n_grid=100,
 ):
-    """Cell-centered occupancy of the FOV on the wall. Returns (mask, ys, zs)."""
+    """Cell-centered FOV occupancy on an axis-aligned plane patch (cm units).
+
+    axis: fixed world axis (0=x, 1=y, 2=z); plane_coord is its value in cm.
+    Returns (mask, us, vs) with cell-center coordinates along the two free axes.
+    """
     n_grid = int(n_grid)
-    ys = np.linspace(-wall_half_y, wall_half_y, n_grid, endpoint=False) + wall_half_y / n_grid
-    zs = np.linspace(-wall_half_z, wall_half_z, n_grid, endpoint=False) + wall_half_z / n_grid
-    yy, zz = np.meshgrid(ys, zs, indexing="ij")
-    mask = wall_yz_in_fisheye_fov(
-        cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, wall_dist, yy, zz
-    )
-    return mask, ys, zs
+    us = np.linspace(u_min, u_max, n_grid, endpoint=False) + (u_max - u_min) / (2 * n_grid)
+    vs = np.linspace(v_min, v_max, n_grid, endpoint=False) + (v_max - v_min) / (2 * n_grid)
+    uu, vv = np.meshgrid(us, vs, indexing="ij")
+    u_axis, v_axis = _PLANE_UV_AXES[axis]
+    pts = np.empty(uu.shape + (3,), dtype=float)
+    pts[..., axis] = float(plane_coord)
+    pts[..., u_axis] = uu
+    pts[..., v_axis] = vv
+    mask = points_in_fisheye_fov(cam_pos, pitch_deg, yaw_deg, hfov_deg, vfov_deg, pts)
+    return mask, us, vs
 
 
-def fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m):
-    """Build wall-plane quads (meters) and silhouette segments from a Y×Z occupancy mask."""
-    n_y, n_z = mask.shape
-    dy = (ys[1] - ys[0]) if n_y > 1 else 0.0
-    dz = (zs[1] - zs[0]) if n_z > 1 else 0.0
-    hy_m, hz_m = dy / 200.0, dz / 200.0
+def fov_plane_mask_to_quads_and_contour(mask, us, vs, axis, plane_m):
+    """Build plane quads (meters) and silhouette segments from a U×V occupancy mask.
+
+    axis is the fixed world axis (0=x, 1=y, 2=z); plane_m its coordinate in
+    meters (already offset off the wall to avoid z-fighting).
+    """
+    n_u, n_v = mask.shape
+    du = (us[1] - us[0]) if n_u > 1 else 0.0
+    dv = (vs[1] - vs[0]) if n_v > 1 else 0.0
+    hu_m, hv_m = du / 200.0, dv / 200.0
+    u_axis, v_axis = _PLANE_UV_AXES[axis]
 
     ii, jj = np.nonzero(mask)
     if ii.size == 0:
@@ -287,19 +298,19 @@ def fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m):
         empty_s = np.zeros((0, 2, 3), np.float32)
         return empty_v, empty_f, empty_s
 
-    y0 = ys[ii] / 100.0
-    z0 = zs[jj] / 100.0
+    u0 = us[ii] / 100.0
+    v0 = vs[jj] / 100.0
     n = ii.size
     verts = np.empty((n * 4, 3), dtype=np.float32)
-    verts[:, 0] = wall_x_m
-    verts[0::4, 1] = y0 - hy_m
-    verts[0::4, 2] = z0 - hz_m
-    verts[1::4, 1] = y0 + hy_m
-    verts[1::4, 2] = z0 - hz_m
-    verts[2::4, 1] = y0 + hy_m
-    verts[2::4, 2] = z0 + hz_m
-    verts[3::4, 1] = y0 - hy_m
-    verts[3::4, 2] = z0 + hz_m
+    verts[:, axis] = plane_m
+    verts[0::4, u_axis] = u0 - hu_m
+    verts[0::4, v_axis] = v0 - hv_m
+    verts[1::4, u_axis] = u0 + hu_m
+    verts[1::4, v_axis] = v0 - hv_m
+    verts[2::4, u_axis] = u0 + hu_m
+    verts[2::4, v_axis] = v0 + hv_m
+    verts[3::4, u_axis] = u0 - hu_m
+    verts[3::4, v_axis] = v0 + hv_m
     faces = np.empty((n * 2, 3), dtype=np.uint32)
     base = (np.arange(n, dtype=np.uint32) * 4)
     faces[0::2, 0] = base
@@ -310,19 +321,28 @@ def fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m):
     faces[1::2, 2] = base + 3
 
     padded = np.pad(mask, 1, mode="constant", constant_values=False)
+
+    def _seg(ua, va, ub, vb):
+        pa = [0.0, 0.0, 0.0]
+        pb = [0.0, 0.0, 0.0]
+        pa[axis] = pb[axis] = plane_m
+        pa[u_axis], pa[v_axis] = ua, va
+        pb[u_axis], pb[v_axis] = ub, vb
+        return [pa, pb]
+
     segs = []
     for k in range(n):
         i, j = int(ii[k]), int(jj[k])
-        yi, zi = y0[k], z0[k]
+        ui, vi = u0[k], v0[k]
         pi, pj = i + 1, j + 1
         if not padded[pi - 1, pj]:
-            segs.append([[wall_x_m, yi - hy_m, zi - hz_m], [wall_x_m, yi - hy_m, zi + hz_m]])
+            segs.append(_seg(ui - hu_m, vi - hv_m, ui - hu_m, vi + hv_m))
         if not padded[pi + 1, pj]:
-            segs.append([[wall_x_m, yi + hy_m, zi - hz_m], [wall_x_m, yi + hy_m, zi + hz_m]])
+            segs.append(_seg(ui + hu_m, vi - hv_m, ui + hu_m, vi + hv_m))
         if not padded[pi, pj - 1]:
-            segs.append([[wall_x_m, yi - hy_m, zi - hz_m], [wall_x_m, yi + hy_m, zi - hz_m]])
+            segs.append(_seg(ui - hu_m, vi - hv_m, ui + hu_m, vi - hv_m))
         if not padded[pi, pj + 1]:
-            segs.append([[wall_x_m, yi - hy_m, zi + hz_m], [wall_x_m, yi + hy_m, zi + hz_m]])
+            segs.append(_seg(ui - hu_m, vi + hv_m, ui + hu_m, vi + hv_m))
     segs_np = np.asarray(segs, dtype=np.float32) if segs else np.zeros((0, 2, 3), np.float32)
     return verts, faces, segs_np
 
@@ -5017,13 +5037,13 @@ def main():
         show_room_walls = server.gui.add_checkbox("Show Room Walls", initial_value=True)
         show_room_intensity = server.gui.add_checkbox("Show Room Intensity", initial_value=False)
         room_front_dist = server.gui.add_slider(
-            "Front wall distance (cm)", min=20, max=200, step=10, initial_value=50
+            "Front wall distance (cm)", min=20, max=200, step=10, initial_value=200
         )
         room_side_dist = server.gui.add_slider(
-            "Side walls distance (cm)", min=20, max=300, step=10, initial_value=50
+            "Side walls distance (cm)", min=20, max=300, step=10, initial_value=200
         )
         room_top_bottom_dist = server.gui.add_slider(
-            "Top/Bottom walls distance (cm)", min=20, max=300, step=10, initial_value=50
+            "Top/Bottom walls distance (cm)", min=20, max=300, step=10, initial_value=200
         )
         show_back_wall = server.gui.add_checkbox("Show Back Wall", initial_value=False)
         room_back_dist = server.gui.add_slider(
@@ -11523,46 +11543,77 @@ def main():
             )
             camera_fov_handles.append(cam_axis_h)
 
-        # Draw VIO fisheye FOV footprints on the front wall
+        # Draw VIO fisheye FOV footprints on the wall(s).
+        # In room mode the footprint is projected on ALL room walls (front,
+        # left, right, top, bottom, and back if shown), not just the front one.
         if show_vio_fov.value:
+            # Wall patches: (axis, plane_coord_cm, u_min, u_max, v_min, v_max, inward_sign)
+            # axis 0=x, 1=y, 2=z; (u, v) are the two remaining axes in
+            # ascending order; inward_sign offsets the overlay into the room.
             if room_mode_enable.value:
-                vio_wall_dist = room_front_dist.value
-                vio_half_y = room_side_dist.value
-                vio_half_z = room_top_bottom_dist.value
+                _fd = room_front_dist.value
+                _sd = room_side_dist.value
+                _td = room_top_bottom_dist.value
+                # Same extent as draw_room_walls: 2.5x depth behind the front wall
+                _x_back_edge = _fd - (_fd - circle_center_slider.value) * 2.5
+                if show_back_wall.value:
+                    _x_back_edge = max(_x_back_edge, -room_back_dist.value)
+                vio_walls = [
+                    (0, _fd, -_sd, _sd, -_td, _td, -1.0),   # front
+                    (1, -_sd, _x_back_edge, _fd, -_td, _td, +1.0),  # left
+                    (1, _sd, _x_back_edge, _fd, -_td, _td, -1.0),   # right
+                    (2, _td, _x_back_edge, _fd, -_sd, _sd, -1.0),   # top
+                    (2, -_td, _x_back_edge, _fd, -_sd, _sd, +1.0),  # bottom
+                ]
+                if show_back_wall.value:
+                    vio_walls.append((0, -room_back_dist.value, -_sd, _sd, -_td, _td, +1.0))
             else:
-                vio_wall_dist = wall_dist_slider.value
-                vio_half_y = wall_view_size.value / 2.0
-                vio_half_z = wall_view_size.value / 2.0
+                _half = wall_view_size.value / 2.0
+                vio_walls = [(0, wall_dist_slider.value, -_half, _half, -_half, _half, -1.0)]
 
             vio_hfov, vio_vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
             cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
             axis_len_cm = 8.0
             marker_specs = [
-                (1, vio_cam1_pitch.value, vio_cam1_yaw.value, (1.0, 0.0, 1.0), -0.008),  # magenta
-                (2, vio_cam2_pitch.value, vio_cam2_yaw.value, (0.0, 1.0, 1.0), -0.012),  # cyan
+                (1, vio_cam1_pitch.value, vio_cam1_yaw.value, (1.0, 0.0, 1.0), 0.008),  # magenta
+                (2, vio_cam2_pitch.value, vio_cam2_yaw.value, (0.0, 1.0, 1.0), 0.012),  # cyan
             ]
-            for cam_id, pitch, yaw, color, x_off in marker_specs:
-                wall_x_m = vio_wall_dist / 100.0 + x_off
-                mask, ys, zs = rasterize_fisheye_fov_on_wall(
-                    cam_pos, pitch, yaw, vio_hfov, vio_vfov,
-                    vio_wall_dist, vio_half_y, vio_half_z, n_grid=90,
-                )
-                verts, faces, segs_m = fov_mask_to_quads_and_contour(mask, ys, zs, wall_x_m)
-                if vio_fill_fov.value and len(faces) > 0:
+            for cam_id, pitch, yaw, color, inset_m in marker_specs:
+                all_verts, all_faces, all_segs = [], [], []
+                n_verts = 0
+                for w_axis, plane_cm, u_min, u_max, v_min, v_max, inward in vio_walls:
+                    # Skip walls the camera is not on the interior side of
+                    if (cam_pos[w_axis] - plane_cm) * inward <= 1e-6:
+                        continue
+                    mask, us, vs = rasterize_fisheye_fov_on_plane(
+                        cam_pos, pitch, yaw, vio_hfov, vio_vfov,
+                        w_axis, plane_cm, u_min, u_max, v_min, v_max, n_grid=90,
+                    )
+                    plane_m = plane_cm / 100.0 + inward * inset_m
+                    verts, faces, segs = fov_plane_mask_to_quads_and_contour(
+                        mask, us, vs, w_axis, plane_m
+                    )
+                    if len(faces) > 0:
+                        all_verts.append(verts)
+                        all_faces.append(faces + np.uint32(n_verts))
+                        n_verts += len(verts)
+                    if len(segs) > 0:
+                        all_segs.append(segs)
+                if vio_fill_fov.value and all_faces:
                     fill = server.scene.add_mesh_simple(
                         name=f"/vio_cam{cam_id}/fov_fill",
-                        vertices=verts,
-                        faces=faces,
+                        vertices=np.concatenate(all_verts, axis=0),
+                        faces=np.concatenate(all_faces, axis=0),
                         color=tuple(int(c * 255) for c in color),
                         opacity=0.28,
                         flat_shading=True,
                         side="double",
                     )
                     vio_fov_handles.append(fill)
-                if len(segs_m) > 0:
+                if all_segs:
                     handle = server.scene.add_line_segments(
                         f"/vio_cam{cam_id}/fov_border",
-                        points=segs_m,
+                        points=np.concatenate(all_segs, axis=0),
                         colors=color,
                         line_width=4.0,
                     )
@@ -11809,8 +11860,8 @@ def main():
     room_front_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     room_side_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     room_top_bottom_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
-    show_back_wall.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
-    room_back_dist.on_update(lambda _: draw_room_walls() if room_mode_enable.value else None)
+    show_back_wall.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
+    room_back_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
     wall_view_size.on_update(lambda _: (update_wall(), update_cell_area_info(), update_scene()))  # Update wall size, cell area, VIO FOV clip
 
     def on_wall_dist_change(_):
