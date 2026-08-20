@@ -1295,6 +1295,65 @@ def _camera_fov_wall_trapezoid(dist_cm, pitch_deg, fov_h_deg, fov_v_deg):
     return float(z_bot), float(z_top), float(half_w_bot), float(half_w_top)
 
 
+# Reflection across the XZ plane (Y → −Y). Used to derive a mirrored panel
+# from a main panel: M R M = Rz(−yaw) Ry(pitch) Rx(−roll) for extrinsic X-Y-Z.
+_XZ_MIRROR = np.diag([1.0, -1.0, 1.0])
+
+
+def _mirror_xz_vec(v):
+    """Return (x, −y, z) as a tuple of floats."""
+    arr = _XZ_MIRROR @ np.asarray(v, dtype=float).reshape(3)
+    return (float(arr[0]), float(arr[1]), float(arr[2]))
+
+
+def _mirror_xz_vecs(vecs):
+    return [_mirror_xz_vec(v) for v in vecs]
+
+
+def _mirror_group_config_xz(cfg):
+    """Return an XZ-mirrored copy of a custom-group LED config dict.
+
+    Dynamic configs carry absolute world-space led_positions/directions, so
+    reflecting them is a pure data transform. For standard (non-dynamic)
+    groups the extrinsic R = Rz@Ry@Rx convention gives M R M =
+    Rz(-yaw) Ry(pitch) Rx(-roll), hence the negated X/Z angles.
+    """
+    m = dict(cfg)
+    m['owner'] = None  # derived copy: not clickable/selectable
+    pos = cfg.get('position')
+    if pos is not None:
+        m['position'] = (pos[0], -pos[1], pos[2])
+    m['rotation_x'] = -cfg.get('rotation_x', 0.0)
+    m['rotation_z'] = -cfg.get('rotation_z', 0.0)
+    if cfg.get('led_positions'):
+        m['led_positions'] = _mirror_xz_vecs(cfg['led_positions'])
+    if cfg.get('led_rotations'):
+        m['led_rotations'] = _mirror_xz_vecs(cfg['led_rotations'])
+    if cfg.get('led_row_directions'):
+        m['led_row_directions'] = _mirror_xz_vecs(cfg['led_row_directions'])
+    if cfg.get('led_beam_tilts'):
+        m['led_beam_tilts'] = [-float(t) for t in cfg['led_beam_tilts']]
+    if cfg.get('led_states') is not None:
+        m['led_states'] = list(cfg['led_states'])
+    return m
+
+
+def _mirror_led_config_xz(cfg):
+    """Return an XZ-mirrored copy of an individual-LED config dict.
+
+    Direction convention d = Rx(rx)@Ry(ry)@Rz(rz)@[1,0,0]: reflecting across
+    XZ negates rx and rz (keeps ry), and flips roll/beam-tilt handedness.
+    """
+    m = dict(cfg)
+    m['owner'] = None
+    m['pos_y'] = -cfg.get('pos_y', 0.0)
+    m['rot_x'] = -cfg.get('rot_x', 0.0)
+    m['rot_z'] = -cfg.get('rot_z', 0.0)
+    m['square_roll'] = -cfg.get('square_roll', 0.0)
+    m['beam_tilt'] = -cfg.get('beam_tilt', 0.0)
+    return m
+
+
 def _compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None,
                              fov_trapezoid=None):
     """Compute illuminotechnical uniformity metrics from a 2D lux grid.
@@ -2214,6 +2273,13 @@ def main():
     # Panel Configurator state (populated later when UI is created)
     _panel_slot_data = [None, None, None, None]
     _panel_dropdowns = []
+    _panel_mode_dropdowns = []
+
+    # Live panel mirroring: the selected "primary" panel is reflected across
+    # the XZ plane at scene-build time; its counterpart panel is disabled.
+    _mirror_primary = [None]           # owner tuple ('slot', idx) / ('custom_group', id)
+    _mirror_disabled_handles = []      # enable checkboxes we turned off (to restore)
+    _mirror_counterpart_name = [None]  # display name of the disabled panel
     
     # Store button handles for LED control
     led_buttons = {}
@@ -2549,7 +2615,21 @@ def main():
                 "long_fov": vio_long_fov.value,
                 "landscape": vio_landscape.value,
             },
+            "mirror_primary": _encode_mirror_primary(),
         }
+
+    def _encode_mirror_primary():
+        owner = _mirror_primary[0]
+        if owner is None:
+            return None
+        kind, key = owner
+        if kind == 'slot':
+            return {"kind": "slot", "key": int(key)}
+        if kind == 'custom_group':
+            for idx, g in enumerate(custom_groups):
+                if g.get('id') == key:
+                    return {"kind": "custom_group", "key": idx}
+        return None
 
     def clear_all_custom_groups():
         """Remove all custom groups."""
@@ -2605,6 +2685,7 @@ def main():
                 dd.value = "-- Nessuno --"
             except Exception:
                 pass
+        _clear_mirror_state()
     
     def apply_config(cfg):
         """Update GUI elements with values from config."""
@@ -3343,6 +3424,28 @@ def main():
             vio_landscape.value = vio_cfg.get("landscape", True)
             _refresh_vio_fov_label()
         
+        # Restore mirror-primary panel (old configs omit this key → no-op)
+        _clear_mirror_state()
+        mp = cfg.get("mirror_primary")
+        if isinstance(mp, dict):
+            owner = None
+            if mp.get("kind") == "slot":
+                try:
+                    si = int(mp.get("key"))
+                    if 0 <= si < len(_ELIOS3_SLOTS):
+                        owner = ('slot', si)
+                except (TypeError, ValueError):
+                    pass
+            elif mp.get("kind") == "custom_group":
+                try:
+                    gi = int(mp.get("key"))
+                    if 0 <= gi < len(custom_groups):
+                        owner = ('custom_group', custom_groups[gi]['id'])
+                except (TypeError, ValueError):
+                    pass
+            if owner is not None:
+                _enable_mirror_for(owner)
+
         # Re-enable callbacks and do final scene update
         loading_in_progress[0] = False
         
@@ -5553,6 +5656,148 @@ def main():
         c, s = np.cos(r), np.sin(r)
         return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
+    # ── Panel mirroring (XZ plane) ──────────────────────────────────────
+    # The selected "primary" panel gets a live mirrored shadow generated at
+    # scene-build time (_expand_mirror_configs); the panel that used to sit
+    # on the opposite side is simply disabled.
+
+    def _owner_groups(owner):
+        """Custom-group dicts belonging to a panel owner tuple."""
+        if owner is None:
+            return []
+        kind, key = owner
+        if kind == 'slot':
+            return [g for g in custom_groups if g.get('panel_slot') == key]
+        if kind == 'custom_group':
+            return [g for g in custom_groups
+                    if g.get('id') == key and g.get('panel_slot') is None]
+        return []
+
+    def _owner_individual_leds(owner):
+        """Individual-LED dicts belonging to a slot owner (individual mode)."""
+        if owner is None or owner[0] != 'slot':
+            return []
+        key = owner[1]
+        data = _panel_slot_data[key] if 0 <= key < len(_panel_slot_data) else None
+        if data and data.get('individual_leds'):
+            return list(data['individual_leds'])
+        return [led for led in individual_leds if led.get('panel_slot') == key]
+
+    def _owner_display_name(owner):
+        kind, key = owner
+        if kind == 'slot':
+            if 0 <= key < len(_ELIOS3_SLOTS):
+                return _ELIOS3_SLOTS[key]['name']
+            return f"Slot {key + 1}"
+        for g in custom_groups:
+            if g.get('id') == key:
+                return g.get('name') or f"Group {key}"
+        return f"Group {key}"
+
+    def _owner_mean_y(owner):
+        ys = []
+        for g in _owner_groups(owner):
+            try:
+                ys.append(float(g['pos_y'].value))
+            except Exception:
+                pass
+        for led in _owner_individual_leds(owner):
+            try:
+                ys.append(float(led['pos_y'].value))
+            except Exception:
+                pass
+        return float(np.mean(ys)) if ys else None
+
+    def _mirror_candidate_owners():
+        owners = []
+        for si in range(len(_ELIOS3_SLOTS)):
+            o = ('slot', si)
+            if _owner_groups(o) or _owner_individual_leds(o):
+                owners.append(o)
+        for g in custom_groups:
+            if g.get('panel_slot') is None:
+                owners.append(('custom_group', g.get('id')))
+        return owners
+
+    def _find_mirror_counterpart(owner):
+        """Panel on the opposite side of the XZ plane (closest Y match)."""
+        yp = _owner_mean_y(owner)
+        if yp is None or abs(yp) < 0.1:
+            return None
+        best, best_err = None, None
+        for cand in _mirror_candidate_owners():
+            if cand == owner:
+                continue
+            yc = _owner_mean_y(cand)
+            if yc is None or yc * yp >= 0:
+                continue
+            err = abs(yc + yp)
+            if best_err is None or err < best_err:
+                best, best_err = cand, err
+        return best
+
+    def _clear_mirror_state():
+        """Turn mirroring off and re-enable whatever panel it had disabled."""
+        prev_loading = loading_in_progress[0]
+        loading_in_progress[0] = True
+        try:
+            for h in _mirror_disabled_handles:
+                try:
+                    h.value = True
+                except Exception:
+                    pass
+        finally:
+            loading_in_progress[0] = prev_loading
+        _mirror_disabled_handles.clear()
+        _mirror_primary[0] = None
+        _mirror_counterpart_name[0] = None
+
+    def _enable_mirror_for(owner):
+        """Make `owner` the mirror primary and disable its counterpart panel.
+
+        Returns the counterpart owner, or None if no opposite-side panel was
+        found (mirroring is still enabled in that case)."""
+        _clear_mirror_state()
+        counterpart = _find_mirror_counterpart(owner)
+        if counterpart is not None:
+            handles = [g.get('enable') for g in _owner_groups(counterpart)]
+            handles += [l.get('enable') for l in _owner_individual_leds(counterpart)]
+            if counterpart[0] == 'slot':
+                data = _panel_slot_data[counterpart[1]]
+                if data:
+                    ctl = (data.get('controls') or {}).get('enable')
+                    if ctl is not None:
+                        handles.append(ctl)
+            prev_loading = loading_in_progress[0]
+            loading_in_progress[0] = True
+            try:
+                for h in handles:
+                    if h is None:
+                        continue
+                    try:
+                        if h.value:
+                            h.value = False
+                            _mirror_disabled_handles.append(h)
+                    except Exception:
+                        pass
+            finally:
+                loading_in_progress[0] = prev_loading
+            _mirror_counterpart_name[0] = _owner_display_name(counterpart)
+        _mirror_primary[0] = owner
+        return counterpart
+
+    def _expand_mirror_configs(custom_groups_configs, individual_leds_configs):
+        """Append XZ-mirrored copies of the mirror-primary panel's configs."""
+        owner = _mirror_primary[0]
+        if owner is None:
+            return
+        for cfg in list(custom_groups_configs):
+            if cfg.get('owner') == owner:
+                custom_groups_configs.append(_mirror_group_config_xz(cfg))
+        for cfg in list(individual_leds_configs):
+            if cfg.get('owner') == owner:
+                individual_leds_configs.append(_mirror_led_config_xz(cfg))
+
     def _convert_individual_leds_to_dynamic_group(individual_leds_data):
         """Convert an individual_leds list into a single dynamic-format group config
         with positions made RELATIVE (centroid subtracted)."""
@@ -5867,6 +6112,7 @@ def main():
                     led_data['rot_z'].value = rot_angles[2]
                     led_data['size'].value = float(led_sizes_raw[led_idx]) if led_idx < len(led_sizes_raw) else 0.5
                     led_data['viewing_angle'].value = float(led_va_raw[led_idx]) if led_idx < len(led_va_raw) else 120
+                    led_data['panel_slot'] = slot_idx
 
                     if led_beam_tilts_raw and led_idx < len(led_beam_tilts_raw):
                         led_data['beam_tilt'].value = int(round(led_beam_tilts_raw[led_idx]))
@@ -6247,6 +6493,8 @@ def main():
 
     def _clear_panel_slot(slot_idx):
         """Remove all content from a panel slot."""
+        if _mirror_primary[0] == ('slot', slot_idx):
+            _clear_mirror_state()
         data = _panel_slot_data[slot_idx]
         if data is None:
             return
@@ -6293,7 +6541,8 @@ def main():
         server.gui.add_html(
             "<div style='color:#aaa;font-size:11px;margin-bottom:8px;'>"
             "Assign a template to each of the 4 Elios 3 panel positions.<br>"
-            "Positions and rotations are pre-set to match the drone geometry.</div>"
+            "Positions and rotations are pre-set to match the drone geometry.<br>"
+            "Tip: click a panel in 3D and use 'Mirror to other side' in the Selected tab.</div>"
         )
 
         for _si, _slot_info in enumerate(_ELIOS3_SLOTS):
@@ -8086,8 +8335,13 @@ def main():
                 if _pdata and led in _pdata.get('individual_leds', []):
                     config['owner'] = ('slot', _si)
                     break
+            if 'owner' not in config and led.get('panel_slot') is not None:
+                config['owner'] = ('slot', led['panel_slot'])
             individual_leds_configs.append(config)
         
+        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
+        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
+
         leds = create_leds(
             front_angle,
             side_angle,
@@ -8634,7 +8888,12 @@ def main():
                 if _pdata and led in _pdata.get('individual_leds', []):
                     config['owner'] = ('slot', _si)
                     break
+            if 'owner' not in config and led.get('panel_slot') is not None:
+                config['owner'] = ('slot', led['panel_slot'])
             individual_leds_configs.append(config)
+
+        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
+        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
 
         leds = create_leds(
             front_angle, side_angle, viewing_angle, radius, circle_center_x,
@@ -10190,6 +10449,36 @@ def main():
 
             led_btn.on_click(_make_led(led_idx))
 
+    def _inspector_mirror_checkbox(owner):
+        """Checkbox making `owner` the mirror primary (XZ reflection).
+
+        Enabling it disables the panel on the opposite side and renders a live
+        mirrored copy of this panel there instead."""
+        is_primary = _mirror_primary[0] == owner
+        chk = _inspector_add(server.gui.add_checkbox(
+            "Mirror to other side (XZ)", initial_value=is_primary
+        ))
+        if is_primary:
+            cp_name = _mirror_counterpart_name[0]
+            note = (
+                f"Mirroring active — **{cp_name}** is disabled."
+                if cp_name else
+                "Mirroring active — no opposite-side panel found to disable."
+            )
+            _inspector_add(server.gui.add_markdown(f"*{note}*"))
+
+        @chk.on_update
+        def _(_):
+            if loading_in_progress[0]:
+                return
+            if chk.value:
+                _enable_mirror_for(owner)
+            elif _mirror_primary[0] == owner:
+                _clear_mirror_state()
+            update_scene()
+            if selected_owner[0] == owner:
+                populate_inspector(owner)
+
     def populate_inspector(owner):
         """Rebuild the floating inspector for the given owner (or empty state)."""
         _clear_inspector()
@@ -10209,8 +10498,35 @@ def main():
 
             if kind == 'slot':
                 data = _panel_slot_data[key] if 0 <= key < len(_panel_slot_data) else None
-                if data is None:
+                slot_groups = [g for g in custom_groups if g.get('panel_slot') == key]
+                if data is None and not slot_groups:
                     _inspector_add(server.gui.add_markdown("This slot is empty."))
+                    return
+                if data is None:
+                    # Panel restored from a saved configuration (no slot UI):
+                    # expose its group controls directly so it stays editable.
+                    slot_name = _ELIOS3_SLOTS[key]['name']
+                    _inspector_add(server.gui.add_markdown(f"**Slot {slot_name}**"))
+                    _inspector_mirror_checkbox(owner)
+                    for g_idx, group in enumerate(slot_groups):
+                        if len(slot_groups) > 1:
+                            _inspector_add(server.gui.add_html(
+                                f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
+                            ))
+                        _mirror_checkbox("Enable", group['enable'])
+                        _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
+                        _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
+                        _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
+                        if group.get('rot_tilt_lr') is not None:
+                            _mirror_slider("Inclina Sinistra/Destra (°)", group['rot_tilt_lr'], -180, 180, 1)
+                        if group.get('rot_tilt_ud') is not None:
+                            _mirror_slider("Inclina Alto/Basso (°)", group['rot_tilt_ud'], -180, 180, 1)
+                        if group.get('rot_roll') is not None:
+                            _mirror_slider("Ruota su se stesso (°)", group['rot_roll'], -180, 180, 1)
+                        if group.get('lumens_override') is not None:
+                            _mirror_checkbox("Enable custom lumens", group['lumens_override'])
+                            _mirror_slider("Lumens per LED (lm)", group['lumens_value'], 1, 900000, 1)
+                        _inspector_led_matrix(group)
                     return
                 slot_name = data.get('slot_label', _ELIOS3_SLOTS[key]['name'])
                 tmpl = data.get('template_display', data.get('template_name', ''))
@@ -10218,6 +10534,7 @@ def main():
                     f"**Slot {slot_name}**  \n{tmpl}"
                     + ("  \n*Loaded as individual LEDs*" if data.get('as_individual') else "")
                 ))
+                _inspector_mirror_checkbox(owner)
                 ctrl = data.get('controls') or {}
                 if ctrl.get('enable') is not None:
                     _mirror_checkbox("Enable Slot", ctrl['enable'])
@@ -10256,6 +10573,7 @@ def main():
                     return
                 title = group.get('template_name') or f"Custom Group {key}"
                 _inspector_add(server.gui.add_markdown(f"**{title}**"))
+                _inspector_mirror_checkbox(owner)
                 _mirror_checkbox("Enable", group['enable'])
                 _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
                 _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
@@ -10587,8 +10905,13 @@ def main():
                 if _pdata and led in _pdata.get('individual_leds', []):
                     config['owner'] = ('slot', _si)
                     break
+            if 'owner' not in config and led.get('panel_slot') is not None:
+                config['owner'] = ('slot', led['panel_slot'])
             individual_leds_configs.append(config)
         
+        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
+        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
+
         leds = create_leds(
             front_angle,
             side_angle,
