@@ -649,6 +649,7 @@ def create_leds(
             led_viewing_angles = custom_group_config.get('led_viewing_angles', [])
             led_row_dirs = custom_group_config.get('led_row_directions', [])
             led_beam_tilts = custom_group_config.get('led_beam_tilts', [])
+            led_lumens = custom_group_config.get('led_lumens', [])
             num_leds = custom_group_config.get('num_leds', 0)
             
             custom_color = (1.0, 0.0, 1.0)  # Magenta for custom group
@@ -704,7 +705,12 @@ def create_leds(
                 led.square_normal = direction  # Store original direction for square mesh orientation
                 led.is_custom = True  # Mark as custom group LED
                 led.is_dynamic_group = True  # Mark as dynamic group LED
-                led.lumens = custom_group_config.get('lumens_override', None)  # Per-group lumens override
+                # A panel template may override power per LED.  Null entries
+                # intentionally fall back to the existing group-level override.
+                led.lumens = (
+                    led_lumens[i] if i < len(led_lumens) and led_lumens[i] is not None
+                    else custom_group_config.get('lumens_override', None)
+                )
                 led.owner = custom_group_config.get('owner')
                 leds.append(led)
                 led_index += 1
@@ -2459,6 +2465,7 @@ def main():
                 group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
                 group_cfg['led_euler_angles'] = group.get('led_euler_angles', [])
                 group_cfg['led_beam_tilts'] = group.get('led_beam_tilts', [])
+                group_cfg['led_lumens'] = group.get('led_lumens', [])
             # Save lumens override settings for custom group
             group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
             group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
@@ -2872,6 +2879,7 @@ def main():
                 group_data['led_beam_tilts'] = group_cfg.get('led_beam_tilts', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
                 group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
+                group_data['led_lumens'] = group_cfg.get('led_lumens', [])
                 # IMPORTANT: Positions in saved config are already RELATIVE
                 # They were saved with original_led_positions, use directly
                 group_data['original_led_positions'] = [tuple(pos) for pos in group_data['led_positions']]
@@ -3797,6 +3805,8 @@ def main():
                 group_data['led_euler_angles'] = group_cfg.get('led_euler_angles', [])
                 group_data['led_beam_tilts'] = group_cfg.get('led_beam_tilts', [])
                 group_data['led_sizes'] = group_cfg.get('led_sizes', [])
+                group_data['led_viewing_angles'] = group_cfg.get('led_viewing_angles', [])
+                group_data['led_lumens'] = group_cfg.get('led_lumens', [])
                 # IMPORTANT: Positions in template are already RELATIVE (not absolute!)
                 # They were saved with original_led_positions, so use them directly
                 group_data['original_led_positions'] = [tuple(pos) for pos in group_data['led_positions']]
@@ -4480,6 +4490,7 @@ def main():
                             group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
                             group_cfg['led_euler_angles'] = group.get('led_euler_angles', [])
                             group_cfg['led_beam_tilts'] = group.get('led_beam_tilts', [])
+                            group_cfg['led_lumens'] = group.get('led_lumens', [])
                         # Save lumens override for template
                         group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
                         group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
@@ -5396,7 +5407,25 @@ def main():
     with tab_panels:
         custom_groups_folder = server.gui.add_folder("Custom LED Groups")
         server.gui.add_markdown("Click a panel or LED group in the 3D view to edit its parameters.")
+        open_panel_designer_btn = server.gui.add_button("Create New Panel", color="green")
     template_dropdown = None  # Will be initialized later
+
+    # Panel designer state is deliberately separate from scene groups.  This
+    # lets Cancel leave the currently placed panel completely untouched.
+    designer_mode = [False]
+    designer_state = [{
+        'name': 'Untitled Panel',
+        'editing_owner': None,
+        'leds': [],
+        'selected_led': None,
+    }]
+    designer_ui_handles = []
+    designer_scene_handles = []
+    designer_led_nodes = []  # [{box, frame}, ...] persistent LED meshes
+    designer_gizmo = [None]
+    designer_widget_refs = [{}]  # field -> (slider, number) for gizmo→UI sync
+    designer_syncing = [False]
+    static_scene_handles = []  # /grid + /axes (filled when static scene is built)
     
     def create_custom_group(skip_update_scene=False, num_leds=12, led_rows=None, group_name=None):
         """Create a new custom LED group with all controls.
@@ -6353,6 +6382,7 @@ def main():
                     group_data['led_beam_tilts'] = grp_cfg.get('led_beam_tilts', [])
                     group_data['led_sizes'] = grp_cfg.get('led_sizes', [])
                     group_data['led_viewing_angles'] = grp_cfg.get('led_viewing_angles', [])
+                    group_data['led_lumens'] = grp_cfg.get('led_lumens', [])
 
                     group_data['original_led_positions'] = list(baked_pos)
                     group_data['original_led_rotations'] = list(baked_rot)
@@ -10693,8 +10723,611 @@ def main():
             if selected_owner[0] == owner:
                 populate_inspector(owner)
 
+    def _designer_rotation_matrix(rx_deg, ry_deg, rz_deg):
+        """LED-local Euler convention used by the designer: Rx @ Ry @ Rz."""
+        rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+        Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+        Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+        Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+        return Rx @ Ry @ Rz
+
+    def _designer_euler_from_axes(direction, row_direction=None):
+        """Recover designer Euler values from an LED forward and row axis."""
+        forward = np.asarray(direction, dtype=float)
+        norm = np.linalg.norm(forward)
+        forward = forward / norm if norm > 1e-9 else np.array([1.0, 0.0, 0.0])
+        if row_direction is None:
+            row = np.array([0.0, 1.0, 0.0])
+        else:
+            row = np.asarray(row_direction, dtype=float)
+            row -= forward * np.dot(row, forward)
+            if np.linalg.norm(row) < 1e-9:
+                row = np.array([0.0, 1.0, 0.0])
+        row /= np.linalg.norm(row)
+        third = np.cross(forward, row)
+        R = np.column_stack([forward, row, third])
+        ry = np.arcsin(np.clip(R[0, 2], -1.0, 1.0))
+        if abs(np.cos(ry)) > 1e-6:
+            rx = np.arctan2(-R[1, 2], R[2, 2])
+            rz = np.arctan2(-R[0, 1], R[0, 0])
+        else:
+            rx, rz = np.arctan2(R[2, 1], R[1, 1]), 0.0
+        return tuple(float(v) for v in np.degrees([rx, ry, rz]))
+
+    def _designer_quaternion(R):
+        """Return a wxyz quaternion for an orthonormal 3x3 rotation matrix."""
+        trace = np.trace(R)
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            return (0.25 / s, (R[2, 1] - R[1, 2]) * s,
+                    (R[0, 2] - R[2, 0]) * s, (R[1, 0] - R[0, 1]) * s)
+        i = int(np.argmax(np.diag(R)))
+        if i == 0:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            return ((R[2, 1] - R[1, 2]) / s, 0.25 * s,
+                    (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s)
+        if i == 1:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            return ((R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
+                    0.25 * s, (R[1, 2] + R[2, 1]) / s)
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        return ((R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
+                (R[1, 2] + R[2, 1]) / s, 0.25 * s)
+
+    def _designer_matrix_from_wxyz(wxyz):
+        """Convert a wxyz quaternion to a 3x3 rotation matrix."""
+        w, x, y, z = [float(v) for v in wxyz]
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ], dtype=float)
+
+    def _clear_designer_gizmo():
+        if designer_gizmo[0] is not None:
+            try:
+                designer_gizmo[0].remove()
+            except (KeyError, AttributeError):
+                pass
+            designer_gizmo[0] = None
+
+    def _clear_designer_scene():
+        _clear_designer_gizmo()
+        for nodes in designer_led_nodes:
+            for key in ('box', 'frame'):
+                try:
+                    nodes[key].remove()
+                except (KeyError, AttributeError):
+                    pass
+        designer_led_nodes.clear()
+        for handle in designer_scene_handles:
+            try:
+                handle.remove()
+            except (KeyError, AttributeError):
+                pass
+        designer_scene_handles.clear()
+
+    def _designer_led_pose(led):
+        """Return (position_m, wxyz) for an LED in designer state."""
+        R = _designer_rotation_matrix(led['rx'], led['ry'], led['rz'])
+        pos = (led['x'] / 100.0, led['y'] / 100.0, led['z'] / 100.0)
+        return pos, _designer_quaternion(R)
+
+    def _update_designer_led_pose(index):
+        """In-place pose update for one LED box + frame (no recreate)."""
+        if index is None or index < 0 or index >= len(designer_led_nodes):
+            return
+        led = designer_state[0]['leds'][index]
+        pos, wxyz = _designer_led_pose(led)
+        nodes = designer_led_nodes[index]
+        nodes['box'].position = pos
+        nodes['box'].wxyz = wxyz
+        nodes['frame'].position = pos
+        nodes['frame'].wxyz = wxyz
+
+    def _update_designer_selection_colors():
+        selected = designer_state[0]['selected_led']
+        for index, nodes in enumerate(designer_led_nodes):
+            try:
+                # Viser expects 0-255 when assigning .color (floats stay near-black).
+                nodes['box'].color = (38, 255, 255) if index == selected else (255, 255, 255)
+            except Exception:
+                pass
+
+    def _sync_widgets_from_led(led):
+        """Push LED state into slider/number widgets without feedback loops."""
+        refs = designer_widget_refs[0]
+        if not refs:
+            return
+        designer_syncing[0] = True
+        try:
+            for key, pair in refs.items():
+                if key not in led:
+                    continue
+                slider, number = pair
+                val = led[key]
+                try:
+                    slider.value = val
+                except Exception:
+                    pass
+                try:
+                    number.value = val
+                except Exception:
+                    pass
+        finally:
+            designer_syncing[0] = False
+
+    def _place_gizmo():
+        """Create/move the transform gizmo onto the selected LED (LED-local axes)."""
+        index = designer_state[0]['selected_led']
+        leds = designer_state[0]['leds']
+        if index is None or index < 0 or index >= len(leds):
+            _clear_designer_gizmo()
+            return
+        led = leds[index]
+        pos, wxyz = _designer_led_pose(led)
+        if designer_gizmo[0] is None:
+            gizmo = server.scene.add_transform_controls(
+                "/panel_designer/gizmo",
+                scale=0.08,
+                depth_test=False,
+                position=pos,
+                wxyz=wxyz,
+            )
+
+            @gizmo.on_update
+            def _on_gizmo_update(_):
+                if designer_syncing[0] or not designer_mode[0]:
+                    return
+                i = designer_state[0]['selected_led']
+                if i is None or i >= len(designer_state[0]['leds']):
+                    return
+                cur = designer_state[0]['leds'][i]
+                gx, gy, gz = designer_gizmo[0].position
+                cur['x'], cur['y'], cur['z'] = gx * 100.0, gy * 100.0, gz * 100.0
+                Rm = _designer_matrix_from_wxyz(designer_gizmo[0].wxyz)
+                rx, ry, rz = _designer_euler_from_axes(Rm @ np.array([1.0, 0.0, 0.0]),
+                                                      Rm @ np.array([0.0, 1.0, 0.0]))
+                cur['rx'], cur['ry'], cur['rz'] = rx, ry, rz
+                _update_designer_led_pose(i)
+                _sync_widgets_from_led(cur)
+
+            @gizmo.on_drag_end
+            def _on_gizmo_drag_end(_):
+                if not designer_mode[0]:
+                    return
+                i = designer_state[0]['selected_led']
+                if i is None or i >= len(designer_state[0]['leds']):
+                    return
+                cur = designer_state[0]['leds'][i]
+                # Snap to the same steps as the UI controls.
+                cur['x'] = round(cur['x'] / 0.05) * 0.05
+                cur['y'] = round(cur['y'] / 0.05) * 0.05
+                cur['z'] = round(cur['z'] / 0.05) * 0.05
+                cur['rx'] = round(cur['rx'] / 0.5) * 0.5
+                cur['ry'] = round(cur['ry'] / 0.5) * 0.5
+                cur['rz'] = round(cur['rz'] / 0.5) * 0.5
+                _update_designer_led_pose(i)
+                _sync_widgets_from_led(cur)
+                designer_syncing[0] = True
+                try:
+                    pos2, wxyz2 = _designer_led_pose(cur)
+                    designer_gizmo[0].position = pos2
+                    designer_gizmo[0].wxyz = wxyz2
+                finally:
+                    designer_syncing[0] = False
+
+            designer_gizmo[0] = gizmo
+        else:
+            designer_syncing[0] = True
+            try:
+                designer_gizmo[0].position = pos
+                designer_gizmo[0].wxyz = wxyz
+            finally:
+                designer_syncing[0] = False
+
+    def _select_designer_led_index(index, rebuild_ui=True):
+        """Select an LED for editing; move gizmo and refresh inspector."""
+        _just_clicked_mesh[0] = True
+        designer_state[0]['selected_led'] = index
+        _update_designer_selection_colors()
+        _place_gizmo()
+        if rebuild_ui:
+            _build_designer_ui()
+
+    def update_designer_scene(full_rebuild=True):
+        """Render the isolated panel. full_rebuild recreates LED meshes + gizmo."""
+        if not designer_mode[0]:
+            _clear_designer_scene()
+            return
+        leds = designer_state[0]['leds']
+        if full_rebuild:
+            _clear_designer_scene()
+            extent_cm = max(10.0, max(
+                (max(abs(led[a]) for a in ('x', 'y', 'z')) + led['size']
+                 for led in leds), default=5.0
+            ))
+            designer_scene_handles.append(server.scene.add_grid(
+                "/panel_designer/grid", width=extent_cm * 2 / 100.0,
+                height=extent_cm * 2 / 100.0, plane="yz", cell_size=0.01,
+            ))
+            designer_scene_handles.append(server.scene.add_frame(
+                "/panel_designer/panel_reference_frame", axes_length=0.05,
+                axes_radius=0.002, origin_radius=0.004,
+            ))
+            for index, led in enumerate(leds):
+                pos, wxyz = _designer_led_pose(led)
+                selected = index == designer_state[0]['selected_led']
+                # Sibling paths (not child of the box) so poses are not double-applied.
+                box = server.scene.add_box(
+                    f"/panel_designer/led_{index}",
+                    dimensions=(0.0005, led['size'] / 100.0, led['size'] / 100.0),
+                    color=(38, 255, 255) if selected else (255, 255, 255),
+                    position=pos,
+                    wxyz=wxyz,
+                )
+                frame = server.scene.add_frame(
+                    f"/panel_designer/frame_{index}",
+                    axes_length=max(0.01, led['size'] / 150.0), axes_radius=0.001,
+                    origin_radius=0.002,
+                    position=pos,
+                    wxyz=wxyz,
+                )
+
+                def _on_led_click(_event, selected_index=index):
+                    _select_designer_led_index(selected_index)
+
+                box.on_click(_on_led_click)
+                designer_led_nodes.append({'box': box, 'frame': frame})
+            _place_gizmo()
+        else:
+            for index in range(len(leds)):
+                _update_designer_led_pose(index)
+            _update_designer_selection_colors()
+            _place_gizmo()
+
+    def _designer_set_camera(view):
+        """Place every connected client on an orthographic-style panel view."""
+        leds = designer_state[0]['leds']
+        extent = max(0.3, max(
+            (max(abs(led[a]) for a in ('x', 'y', 'z')) / 100.0 + led['size'] / 100.0
+             for led in leds), default=0.1
+        ) * 3)
+        views = {
+            'XY': ((0, 0, extent), (0, 1, 0)),
+            '-XY': ((0, 0, -extent), (0, 1, 0)),
+            'XZ': ((0, extent, 0), (0, 0, 1)),
+            '-XZ': ((0, -extent, 0), (0, 0, 1)),
+            'YZ': ((extent, 0, 0), (0, 0, 1)),
+            '-YZ': ((-extent, 0, 0), (0, 0, 1)),
+        }
+        position, up = views[view]
+        for client in server.get_clients().values():
+            client.camera.position = position
+            client.camera.look_at = (0, 0, 0)
+            client.camera.up_direction = up
+
+    def _designer_apply_to_group(group, leds):
+        """Replace one dynamic group's local LED arrays from designer LEDs."""
+        group['is_dynamic'] = True
+        group['num_leds'] = len(leds)
+        group['led_positions'] = [(led['x'], led['y'], led['z']) for led in leds]
+        group['original_led_positions'] = list(group['led_positions'])
+        rotations = []
+        rows = []
+        for led in leds:
+            R = _designer_rotation_matrix(led['rx'], led['ry'], led['rz'])
+            rotations.append(tuple(R @ np.array([1.0, 0.0, 0.0])))
+            rows.append(tuple(R @ np.array([0.0, 1.0, 0.0])))
+        group['led_rotations'] = rotations
+        group['original_led_rotations'] = list(rotations)
+        group['led_row_directions'] = rows
+        group['original_led_row_directions'] = list(rows)
+        group['led_euler_angles'] = [(led['rx'], led['ry'], led['rz']) for led in leds]
+        group['led_sizes'] = [led['size'] for led in leds]
+        group['led_viewing_angles'] = [led['view_angle'] for led in leds]
+        group['led_lumens'] = [led['lumens'] if led['custom_lumens'] else None for led in leds]
+        group['led_states'] = [True] * len(leds)
+        group['led_rows'] = [list(range(len(leds)))] if leds else []
+
+    def _designer_template_group():
+        """Return a serializable dynamic group for Save As Template."""
+        leds = designer_state[0]['leds']
+        temp = {'is_dynamic': True, 'position': [0, 0, 0],
+                'rotation_x': 0, 'rotation_y': 0, 'rotation_z': 0,
+                'enabled': True}
+        _designer_apply_to_group(temp, leds)
+        return temp
+
+    def _save_designer_template(_event=None):
+        name = designer_state[0]['name'].strip() or 'Untitled Panel'
+        save_custom_group_template(name, [_designer_template_group()], [])
+        fresh = get_available_templates()
+        template_dropdown.options = ["Empty"] + fresh
+        for dropdown in _panel_dropdowns:
+            current = dropdown.value
+            dropdown.options = ["-- Nessuno --"] + fresh
+            dropdown.value = current if current in dropdown.options else "-- Nessuno --"
+        print(f"✓ Panel Designer template saved: {name}")
+
+    def _save_designer(_event=None):
+        state = designer_state[0]
+        by_group = {}
+        for led in state['leds']:
+            group = led.get('_group')
+            if group is not None:
+                by_group.setdefault(id(group), [group, []])[1].append(led)
+            elif led.get('_individual') is not None:
+                item = led['_individual']
+                item['pos_x'].value, item['pos_y'].value, item['pos_z'].value = led['x'], led['y'], led['z']
+                item['rot_x'].value, item['rot_y'].value, item['rot_z'].value = led['rx'], led['ry'], led['rz']
+                item['size'].value, item['viewing_angle'].value = led['size'], led['view_angle']
+                item['lumens_override'].value = led['custom_lumens']
+                item['lumens_value'].value = led['lumens']
+        if state['editing_owner'] is None:
+            group = create_custom_group(skip_update_scene=True, num_leds=max(1, len(state['leds'])),
+                                        led_rows=[list(range(len(state['leds'])))] if state['leds'] else [[0]],
+                                        group_name=state['name'])
+            _designer_apply_to_group(group, state['leds'])
+            group['template_name'] = state['name']
+            selected_owner[0] = ('custom_group', group['id'])
+        else:
+            for group, group_leds in by_group.values():
+                _designer_apply_to_group(group, group_leds)
+        _exit_designer()
+
+    def _collect_normal_scene_visibility_targets():
+        """Handles that should be hidden while the panel designer is open."""
+        targets = list(static_scene_handles)
+        try:
+            targets.append(wall_handle)
+        except Exception:
+            pass
+        if stl_mesh_handle[0] is not None:
+            targets.append(stl_mesh_handle[0])
+        targets.extend(room_wall_handles)
+        targets.extend(intensity_handles)
+        targets.extend(room_intensity_handles)
+        targets.extend(imported_csv_handles)
+        return targets
+
+    def _set_normal_scene_visible(visible):
+        for handle in _collect_normal_scene_visibility_targets():
+            try:
+                handle.visible = visible
+            except Exception:
+                pass
+
+    def _clear_normal_dynamic_scene():
+        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles
+        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles:
+            try:
+                handle.remove()
+            except (KeyError, AttributeError):
+                pass
+        led_handles = []
+        ray_handles = []
+        absorber_handles = []
+        camera_fov_handles = []
+        vio_fov_handles = []
+
+    def _exit_designer(_event=None):
+        designer_mode[0] = False
+        designer_widget_refs[0] = {}
+        _clear_designer_scene()
+        for handle in designer_ui_handles:
+            try:
+                handle.remove()
+            except (KeyError, AttributeError):
+                pass
+        designer_ui_handles.clear()
+        _clear_inspector()
+        _set_normal_scene_visible(True)
+        update_scene()
+        populate_inspector(selected_owner[0])
+
+    def _build_designer_ui():
+        """Rebuild designer controls inside the floating Selected inspector."""
+        _clear_inspector()
+        for handle in designer_ui_handles:
+            try:
+                handle.remove()
+            except (KeyError, AttributeError):
+                pass
+        designer_ui_handles.clear()
+        designer_widget_refs[0] = {}
+        state = designer_state[0]
+        with inspector_tab:
+            _inspector_add(server.gui.add_markdown("**Panel Designer**"))
+            exit_btn = _inspector_add(server.gui.add_button("Exit Designer", color="red"))
+            exit_btn.on_click(_exit_designer)
+
+            name_input = _inspector_add(server.gui.add_text("Panel name", initial_value=state['name']))
+            name_input.on_update(lambda _: state.__setitem__('name', name_input.value))
+
+            _inspector_add(server.gui.add_markdown("**View plane**"))
+            for view in ('XY', 'XZ', 'YZ', '-XY', '-XZ', '-YZ'):
+                button = _inspector_add(server.gui.add_button(view))
+                button.on_click(lambda _, v=view: _designer_set_camera(v))
+
+            _inspector_add(server.gui.add_markdown("**LEDs** — click a mesh or button; drag the gizmo arrows/rings"))
+            for index, _led in enumerate(state['leds']):
+                if index == state['selected_led']:
+                    button = _inspector_add(server.gui.add_button(f"LED {index + 1}", color="#00CCCC"))
+                else:
+                    button = _inspector_add(server.gui.add_button(f"LED {index + 1}"))
+
+                def _choose(_event, selected_index=index):
+                    _select_designer_led_index(selected_index)
+
+                button.on_click(_choose)
+
+            add_btn = _inspector_add(server.gui.add_button("Add LED", color="green"))
+            duplicate_btn = _inspector_add(server.gui.add_button("Duplicate LED"))
+            remove_btn = _inspector_add(server.gui.add_button("Remove LED", color="red"))
+
+            def _add(_):
+                state['leds'].append({
+                    'x': 0.0, 'y': 0.0, 'z': 0.0, 'rx': 0.0, 'ry': 0.0, 'rz': 0.0,
+                    'size': 0.5, 'view_angle': 120.0, 'custom_lumens': False,
+                    'lumens': 100.0, '_group': state.get('target_group'),
+                })
+                state['selected_led'] = len(state['leds']) - 1
+                update_designer_scene(full_rebuild=True)
+                _build_designer_ui()
+
+            add_btn.on_click(_add)
+
+            def _duplicate(_):
+                i = state['selected_led']
+                if i is None:
+                    return
+                new_led = dict(state['leds'][i])
+                new_led['y'] += 0.5
+                state['leds'].append(new_led)
+                state['selected_led'] = len(state['leds']) - 1
+                update_designer_scene(full_rebuild=True)
+                _build_designer_ui()
+
+            duplicate_btn.on_click(_duplicate)
+
+            def _remove(_):
+                i = state['selected_led']
+                if i is None:
+                    return
+                state['leds'].pop(i)
+                state['selected_led'] = min(i, len(state['leds']) - 1) if state['leds'] else None
+                update_designer_scene(full_rebuild=True)
+                _build_designer_ui()
+
+            remove_btn.on_click(_remove)
+
+            i = state['selected_led']
+            if i is not None and i < len(state['leds']):
+                led = state['leds'][i]
+                _inspector_add(server.gui.add_markdown(
+                    f"**LED {i + 1}** — drag gizmo (LED-local axes) or edit values"
+                ))
+                for label, key, low, high, step in (
+                    ('Position X (cm)', 'x', -30, 30, 0.05),
+                    ('Position Y (cm)', 'y', -30, 30, 0.05),
+                    ('Position Z (cm)', 'z', -30, 30, 0.05),
+                    ('Rotation X (°)', 'rx', -180, 180, 0.5),
+                    ('Rotation Y (°)', 'ry', -180, 180, 0.5),
+                    ('Rotation Z (°)', 'rz', -180, 180, 0.5),
+                    ('Square side (cm)', 'size', 0.1, 10, 0.05),
+                    ('Viewing angle (°)', 'view_angle', 1, 180, 1),
+                ):
+                    slider = _inspector_add(server.gui.add_slider(
+                        label, min=low, max=high, step=step, initial_value=led[key]
+                    ))
+                    number = _inspector_add(server.gui.add_number(
+                        f"{label} value", initial_value=led[key], step=step
+                    ))
+                    designer_widget_refs[0][key] = (slider, number)
+
+                    def _bind(source, other, field, needs_rebuild):
+                        def _update(_):
+                            if designer_syncing[0]:
+                                return
+                            designer_syncing[0] = True
+                            try:
+                                led[field] = float(source.value)
+                                other.value = source.value
+                            finally:
+                                designer_syncing[0] = False
+                            if needs_rebuild:
+                                update_designer_scene(full_rebuild=True)
+                            else:
+                                _update_designer_led_pose(state['selected_led'])
+                                _place_gizmo()
+                        source.on_update(_update)
+
+                    needs_rebuild = key in ('size', 'view_angle')
+                    _bind(slider, number, key, needs_rebuild)
+                    _bind(number, slider, key, needs_rebuild)
+
+                lumens_check = _inspector_add(server.gui.add_checkbox(
+                    "Custom lumens", initial_value=led['custom_lumens']
+                ))
+                lumens_value = _inspector_add(server.gui.add_number(
+                    "Lumens value", initial_value=led['lumens'], min=1, step=1
+                ))
+                lumens_check.on_update(lambda _: led.__setitem__('custom_lumens', lumens_check.value))
+                lumens_value.on_update(lambda _: led.__setitem__('lumens', float(lumens_value.value)))
+
+            _inspector_add(server.gui.add_html("<hr style='margin:8px 0;'>"))
+            save_btn = _inspector_add(server.gui.add_button("Save", color="green"))
+            template_btn = _inspector_add(server.gui.add_button("Save As Template"))
+            cancel_btn = _inspector_add(server.gui.add_button("Cancel", color="red"))
+            save_btn.on_click(_save_designer)
+            template_btn.on_click(_save_designer_template)
+            cancel_btn.on_click(_exit_designer)
+
+    def _enter_panel_designer(owner=None):
+        """Open an empty designer or extract a selected panel's local LEDs."""
+        state = {'name': 'Untitled Panel', 'editing_owner': owner, 'leds': [],
+                 'selected_led': None, 'target_group': None}
+        groups = _owner_groups(owner) if owner is not None else []
+        for group in groups:
+            if not group.get('is_dynamic', False):
+                continue
+            state['name'] = group.get('template_name') or _owner_display_name(owner)
+            positions = group.get('original_led_positions', group.get('led_positions', []))
+            eulers = group.get('led_euler_angles', [])
+            directions = group.get('original_led_rotations', group.get('led_rotations', []))
+            rows = group.get('original_led_row_directions', group.get('led_row_directions', []))
+            sizes = group.get('led_sizes', [])
+            view_angles = group.get('led_viewing_angles', [])
+            lumens_list = group.get('led_lumens', [])
+            for i, pos in enumerate(positions):
+                euler = eulers[i] if i < len(eulers) else _designer_euler_from_axes(
+                    directions[i] if i < len(directions) else (1, 0, 0),
+                    rows[i] if i < len(rows) else None,
+                )
+                state['leds'].append({
+                    'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2]),
+                    'rx': float(euler[0]), 'ry': float(euler[1]), 'rz': float(euler[2]),
+                    'size': float(sizes[i]) if i < len(sizes) else 0.5,
+                    'view_angle': float(view_angles[i]) if i < len(view_angles) else 120.0,
+                    'custom_lumens': i < len(lumens_list) and lumens_list[i] is not None,
+                    'lumens': float(lumens_list[i]) if i < len(lumens_list) and lumens_list[i] is not None else 100.0,
+                    '_group': group,
+                })
+            state['target_group'] = state['target_group'] or group
+        for item in _owner_individual_leds(owner):
+            state['name'] = _owner_display_name(owner)
+            state['leds'].append({
+                'x': item['pos_x'].value, 'y': item['pos_y'].value, 'z': item['pos_z'].value,
+                'rx': item['rot_x'].value, 'ry': item['rot_y'].value, 'rz': item['rot_z'].value,
+                'size': item['size'].value, 'view_angle': item['viewing_angle'].value,
+                'custom_lumens': item['lumens_override'].value,
+                'lumens': item['lumens_value'].value, '_individual': item,
+            })
+        if owner is not None and not state['leds']:
+            print("Panel Designer requires a dynamic panel or individual LEDs.")
+            return
+        if state['leds']:
+            state['selected_led'] = 0
+        designer_state[0] = state
+        designer_mode[0] = True
+        # Isolate the view without destroying static nodes (wall/grid/axes/STL).
+        _clear_normal_dynamic_scene()
+        _set_normal_scene_visible(False)
+        _build_designer_ui()
+        update_designer_scene(full_rebuild=True)
+        _designer_set_camera('YZ')
+
+    open_panel_designer_btn.on_click(lambda _: _enter_panel_designer())
+
     def populate_inspector(owner):
         """Rebuild the floating inspector for the given owner (or empty state)."""
+        if designer_mode[0]:
+            # Designer owns the Selected tab while active.
+            return
         _clear_inspector()
         with inspector_tab:
             if owner is None:
@@ -10748,6 +11381,8 @@ def main():
                     f"**Slot {slot_name}**  \n{tmpl}"
                     + ("  \n*Loaded as individual LEDs*" if data.get('as_individual') else "")
                 ))
+                edit_designer_btn = _inspector_add(server.gui.add_button("Edit in Panel Designer"))
+                edit_designer_btn.on_click(lambda _, o=owner: _enter_panel_designer(o))
                 _inspector_mirror_checkbox(owner)
                 ctrl = data.get('controls') or {}
                 if ctrl.get('enable') is not None:
@@ -10787,6 +11422,8 @@ def main():
                     return
                 title = group.get('template_name') or f"Custom Group {key}"
                 _inspector_add(server.gui.add_markdown(f"**{title}**"))
+                edit_designer_btn = _inspector_add(server.gui.add_button("Edit in Panel Designer"))
+                edit_designer_btn.on_click(lambda _, o=owner: _enter_panel_designer(o))
                 _inspector_mirror_checkbox(owner)
                 _mirror_checkbox("Enable", group['enable'])
                 _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
@@ -10886,6 +11523,8 @@ def main():
                 _inspector_add(server.gui.add_markdown(f"Unknown selection: `{kind}`"))
 
     def _select_panel_real(owner):
+        if designer_mode[0]:
+            return
         if selected_owner[0] == owner:
             return
         selected_owner[0] = owner
@@ -10898,6 +11537,9 @@ def main():
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
         nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, current_leds
+        if designer_mode[0]:
+            # Designer owns the 3D view; do not rebuild (would destroy the gizmo).
+            return
 
         # Ray-box intersection helper for update_scene (positions in cm)
         def ray_box_intersection(pos, direction, box):
@@ -11072,6 +11714,7 @@ def main():
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
+                config['led_lumens'] = group.get('led_lumens', [])
                 
                 # Rotate row direction vectors
                 original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
@@ -11834,6 +12477,9 @@ def main():
 
     @server.scene.on_click()
     def _on_scene_background_click(_event):
+        if designer_mode[0]:
+            _just_clicked_mesh[0] = False
+            return
         if _just_clicked_mesh[0]:
             _just_clicked_mesh[0] = False
             return
@@ -11857,32 +12503,32 @@ def main():
         grid_points.append([[-1.0, i * 0.01, 0], [1.0, i * 0.01, 0]])  # 1mm spacing
         grid_points.append([[i * 0.01, -1.0, 0], [i * 0.01, 1.0, 0]])  # 1mm spacing
 
-    server.scene.add_line_segments(
+    static_scene_handles.append(server.scene.add_line_segments(
         "/grid",
         points=np.array(grid_points),
         colors=(0.3, 0.3, 0.3),  # Single color for all segments
         line_width=1.0,
-    )
+    ))
 
     # Origin axes
-    server.scene.add_line_segments(
+    static_scene_handles.append(server.scene.add_line_segments(
         "/axes/x",
         points=np.array([[[0, 0, 0], [0.5, 0, 0]]]),
         colors=(1.0, 0.0, 0.0),
         line_width=3.0,
-    )
-    server.scene.add_line_segments(
+    ))
+    static_scene_handles.append(server.scene.add_line_segments(
         "/axes/y",
         points=np.array([[[0, 0, 0], [0, 0.5, 0]]]),
         colors=(0.0, 1.0, 0.0),
         line_width=3.0,
-    )
-    server.scene.add_line_segments(
+    ))
+    static_scene_handles.append(server.scene.add_line_segments(
         "/axes/z",
         points=np.array([[[0, 0, 0], [0, 0, 0.5]]]),
         colors=(0.0, 0.0, 1.0),
         line_width=3.0,
-    )
+    ))
 
     # Callback to update wall position and size
     def update_wall():
