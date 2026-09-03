@@ -1412,6 +1412,420 @@ def _mirror_xz_vecs(vecs):
     return [_mirror_xz_vec(v) for v in vecs]
 
 
+# ---------------------------------------------------------------------------
+# Circular construction guides (cylinder fit + Rodrigues orbit)
+# ---------------------------------------------------------------------------
+
+_GUIDE_NORMAL_SPREAD_WARN_DEG = 8.0
+_GUIDE_RADIUS_REL_WARN = 0.20
+
+
+def _as_vec3(v):
+    arr = np.asarray(v, dtype=float).reshape(3)
+    return arr
+
+
+def rodrigues_rotation(axis, theta_rad):
+    """3x3 rotation matrix about `axis` by `theta_rad` (Rodrigues)."""
+    u = _as_vec3(axis)
+    n = np.linalg.norm(u)
+    if n < 1e-12 or abs(theta_rad) < 1e-15:
+        return np.eye(3)
+    u = u / n
+    c, s = np.cos(theta_rad), np.sin(theta_rad)
+    t = 1.0 - c
+    ux, uy, uz = u
+    return np.array([
+        [t * ux * ux + c, t * ux * uy - s * uz, t * ux * uz + s * uy],
+        [t * ux * uy + s * uz, t * uy * uy + c, t * uy * uz - s * ux],
+        [t * ux * uz - s * uy, t * uy * uz + s * ux, t * uz * uz + c],
+    ])
+
+
+def euler_xyz_matrix(roll_deg, pitch_deg, yaw_deg):
+    """Extrinsic X-Y-Z rotation: R = Rz @ Ry @ Rx."""
+    roll_rad = np.radians(float(roll_deg))
+    pitch_rad = np.radians(float(pitch_deg))
+    yaw_rad = np.radians(float(yaw_deg))
+    cr, sr = np.cos(roll_rad), np.sin(roll_rad)
+    cp, sp = np.cos(pitch_rad), np.sin(pitch_rad)
+    cy, sy = np.cos(yaw_rad), np.sin(yaw_rad)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def euler_xyz_from_matrix(R):
+    """Extract extrinsic X-Y-Z Euler degrees from R = Rz @ Ry @ Rx.
+
+    Returns (roll_x, pitch_y, yaw_z) in degrees.
+    """
+    R = np.asarray(R, dtype=float)
+    cy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    if cy > 1e-8:
+        pitch = np.degrees(np.arctan2(-R[2, 0], cy))
+        roll = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
+        yaw = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
+    else:
+        pitch = np.degrees(np.arcsin(np.clip(-R[2, 0], -1.0, 1.0)))
+        roll = np.degrees(np.arctan2(-R[0, 1], R[1, 1]))
+        yaw = 0.0
+    return float(roll), float(pitch), float(yaw)
+
+
+def fit_circle_3points(a, b, c):
+    """Circumcircle of three 3D points.
+
+    Returns (center, radius, unit_normal) or None if collinear.
+    """
+    a = _as_vec3(a)
+    b = _as_vec3(b)
+    c = _as_vec3(c)
+    ab = b - a
+    ac = c - a
+    n = np.cross(ab, ac)
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-10:
+        return None
+    n = n / n_norm
+    mid_ab = (a + b) * 0.5
+    mid_ac = (a + c) * 0.5
+    d1 = np.cross(n, ab)
+    d2 = np.cross(n, ac)
+    A = np.column_stack((d1, -d2, n))
+    rhs = mid_ac - mid_ab
+    try:
+        stn, _, _, _ = np.linalg.lstsq(A, rhs, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    center = mid_ab + stn[0] * d1
+    radius = float(np.linalg.norm(center - a))
+    if radius < 1e-6:
+        return None
+    return center, radius, n
+
+
+def fit_circle_npoints(points):
+    """Least-squares 3D circle for 3+ points (plane SVD + algebraic 2D fit)."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 3)
+    if pts.shape[0] < 3:
+        return None
+    if pts.shape[0] == 3:
+        return fit_circle_3points(pts[0], pts[1], pts[2])
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    normal = vh[-1]
+    n_norm = np.linalg.norm(normal)
+    if n_norm < 1e-12:
+        return None
+    normal = normal / n_norm
+    if abs(normal[2]) < 0.9:
+        x_axis = np.cross(normal, [0.0, 0.0, 1.0])
+    else:
+        x_axis = np.cross(normal, [0.0, 1.0, 0.0])
+    x_n = np.linalg.norm(x_axis)
+    if x_n < 1e-12:
+        return None
+    x_axis = x_axis / x_n
+    y_axis = np.cross(normal, x_axis)
+    xy = np.column_stack((centered @ x_axis, centered @ y_axis))
+    x, y = xy[:, 0], xy[:, 1]
+    A = np.column_stack((x, y, np.ones(len(x))))
+    b = -(x * x + y * y)
+    try:
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    ac, bc, cc = sol
+    cx, cy = -0.5 * ac, -0.5 * bc
+    r2 = cx * cx + cy * cy - cc
+    if r2 <= 1e-12:
+        return None
+    radius = float(np.sqrt(r2))
+    center = centroid + cx * x_axis + cy * y_axis
+    return center, radius, normal
+
+
+def fit_panel_cylinder_from_rows(positions, led_rows):
+    """Fit one circle per LED row and reconcile a common cylinder axis.
+
+    Returns (guide_dict, error_string). error_string is None on success.
+    """
+    positions = list(positions)
+    circles = []
+    for row in led_rows or []:
+        pts = []
+        for idx in row:
+            if isinstance(idx, int) and 0 <= idx < len(positions):
+                pts.append(_as_vec3(positions[idx]))
+        if len(pts) < 3:
+            continue
+        fit = fit_circle_npoints(pts)
+        if fit is None:
+            continue
+        center, radius, normal = fit
+        circles.append({'center': center, 'radius': radius, 'normal': normal})
+
+    if not circles:
+        return None, "Need at least one LED row with 3 non-collinear points."
+
+    ref = circles[0]['normal']
+    for circ in circles[1:]:
+        if np.dot(circ['normal'], ref) < 0.0:
+            circ['normal'] = -circ['normal']
+
+    axis = np.mean([circ['normal'] for circ in circles], axis=0)
+    axis_n = np.linalg.norm(axis)
+    if axis_n < 1e-12:
+        return None, "Could not reconcile a common duct axis from the row circles."
+    axis = axis / axis_n
+
+    dots = [float(np.clip(np.dot(circ['normal'], axis), -1.0, 1.0)) for circ in circles]
+    spread = max(float(np.degrees(np.arccos(abs(d)))) for d in dots)
+    radii = [circ['radius'] for circ in circles]
+    r_mean = float(np.mean(radii))
+    r_span = (max(radii) - min(radii)) / r_mean if r_mean > 1e-9 else 0.0
+
+    origin = np.mean([circ['center'] for circ in circles], axis=0)
+
+    warning = None
+    if spread > _GUIDE_NORMAL_SPREAD_WARN_DEG or r_span > _GUIDE_RADIUS_REL_WARN:
+        warning = (
+            f"Rows are not a tight cylinder (axis spread {spread:.1f}°, "
+            f"radius span {100.0 * r_span:.0f}%). Sliding still uses one common axis."
+        )
+
+    guide = {
+        'type': 'cylinder',
+        'enabled': True,
+        'origin': [float(origin[0]), float(origin[1]), float(origin[2])],
+        'axis': [float(axis[0]), float(axis[1]), float(axis[2])],
+        'theta_deg': 0.0,
+        'circles': [
+            {
+                'center': [float(c['center'][0]), float(c['center'][1]), float(c['center'][2])],
+                'radius': float(c['radius']),
+                'normal': [float(c['normal'][0]), float(c['normal'][1]), float(c['normal'][2])],
+            }
+            for c in circles
+        ],
+        'normal_spread_deg': spread,
+        'warning': warning,
+    }
+    return guide, None
+
+
+def serialize_guide(guide):
+    """JSON-safe copy of a guide dict, or None."""
+    if not guide or not isinstance(guide, dict):
+        return None
+    circles = []
+    for circ in guide.get('circles') or []:
+        circles.append({
+            'center': [float(x) for x in circ.get('center', (0, 0, 0))],
+            'radius': float(circ.get('radius', 0.0)),
+            'normal': [float(x) for x in circ.get('normal', (0, 0, 1))],
+        })
+    out = {
+        'type': guide.get('type', 'cylinder'),
+        'enabled': bool(guide.get('enabled', False)),
+        'origin': [float(x) for x in guide.get('origin', (0, 0, 0))],
+        'axis': [float(x) for x in guide.get('axis', (0, 0, 1))],
+        'theta_deg': float(guide.get('theta_deg', 0.0)),
+        'circles': circles,
+        'normal_spread_deg': float(guide.get('normal_spread_deg', 0.0)),
+    }
+    if guide.get('warning'):
+        out['warning'] = str(guide['warning'])
+    return out
+
+
+def _mirror_guide_xz(guide):
+    """Reflect a construction guide across the XZ plane and negate theta."""
+    g = serialize_guide(guide)
+    if g is None:
+        return None
+    g['origin'] = list(_mirror_xz_vec(g['origin']))
+    ax = _as_vec3(g['axis'])
+    ax[1] = -ax[1]
+    n = np.linalg.norm(ax)
+    g['axis'] = [float(ax[0] / n), float(ax[1] / n), float(ax[2] / n)] if n > 1e-12 else [0.0, 0.0, 1.0]
+    g['theta_deg'] = -float(g.get('theta_deg', 0.0))
+    mirrored_circles = []
+    for circ in g.get('circles') or []:
+        nrm = _as_vec3(circ['normal'])
+        nrm[1] = -nrm[1]
+        nn = np.linalg.norm(nrm)
+        if nn > 1e-12:
+            nrm = nrm / nn
+        mirrored_circles.append({
+            'center': list(_mirror_xz_vec(circ['center'])),
+            'radius': float(circ['radius']),
+            'normal': [float(nrm[0]), float(nrm[1]), float(nrm[2])],
+        })
+    g['circles'] = mirrored_circles
+    return g
+
+
+def _guide_is_enabled(group):
+    g = group.get('guide') if isinstance(group, dict) else None
+    return bool(isinstance(g, dict) and g.get('enabled'))
+
+
+def _group_euler_matrix(group):
+    roll = group['rot_roll'].value if group.get('rot_roll') is not None else 0.0
+    pitch = group['rot_tilt_ud'].value if group.get('rot_tilt_ud') is not None else 0.0
+    yaw = group['rot_tilt_lr'].value if group.get('rot_tilt_lr') is not None else 0.0
+    return euler_xyz_matrix(roll, pitch, yaw)
+
+
+def _group_position_offset(group):
+    return np.array([
+        float(group['pos_x'].value),
+        float(group['pos_y'].value),
+        float(group['pos_z'].value),
+    ], dtype=float)
+
+
+def apply_axis_orbit(points, origin, axis, theta_deg):
+    """Orbit 3D points around origin/axis by theta_deg. points: list of 3-vectors."""
+    theta = float(theta_deg)
+    if abs(theta) < 1e-12:
+        return [tuple(np.asarray(p, dtype=float).reshape(3)) for p in points]
+    R = rodrigues_rotation(axis, np.radians(theta))
+    O = _as_vec3(origin)
+    out = []
+    for p in points:
+        out.append(tuple(O + R @ (_as_vec3(p) - O)))
+    return out
+
+
+def _dynamic_group_world_geometry(group):
+    """World-space LED positions, directions, and row directions for a dynamic group.
+
+    Applies extrinsic Euler + group offset, then the circular-guide orbit if enabled.
+    """
+    position_offset = _group_position_offset(group)
+    if not group.get('original_led_positions') and group.get('led_positions'):
+        relative_positions = []
+        for led_pos in group.get('led_positions', []):
+            relative_positions.append(tuple(np.asarray(led_pos, dtype=float) - position_offset))
+        group['original_led_positions'] = relative_positions
+    if not group.get('original_led_rotations') and group.get('led_rotations'):
+        group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
+    if not group.get('original_led_row_directions') and group.get('led_row_directions'):
+        group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
+
+    R_total = _group_euler_matrix(group)
+    original_positions = group.get('original_led_positions') or group.get('led_positions') or []
+    original_rotations = group.get('original_led_rotations') or group.get('led_rotations') or []
+    original_row_dirs = group.get('original_led_row_directions') or group.get('led_row_directions') or []
+
+    positions = []
+    for orig_pos in original_positions:
+        positions.append(tuple(R_total @ np.asarray(orig_pos, dtype=float) + position_offset))
+    directions = [tuple(R_total @ np.asarray(d, dtype=float)) for d in original_rotations]
+    row_dirs = [tuple(R_total @ np.asarray(rd, dtype=float)) for rd in original_row_dirs] if original_row_dirs else []
+
+    guide = group.get('guide')
+    if isinstance(guide, dict) and guide.get('enabled'):
+        theta = float(guide.get('theta_deg', 0.0))
+        origin = guide.get('origin', (0.0, 0.0, 0.0))
+        axis = guide.get('axis', (0.0, 0.0, 1.0))
+        if abs(theta) > 1e-12:
+            R_g = rodrigues_rotation(axis, np.radians(theta))
+            O = _as_vec3(origin)
+            positions = [tuple(O + R_g @ (_as_vec3(p) - O)) for p in positions]
+            directions = [tuple(R_g @ _as_vec3(d)) for d in directions]
+            row_dirs = [tuple(R_g @ _as_vec3(rd)) for rd in row_dirs]
+    return positions, directions, row_dirs
+
+
+def enable_circular_guide(group):
+    """Fit a cylinder from the group's current rest-pose LED rows. Returns (ok, error)."""
+    if not group.get('is_dynamic', False):
+        return False, "Anchor requires a dynamic panel with LED rows."
+    rows = group.get('led_rows')
+    if not rows:
+        return False, "This panel has no LED rows to fit a circle to."
+    # Fit from rest pose (Euler + offset, no existing slide).
+    prev = group.get('guide')
+    group['guide'] = None
+    try:
+        positions, _, _ = _dynamic_group_world_geometry(group)
+    finally:
+        group['guide'] = prev
+    if len(positions) < 3:
+        return False, "Need at least 3 LED positions to fit a guide."
+    guide, err = fit_panel_cylinder_from_rows(positions, rows)
+    if err:
+        return False, err
+    group['guide'] = guide
+    group['guide_error'] = None
+    return True, None
+
+
+def bake_and_disable_guide(group):
+    """Fold the current slide into original_led_* so unchecking does not jump."""
+    if not _guide_is_enabled(group):
+        group['guide'] = None
+        group['guide_error'] = None
+        return
+    positions, directions, row_dirs = _dynamic_group_world_geometry(group)
+    R_e = _group_euler_matrix(group)
+    offset = _group_position_offset(group)
+    R_inv = R_e.T
+    orig_pos = [tuple(float(x) for x in (R_inv @ (_as_vec3(p) - offset))) for p in positions]
+    orig_dir = [tuple(float(x) for x in (R_inv @ _as_vec3(d))) for d in directions]
+    orig_row = [tuple(float(x) for x in (R_inv @ _as_vec3(rd))) for rd in row_dirs]
+    group['original_led_positions'] = orig_pos
+    group['original_led_rotations'] = orig_dir
+    group['led_positions'] = list(orig_pos)
+    group['led_rotations'] = list(orig_dir)
+    if orig_row:
+        group['original_led_row_directions'] = orig_row
+        group['led_row_directions'] = list(orig_row)
+    apply_rot = group.get('apply_rotation')
+    if callable(apply_rot):
+        apply_rot()
+    group['guide'] = None
+    group['guide_error'] = None
+
+
+def restore_group_guide(group, group_cfg):
+    """Attach a saved construction guide (if any) onto a runtime group."""
+    guide = serialize_guide(group_cfg.get('guide') if isinstance(group_cfg, dict) else None)
+    group['guide'] = guide
+    group['guide_error'] = None
+
+
+def _circle_line_segments_m(center_cm, radius_cm, normal, n_seg=64):
+    """Polyline segments for a 3D circle, in metres for Viser."""
+    center = _as_vec3(center_cm)
+    nrm = _as_vec3(normal)
+    n_norm = np.linalg.norm(nrm)
+    if n_norm < 1e-12 or radius_cm < 1e-9:
+        return np.zeros((0, 2, 3))
+    nrm = nrm / n_norm
+    if abs(nrm[2]) < 0.9:
+        x_axis = np.cross(nrm, [0.0, 0.0, 1.0])
+    else:
+        x_axis = np.cross(nrm, [0.0, 1.0, 0.0])
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(nrm, x_axis)
+    thetas = np.linspace(0.0, 2.0 * np.pi, int(n_seg) + 1)
+    pts = center + float(radius_cm) * (
+        np.cos(thetas)[:, None] * x_axis + np.sin(thetas)[:, None] * y_axis
+    )
+    segs = np.stack([pts[:-1], pts[1:]], axis=1)
+    return segs / 100.0
+
+
 def _mirror_group_config_xz(cfg):
     """Return an XZ-mirrored copy of a custom-group LED config dict.
 
@@ -1437,6 +1851,8 @@ def _mirror_group_config_xz(cfg):
         m['led_beam_tilts'] = [-float(t) for t in cfg['led_beam_tilts']]
     if cfg.get('led_states') is not None:
         m['led_states'] = list(cfg['led_states'])
+    if cfg.get('guide'):
+        m['guide'] = _mirror_guide_xz(cfg['guide'])
     return m
 
 
@@ -2469,6 +2885,8 @@ def main():
             # Save lumens override settings for custom group
             group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
             group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
+            if _guide_is_enabled(group):
+                group_cfg['guide'] = serialize_guide(group['guide'])
             custom_groups_data.append(group_cfg)
         
         # Process individual LEDs: separate template-sourced from standalone
@@ -2903,16 +3321,21 @@ def main():
             group_data['pos_z'].value = pos[2]
             # For panel slot groups, restore actual rotation values;
             # for others, rotations are baked into led_positions/led_rotations
-            if group_cfg.get('panel_slot') is not None:
+            # unless a construction guide is active (theta is applied on top of Euler).
+            _restore_euler = (
+                group_cfg.get('panel_slot') is not None
+                or (isinstance(group_cfg.get('guide'), dict) and group_cfg['guide'].get('enabled'))
+            )
+            if _restore_euler:
                 if 'rot_tilt_lr' in group_data:
                     group_data['rot_tilt_lr'].value = int(round(group_cfg.get('rotation_z', 0)))
                 if 'rot_tilt_ud' in group_data:
                     group_data['rot_tilt_ud'].value = int(round(group_cfg.get('rotation_y', 0)))
                 if 'rot_roll' in group_data:
                     group_data['rot_roll'].value = int(round(group_cfg.get('rotation_x', 0)))
-                # Preserve panel slot metadata
-                group_data['panel_slot'] = group_cfg.get('panel_slot')
-                group_data['panel_slot_name'] = group_cfg.get('panel_slot_name')
+                if group_cfg.get('panel_slot') is not None:
+                    group_data['panel_slot'] = group_cfg.get('panel_slot')
+                    group_data['panel_slot_name'] = group_cfg.get('panel_slot_name')
             else:
                 if 'rot_tilt_lr' in group_data:
                     group_data['rot_tilt_lr'].value = 0
@@ -2938,6 +3361,7 @@ def main():
             
             # Enable the group AFTER all parameters are loaded
             group_data['enable'].value = group_cfg.get('enabled', True)
+            restore_group_guide(group_data, group_cfg)
         
         # Recreate template folders with master controls
         for template_name, template_groups_cfg in groups_by_template.items():
@@ -3031,6 +3455,7 @@ def main():
                 
                 # Enable the group
                 group_data['enable'].value = group_cfg.get('enabled', True)
+                restore_group_guide(group_data, group_cfg)
                 
                 # Store template association and initial offsets
                 group_data['template_name'] = template_name
@@ -3834,6 +4259,7 @@ def main():
             
             # Enable the group AFTER all parameters are loaded
             group_data['enable'].value = group_cfg.get('enabled', True)
+            restore_group_guide(group_data, group_cfg)
             
             # Store initial offset for this group
             init_pos = [pos[0], pos[1], pos[2]]
@@ -4494,6 +4920,8 @@ def main():
                         # Save lumens override for template
                         group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
                         group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
+                        if _guide_is_enabled(group):
+                            group_cfg['guide'] = serialize_guide(group['guide'])
                         custom_groups_data.append(group_cfg)
                     
                     # Save individual LEDs
@@ -5257,6 +5685,7 @@ def main():
     vio_fov_handles = []
     led_handles = []
     ray_handles = []
+    guide_handles = []
     intensity_handles = []
     room_intensity_handles = []
     room_wall_handles = []
@@ -5540,6 +5969,8 @@ def main():
             'led_euler_angles': None,  # Original Euler angles for lossless roundtrip
             'led_beam_tilts': None,  # Beam tilt angles for lossless roundtrip
             'apply_rotation': None,  # Will be set to apply_rotation_transform()
+            'guide': None,  # Circular construction guide (cylinder) or None
+            'guide_error': None,
         }
         
         # Function to update button colors based on LED states
@@ -8346,83 +8777,12 @@ def main():
             # Add dynamic group info if present
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
-                
-                # Get rotation angles (Euler angles in fixed frame)
-                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0  # Rotation around X
-                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0  # Rotation around Y
-                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0  # Rotation around Z
-                
-                # Build Euler rotation matrices (extrinsic X-Y-Z)
-                roll_rad = np.radians(roll_deg)
-                pitch_rad = np.radians(pitch_deg)
-                yaw_rad = np.radians(yaw_deg)
-                
-                # Rotation matrix around X axis
-                Rx = np.array([
-                    [1, 0, 0],
-                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
-                    [0, np.sin(roll_rad), np.cos(roll_rad)]
-                ])
-                
-                # Rotation matrix around Y axis
-                Ry = np.array([
-                    [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
-                    [0, 1, 0],
-                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
-                ])
-                
-                # Rotation matrix around Z axis
-                Rz = np.array([
-                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
-                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
-                    [0, 0, 1]
-                ])
-                
-                # Compose: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
-                R_total = Rz @ Ry @ Rx
-                
-                # RIGID BODY rotation: rotate BOTH positions AND directions
-                # R is orthogonal => all distances are preserved
-                position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                
-                # Save originals if missing (for backward compatibility)
-                if 'original_led_positions' not in group and 'led_positions' in group:
-                    relative_positions = []
-                    for led_pos in group.get('led_positions', []):
-                        relative_pos = np.array(led_pos) - position_offset
-                        relative_positions.append(tuple(relative_pos))
-                    group['original_led_positions'] = relative_positions
-                if 'original_led_rotations' not in group and 'led_rotations' in group:
-                    group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
-                if 'original_led_row_directions' not in group and 'led_row_directions' in group:
-                    group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
-
-                # Get originals
-                original_positions = group.get('original_led_positions', group.get('led_positions', []))
-                original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
-                
-                # Rotate relative positions then translate (rigid body)
-                translated_positions = []
-                for orig_pos in original_positions:
-                    rotated_pos = R_total @ np.array(orig_pos)
-                    final_pos = rotated_pos + position_offset
-                    translated_positions.append(tuple(final_pos))
-                
-                # Rotate direction vectors
-                rotated_directions = []
-                for orig_dir in original_rotations:
-                    rotated_dir = R_total @ np.array(orig_dir)
-                    rotated_directions.append(tuple(rotated_dir))
-                
+                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
                 config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                
-                # Rotate row direction vectors
-                original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
-                if original_row_dirs:
-                    rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
+                if rotated_row_dirs:
                     config['led_row_directions'] = rotated_row_dirs
             # Pass lumens override for custom group
             if group.get('lumens_override') and group['lumens_override'].value:
@@ -9087,57 +9447,12 @@ def main():
             }
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
-                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0
-                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0
-                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0
-                roll_rad = np.radians(roll_deg)
-                pitch_rad = np.radians(pitch_deg)
-                yaw_rad = np.radians(yaw_deg)
-                Rx = np.array([
-                    [1, 0, 0],
-                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
-                    [0, np.sin(roll_rad), np.cos(roll_rad)]
-                ])
-                Ry = np.array([
-                    [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
-                    [0, 1, 0],
-                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
-                ])
-                Rz = np.array([
-                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
-                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
-                    [0, 0, 1]
-                ])
-                R_total = Rz @ Ry @ Rx
-                position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                if 'original_led_positions' not in group and 'led_positions' in group:
-                    relative_positions = []
-                    for led_pos in group.get('led_positions', []):
-                        relative_pos = np.array(led_pos) - position_offset
-                        relative_positions.append(tuple(relative_pos))
-                    group['original_led_positions'] = relative_positions
-                if 'original_led_rotations' not in group and 'led_rotations' in group:
-                    group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
-                if 'original_led_row_directions' not in group and 'led_row_directions' in group:
-                    group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
-                original_positions = group.get('original_led_positions', group.get('led_positions', []))
-                original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
-                translated_positions = []
-                for orig_pos in original_positions:
-                    rotated_pos = R_total @ np.array(orig_pos)
-                    final_pos = rotated_pos + position_offset
-                    translated_positions.append(tuple(final_pos))
-                rotated_directions = []
-                for orig_dir in original_rotations:
-                    rotated_dir = R_total @ np.array(orig_dir)
-                    rotated_directions.append(tuple(rotated_dir))
+                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
                 config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
                 config['led_beam_tilts'] = group.get('led_beam_tilts', [])
-                original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
-                if original_row_dirs:
-                    rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
+                if rotated_row_dirs:
                     config['led_row_directions'] = rotated_row_dirs
             if group.get('lumens_override') and group['lumens_override'].value:
                 config['lumens_override'] = float(group['lumens_value'].value)
@@ -10723,6 +11038,69 @@ def main():
             if selected_owner[0] == owner:
                 populate_inspector(owner)
 
+    def _inspector_group_pose_sliders(group):
+        """Free XYZ/Euler sliders; hidden while the circular guide is anchoring the panel."""
+        if _guide_is_enabled(group):
+            return
+        _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
+        _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
+        _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
+        if group.get('rot_tilt_lr') is not None:
+            _mirror_slider("Tilt Left/Right (°)", group['rot_tilt_lr'], -180, 180, 1)
+        if group.get('rot_tilt_ud') is not None:
+            _mirror_slider("Tilt Up/Down (°)", group['rot_tilt_ud'], -180, 180, 1)
+        if group.get('rot_roll') is not None:
+            _mirror_slider("Rotate on axis (°)", group['rot_roll'], -180, 180, 1)
+
+    def _inspector_guide_controls(group):
+        """Checkbox to fit/anchor a circular guide and the slide slider while on."""
+        enabled = _guide_is_enabled(group)
+        chk = _inspector_add(server.gui.add_checkbox(
+            "Anchor to circular guide", initial_value=enabled
+        ))
+        if group.get('guide_error'):
+            _inspector_add(server.gui.add_markdown(f"**Guide:** {group['guide_error']}"))
+        if enabled:
+            guide = group.get('guide') or {}
+            if guide.get('warning'):
+                _inspector_add(server.gui.add_markdown(f"*{guide['warning']}*"))
+            n_circ = len(guide.get('circles') or [])
+            _inspector_add(server.gui.add_markdown(
+                f"Pose locked — {n_circ} construction circle(s). "
+                "Uncheck to restore free XYZ/Euler."
+            ))
+            sl = _inspector_add(server.gui.add_slider(
+                "Slide along guide (°)",
+                min=-180, max=180, step=0.5,
+                initial_value=float(guide.get('theta_deg', 0.0)),
+            ))
+
+            @sl.on_update
+            def _(_):
+                if loading_in_progress[0] or _inspector_syncing[0]:
+                    return
+                if not isinstance(group.get('guide'), dict):
+                    return
+                group['guide']['theta_deg'] = float(sl.value)
+                update_scene()
+
+        @chk.on_update
+        def _(_):
+            if loading_in_progress[0] or _inspector_syncing[0]:
+                return
+            if chk.value:
+                ok, err = enable_circular_guide(group)
+                if not ok:
+                    group['guide'] = None
+                    group['guide_error'] = err or "Could not fit a circular guide."
+                else:
+                    group['guide_error'] = None
+            else:
+                bake_and_disable_guide(group)
+            update_scene()
+            if selected_owner[0] is not None:
+                populate_inspector(selected_owner[0])
+
     def _designer_rotation_matrix(rx_deg, ry_deg, rz_deg):
         """LED-local Euler convention used by the designer: Rx @ Ry @ Rz."""
         rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
@@ -11102,8 +11480,8 @@ def main():
                 pass
 
     def _clear_normal_dynamic_scene():
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles:
+        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, guide_handles
+        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles + guide_handles:
             try:
                 handle.remove()
             except (KeyError, AttributeError):
@@ -11113,6 +11491,7 @@ def main():
         absorber_handles = []
         camera_fov_handles = []
         vio_fov_handles = []
+        guide_handles = []
 
     def _exit_designer(_event=None):
         designer_mode[0] = False
@@ -11361,15 +11740,8 @@ def main():
                                 f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
                             ))
                         _mirror_checkbox("Enable", group['enable'])
-                        _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
-                        _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
-                        _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
-                        if group.get('rot_tilt_lr') is not None:
-                            _mirror_slider("Tilt Left/Right (°)", group['rot_tilt_lr'], -180, 180, 1)
-                        if group.get('rot_tilt_ud') is not None:
-                            _mirror_slider("Tilt Up/Down (°)", group['rot_tilt_ud'], -180, 180, 1)
-                        if group.get('rot_roll') is not None:
-                            _mirror_slider("Rotate on axis (°)", group['rot_roll'], -180, 180, 1)
+                        _inspector_guide_controls(group)
+                        _inspector_group_pose_sliders(group)
                         if group.get('lumens_override') is not None:
                             _mirror_checkbox("Enable custom lumens", group['lumens_override'])
                             _mirror_slider("Lumens per LED (lm)", group['lumens_value'], 1, 900000, 1)
@@ -11385,14 +11757,21 @@ def main():
                 edit_designer_btn.on_click(lambda _, o=owner: _enter_panel_designer(o))
                 _inspector_mirror_checkbox(owner)
                 ctrl = data.get('controls') or {}
+                slot_groups_live = data.get('groups') or slot_groups
+                slot_anchored = any(_guide_is_enabled(g) for g in slot_groups_live)
                 if ctrl.get('enable') is not None:
                     _mirror_checkbox("Enable Slot", ctrl['enable'])
-                    _mirror_slider("Offset X (cm)", ctrl['pos_x'], -50, 50, 0.1)
-                    _mirror_slider("Offset Y (cm)", ctrl['pos_y'], -50, 50, 0.1)
-                    _mirror_slider("Offset Z (cm)", ctrl['pos_z'], -50, 50, 0.1)
-                    _mirror_slider("Rotate on axis (°)", ctrl['rot_x'], -180, 180, 1)
-                    _mirror_slider("Tilt Up/Down (°)", ctrl['rot_y'], -180, 180, 1)
-                    _mirror_slider("Tilt Left/Right (°)", ctrl['rot_z'], -180, 180, 1)
+                    if slot_anchored:
+                        _inspector_add(server.gui.add_markdown(
+                            "Slot offset/rotation locked while a group is anchored to a circular guide."
+                        ))
+                    else:
+                        _mirror_slider("Offset X (cm)", ctrl['pos_x'], -50, 50, 0.1)
+                        _mirror_slider("Offset Y (cm)", ctrl['pos_y'], -50, 50, 0.1)
+                        _mirror_slider("Offset Z (cm)", ctrl['pos_z'], -50, 50, 0.1)
+                        _mirror_slider("Rotate on axis (°)", ctrl['rot_x'], -180, 180, 1)
+                        _mirror_slider("Tilt Up/Down (°)", ctrl['rot_y'], -180, 180, 1)
+                        _mirror_slider("Tilt Left/Right (°)", ctrl['rot_z'], -180, 180, 1)
                     _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
                     _mirror_checkbox("Enable custom lumens", ctrl['lumens_chk'])
                     _mirror_slider("Lumens per LED (lm)", ctrl['lumens_slider'], 1, 900000, 1)
@@ -11401,10 +11780,11 @@ def main():
                         "Per-LED edits are in the **Individual LEDs** folder."
                     ))
                 else:
-                    for g_idx, group in enumerate(data.get('groups', [])):
+                    for g_idx, group in enumerate(slot_groups_live):
                         _inspector_add(server.gui.add_html(
                             f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
                         ))
+                        _inspector_guide_controls(group)
                         _inspector_led_matrix(group)
                 remove_btn = _inspector_add(server.gui.add_button("Remove Slot", color="red"))
 
@@ -11426,12 +11806,8 @@ def main():
                 edit_designer_btn.on_click(lambda _, o=owner: _enter_panel_designer(o))
                 _inspector_mirror_checkbox(owner)
                 _mirror_checkbox("Enable", group['enable'])
-                _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
-                _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
-                _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
-                _mirror_slider("Tilt Left/Right (°)", group['rot_tilt_lr'], -180, 180, 1)
-                _mirror_slider("Tilt Up/Down (°)", group['rot_tilt_ud'], -180, 180, 1)
-                _mirror_slider("Rotate on axis (°)", group['rot_roll'], -180, 180, 1)
+                _inspector_guide_controls(group)
+                _inspector_group_pose_sliders(group)
                 if group.get('lumens_override') is not None:
                     _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
                     _mirror_checkbox("Enable custom lumens", group['lumens_override'])
@@ -11536,7 +11912,7 @@ def main():
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, current_leds
+        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, current_leds, guide_handles
         if designer_mode[0]:
             # Designer owns the 3D view; do not rebuild (would destroy the gizmo).
             return
@@ -11584,7 +11960,7 @@ def main():
             return tmin if tmin > 0 else (tmax if tmax > 0 else None)
 
         # Clear previous objects (safely ignore already-removed handles)
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles:
+        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles + guide_handles:
             try:
                 handle.remove()
             except KeyError:
@@ -11594,6 +11970,7 @@ def main():
         absorber_handles = []
         camera_fov_handles = []
         vio_fov_handles = []
+        guide_handles = []
 
         # Get current values (fixed angles: front=0°, side=90°)
         front_angle = 0.0  # Fixed front angle
@@ -11642,84 +12019,13 @@ def main():
             # Add dynamic group info if present
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
-                
-                # Get rotation angles (Euler angles in fixed frame)
-                roll_deg = group['rot_roll'].value if 'rot_roll' in group else 0  # Rotation around X
-                pitch_deg = group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0  # Rotation around Y
-                yaw_deg = group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0  # Rotation around Z
-                
-                # Build Euler rotation matrices (extrinsic X-Y-Z)
-                roll_rad = np.radians(roll_deg)
-                pitch_rad = np.radians(pitch_deg)
-                yaw_rad = np.radians(yaw_deg)
-                
-                # Rotation matrix around X axis
-                Rx = np.array([
-                    [1, 0, 0],
-                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
-                    [0, np.sin(roll_rad), np.cos(roll_rad)]
-                ])
-                
-                # Rotation matrix around Y axis
-                Ry = np.array([
-                    [np.cos(pitch_rad), 0, np.sin(pitch_rad)],
-                    [0, 1, 0],
-                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]
-                ])
-                
-                # Rotation matrix around Z axis
-                Rz = np.array([
-                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0],
-                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
-                    [0, 0, 1]
-                ])
-                
-                # Compose: extrinsic X-Y-Z means R = Rz @ Ry @ Rx
-                R_total = Rz @ Ry @ Rx
-                
-                # RIGID BODY rotation: rotate BOTH positions AND directions
-                # R is orthogonal => all distances are preserved
-                position_offset = np.array([group['pos_x'].value, group['pos_y'].value, group['pos_z'].value])
-                
-                # Save originals if missing (for backward compatibility)
-                if 'original_led_positions' not in group and 'led_positions' in group:
-                    relative_positions = []
-                    for led_pos in group.get('led_positions', []):
-                        relative_pos = np.array(led_pos) - position_offset
-                        relative_positions.append(tuple(relative_pos))
-                    group['original_led_positions'] = relative_positions
-                if 'original_led_rotations' not in group and 'led_rotations' in group:
-                    group['original_led_rotations'] = [tuple(rot) for rot in group.get('led_rotations', [])]
-                if 'original_led_row_directions' not in group and 'led_row_directions' in group:
-                    group['original_led_row_directions'] = [tuple(rd) for rd in group.get('led_row_directions', [])]
-
-                # Get originals
-                original_positions = group.get('original_led_positions', group.get('led_positions', []))
-                original_rotations = group.get('original_led_rotations', group.get('led_rotations', []))
-                
-                # Rotate relative positions then translate (rigid body)
-                translated_positions = []
-                for orig_pos in original_positions:
-                    rotated_pos = R_total @ np.array(orig_pos)
-                    final_pos = rotated_pos + position_offset
-                    translated_positions.append(tuple(final_pos))
-                
-                # Rotate direction vectors
-                rotated_directions = []
-                for orig_dir in original_rotations:
-                    rotated_dir = R_total @ np.array(orig_dir)
-                    rotated_directions.append(tuple(rotated_dir))
-                
+                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
                 config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_sizes'] = group.get('led_sizes', [])
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
                 config['led_lumens'] = group.get('led_lumens', [])
-                
-                # Rotate row direction vectors
-                original_row_dirs = group.get('original_led_row_directions', group.get('led_row_directions', []))
-                if original_row_dirs:
-                    rotated_row_dirs = [tuple(R_total @ np.array(rd)) for rd in original_row_dirs]
+                if rotated_row_dirs:
                     config['led_row_directions'] = rotated_row_dirs
             # Pass lumens override for custom group
             if group.get('lumens_override') and group['lumens_override'].value:
@@ -11822,7 +12128,70 @@ def main():
 
         # Save LEDs for reuse in room intensity calculation
         current_leds = leds
-        
+
+        # Rest-pose construction circles + axis for the selected anchored panel
+        def _globalize_cm(p):
+            v = np.asarray(p, dtype=float).reshape(3)
+            if abs(global_rot_z_deg) > 0.01:
+                g_rad = np.radians(global_rot_z_deg)
+                cg, sg = np.cos(g_rad), np.sin(g_rad)
+                v = np.array([cg * v[0] - sg * v[1], sg * v[0] + cg * v[1], v[2]])
+            v = v + np.array([_gp_x, _gp_y, _gp_z], dtype=float)
+            return v
+
+        def _globalize_dir(d):
+            v = np.asarray(d, dtype=float).reshape(3)
+            if abs(global_rot_z_deg) > 0.01:
+                g_rad = np.radians(global_rot_z_deg)
+                cg, sg = np.cos(g_rad), np.sin(g_rad)
+                v = np.array([cg * v[0] - sg * v[1], sg * v[0] + cg * v[1], v[2]])
+            return v
+
+        draw_groups = []
+        owner = selected_owner[0]
+        if owner is not None:
+            draw_groups = list(_owner_groups(owner))
+        for gi, group in enumerate(draw_groups):
+            if not _guide_is_enabled(group):
+                continue
+            guide = group['guide']
+            origin = _as_vec3(guide.get('origin', (0, 0, 0)))
+            axis = _as_vec3(guide.get('axis', (0, 0, 1)))
+            an = np.linalg.norm(axis)
+            if an < 1e-12:
+                continue
+            axis = axis / an
+            circles = guide.get('circles') or []
+            for ci, circ in enumerate(circles):
+                segs = _circle_line_segments_m(
+                    _globalize_cm(circ.get('center', origin)),
+                    float(circ.get('radius', 0.0)),
+                    _globalize_dir(circ.get('normal', axis)),
+                    n_seg=64,
+                )
+                if segs.shape[0] == 0:
+                    continue
+                handle = server.scene.add_line_segments(
+                    f"/guides/group_{group.get('id', gi)}/circle_{ci}",
+                    points=segs,
+                    colors=(0.55, 0.75, 0.95),
+                    line_width=1.5,
+                )
+                guide_handles.append(handle)
+            ts = [float(np.dot(_as_vec3(c.get('center', origin)) - origin, axis)) for c in circles] or [0.0]
+            t_lo, t_hi = min(ts) - 3.0, max(ts) + 3.0
+            if abs(t_hi - t_lo) < 4.0:
+                t_lo, t_hi = -8.0, 8.0
+            p0 = _globalize_cm(origin + axis * t_lo) / 100.0
+            p1 = _globalize_cm(origin + axis * t_hi) / 100.0
+            axis_h = server.scene.add_line_segments(
+                f"/guides/group_{group.get('id', gi)}/axis",
+                points=np.array([[p0, p1]]),
+                colors=(1.0, 0.85, 0.2),
+                line_width=3.0,
+            )
+            guide_handles.append(axis_h)
+
         # Build absorbers
         absorbers = []
         angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
