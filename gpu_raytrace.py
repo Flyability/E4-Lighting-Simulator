@@ -1,12 +1,16 @@
 """
-GPU-accelerated ray tracing using CuPy (NVIDIA CUDA).
+GPU-accelerated ray tracing with multi-vendor support.
 Provides drop-in replacements for the CPU multiprocessing workers
 in interactive_lighting.py, processing ALL rays in parallel on GPU.
 
-Falls back to CPU (NumPy) automatically if CuPy/CUDA is not available.
+Backend priority:
+  1. CUDA (NVIDIA) via CuPy - reuses the existing vectorized NumPy-style code path.
+  2. Vulkan (Intel Arc / AMD / Apple / any Vulkan-capable GPU) via Taichi kernels.
+  3. CPU (NumPy) fallback if no GPU backend is available.
 
-IMPORTANT: CuPy is lazily initialized on first use to avoid loading CUDA
-in multiprocessing worker subprocesses (which causes memory errors and spam).
+IMPORTANT: CuPy/Taichi are lazily initialized on first use to avoid loading
+GPU drivers in multiprocessing worker subprocesses (which causes memory errors
+and spam).
 """
 
 import numpy as np
@@ -14,10 +18,12 @@ import time
 import warnings
 
 # --- Lazy GPU initialization ---
-# We do NOT import CuPy at module level to prevent multiprocessing workers
-# (which import this module) from each loading CUDA DLLs (causes MemoryError).
+# We do NOT import CuPy/Taichi at module level to prevent multiprocessing workers
+# (which import this module) from each loading GPU drivers (causes MemoryError).
 GPU_AVAILABLE = None  # None = not yet checked, True/False after _ensure_gpu_init()
-_cp = None  # Will hold cupy module after lazy init
+GPU_BACKEND = None  # 'cuda' | 'taichi' | 'cpu' after _ensure_gpu_init()
+_cp = None  # Will hold cupy module after lazy init (backend == 'cuda')
+_ti = None  # Will hold taichi module after lazy init (backend == 'taichi')
 
 
 def _preload_pip_cuda_libs():
@@ -52,11 +58,15 @@ def _preload_pip_cuda_libs():
 
 
 def _ensure_gpu_init():
-    """Lazily initialize CuPy/CUDA on first use. Thread-safe via GIL."""
-    global GPU_AVAILABLE, _cp
+    """Lazily initialize a GPU backend on first use. Thread-safe via GIL.
+
+    Tries NVIDIA CUDA (CuPy) first, then falls back to Vulkan (Taichi) which
+    works on Intel Arc, AMD, and Apple Silicon GPUs, then finally CPU.
+    """
+    global GPU_AVAILABLE, GPU_BACKEND, _cp, _ti
     if GPU_AVAILABLE is not None:
         return  # Already initialized
-    
+
     try:
         _preload_pip_cuda_libs()
         with warnings.catch_warnings():
@@ -69,20 +79,367 @@ def _ensure_gpu_init():
         del _test
         _cp = cp_module
         GPU_AVAILABLE = True
+        GPU_BACKEND = 'cuda'
         sms = cp_module.cuda.Device(0).attributes.get('MultiProcessorCount', '?')
         gpu_name = cp_module.cuda.runtime.getDeviceProperties(0)['name'].decode()
         print(f"[GPU] CUDA acceleration enabled - CuPy {cp_module.__version__}, "
               f"GPU: {gpu_name}, SMs: {sms}")
+        return
     except Exception as e:
+        print(f"[GPU] CUDA not available ({e}), trying Vulkan (Intel Arc/AMD/Apple)...")
+
+    try:
+        _init_taichi_backend()
+        GPU_AVAILABLE = True
+        GPU_BACKEND = 'taichi'
+    except Exception as e2:
         GPU_AVAILABLE = False
-        _cp = None
-        print(f"[GPU] CUDA not available ({e}), using CPU fallback")
+        GPU_BACKEND = 'cpu'
+        _ti = None
+        print(f"[GPU] Vulkan not available ({e2}), using CPU fallback")
 
 
 def _xp():
-    """Return cupy if GPU is available, else numpy."""
+    """Return cupy if the CUDA backend is active, else numpy."""
     _ensure_gpu_init()
-    return _cp if GPU_AVAILABLE else np
+    return _cp if GPU_BACKEND == 'cuda' else np
+
+
+# --- Taichi/Vulkan backend (Intel Arc, AMD, Apple Silicon, or any Vulkan GPU) ---
+# Kernels are compiled lazily inside _init_taichi_backend() once Taichi/Vulkan
+# is confirmed available, and stored in these globals for reuse.
+_ti_generate_rays = None
+_ti_wall_finalize = None
+_ti_room_finalize = None
+
+
+def _init_taichi_backend():
+    """Initialize Taichi with the Vulkan arch and compile the ray-tracing kernels.
+
+    Raises on failure (no Vulkan-capable GPU/driver found) so the caller can
+    fall back to CPU.
+    """
+    global _ti, _ti_generate_rays, _ti_wall_finalize, _ti_room_finalize
+    import taichi as ti_module
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        ti_module.init(arch=ti_module.vulkan, log_level=ti_module.WARN)
+
+    @ti_module.kernel
+    def _smoke_test() -> ti_module.f32:
+        return 1.0 + 1.0
+
+    if float(_smoke_test()) != 2.0:
+        raise RuntimeError("Taichi Vulkan smoke test failed")
+
+    @ti_module.kernel
+    def generate_rays(positions: ti_module.types.ndarray(), directions: ti_module.types.ndarray(),
+                       viewing: ti_module.types.ndarray(), led_lumens: ti_module.types.ndarray(),
+                       abs_center: ti_module.types.ndarray(), abs_half: ti_module.types.ndarray(),
+                       abs_rot: ti_module.types.ndarray(),
+                       out_positions: ti_module.types.ndarray(), out_dirs: ti_module.types.ndarray(),
+                       out_lumens: ti_module.types.ndarray(), out_absorbed: ti_module.types.ndarray(),
+                       num_rays: ti_module.i32, rays_per_led: ti_module.i32, num_absorbers: ti_module.i32,
+                       n_val: ti_module.f32, norm_factor: ti_module.f32, rays_per_led_f: ti_module.f32):
+        for idx in range(num_rays):
+            led_idx = idx // rays_per_led
+            pos = ti_module.Vector([positions[led_idx, 0], positions[led_idx, 1], positions[led_idx, 2]])
+            z_axis = ti_module.Vector([directions[led_idx, 0], directions[led_idx, 1], directions[led_idx, 2]])
+            va = viewing[led_idx]
+
+            up = ti_module.Vector([0.0, 0.0, 1.0])
+            if ti_module.abs(z_axis[2]) >= 0.9:
+                up = ti_module.Vector([0.0, 1.0, 0.0])
+            x_axis = z_axis.cross(up).normalized()
+            y_axis = z_axis.cross(x_axis)
+
+            u1 = ti_module.random(ti_module.f32)
+            u2 = ti_module.random(ti_module.f32)
+            max_theta = ti_module.math.radians(va / 2.0)
+            cos_max = ti_module.cos(max_theta)
+            cos_theta = ti_module.math.clamp(1.0 - u1 * (1.0 - cos_max), -1.0, 1.0)
+            theta = ti_module.acos(cos_theta)
+            phi = 2.0 * 3.14159265 * u2
+            sin_theta = ti_module.sin(theta)
+            local_dir = ti_module.Vector([sin_theta * ti_module.cos(phi), sin_theta * ti_module.sin(phi), cos_theta])
+            world_dir = (local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis).normalized()
+
+            cos_tc = ti_module.math.clamp(cos_theta, 0.0, 1.0)
+            intensity = ti_module.pow(cos_tc, n_val)
+            lumens_per_ray = (led_lumens[led_idx] / rays_per_led_f) * intensity * norm_factor
+
+            absorbed = 0
+            for a in range(num_absorbers):
+                center = ti_module.Vector([abs_center[a, 0], abs_center[a, 1], abs_center[a, 2]])
+                half = ti_module.Vector([abs_half[a, 0], abs_half[a, 1], abs_half[a, 2]])
+                rel = pos - center
+                local_o = ti_module.Vector([0.0, 0.0, 0.0])
+                local_d = ti_module.Vector([0.0, 0.0, 0.0])
+                for r in ti_module.static(range(3)):
+                    s_o = 0.0
+                    s_d = 0.0
+                    for c in ti_module.static(range(3)):
+                        s_o += abs_rot[a, r, c] * rel[c]
+                        s_d += abs_rot[a, r, c] * world_dir[c]
+                    local_o[r] = s_o
+                    local_d[r] = s_d
+
+                tmin = -1e30
+                tmax = 1e30
+                hit_box = 1
+                for k in ti_module.static(range(3)):
+                    if ti_module.abs(local_d[k]) < 1e-12:
+                        if local_o[k] < -half[k] or local_o[k] > half[k]:
+                            hit_box = 0
+                    else:
+                        inv_d = 1.0 / local_d[k]
+                        t1 = (-half[k] - local_o[k]) * inv_d
+                        t2 = (half[k] - local_o[k]) * inv_d
+                        tnear = ti_module.min(t1, t2)
+                        tfar = ti_module.max(t1, t2)
+                        if tnear > tmin:
+                            tmin = tnear
+                        if tfar < tmax:
+                            tmax = tfar
+                if hit_box == 1 and tmin <= tmax and tmax > 0:
+                    absorbed = 1
+
+            out_positions[idx, 0] = pos[0]
+            out_positions[idx, 1] = pos[1]
+            out_positions[idx, 2] = pos[2]
+            out_dirs[idx, 0] = world_dir[0]
+            out_dirs[idx, 1] = world_dir[1]
+            out_dirs[idx, 2] = world_dir[2]
+            out_lumens[idx] = lumens_per_ray
+            out_absorbed[idx] = absorbed
+
+    @ti_module.kernel
+    def wall_finalize(positions: ti_module.types.ndarray(), dirs: ti_module.types.ndarray(),
+                       lumens: ti_module.types.ndarray(), absorbed: ti_module.types.ndarray(),
+                       grid: ti_module.types.ndarray(), num_rays: ti_module.i32, wall_dist: ti_module.f32,
+                       half_size: ti_module.f32, cell_size: ti_module.f32, grid_size: ti_module.i32,
+                       cell_area_m2: ti_module.f32):
+        for idx in range(num_rays):
+            if absorbed[idx] == 0:
+                dx = dirs[idx, 0]
+                if dx > 0:
+                    t = (wall_dist - positions[idx, 0]) / dx
+                    if t > 0:
+                        hit_y = positions[idx, 1] + dirs[idx, 1] * t
+                        hit_z = positions[idx, 2] + dirs[idx, 2] * t
+                        gy = ti_module.cast((hit_y + half_size) / cell_size, ti_module.i32)
+                        gz = ti_module.cast((hit_z + half_size) / cell_size, ti_module.i32)
+                        if 0 <= gy < grid_size and 0 <= gz < grid_size:
+                            lux = lumens[idx] / cell_area_m2
+                            grid[gz, gy] += lux
+
+    @ti_module.kernel
+    def room_finalize(positions: ti_module.types.ndarray(), dirs: ti_module.types.ndarray(),
+                       lumens: ti_module.types.ndarray(), absorbed: ti_module.types.ndarray(),
+                       grid_front: ti_module.types.ndarray(), grid_left: ti_module.types.ndarray(),
+                       grid_right: ti_module.types.ndarray(), grid_top: ti_module.types.ndarray(),
+                       grid_bottom: ti_module.types.ndarray(), grid_back: ti_module.types.ndarray(),
+                       hits: ti_module.types.ndarray(),
+                       col_add: ti_module.types.ndarray(), col_scale: ti_module.types.ndarray(),
+                       row_add: ti_module.types.ndarray(), row_scale: ti_module.types.ndarray(),
+                       rows: ti_module.types.ndarray(), cols: ti_module.types.ndarray(),
+                       area_m2: ti_module.types.ndarray(), c1_axis: ti_module.types.ndarray(),
+                       c2_axis: ti_module.types.ndarray(),
+                       num_rays: ti_module.i32, front_dist: ti_module.f32, side_dist: ti_module.f32,
+                       top_bottom_dist: ti_module.f32, back_dist: ti_module.f32, has_back: ti_module.i32,
+                       max_bounces: ti_module.i32, wall_reflectance: ti_module.f32):
+        for idx in range(num_rays):
+            if absorbed[idx] == 0:
+                ox = positions[idx, 0]
+                oy = positions[idx, 1]
+                oz = positions[idx, 2]
+                dx = dirs[idx, 0]
+                dy = dirs[idx, 1]
+                dz = dirs[idx, 2]
+                lpr = lumens[idx]
+                active = 1
+
+                for bounce in range(max_bounces + 1):
+                    if active == 1:
+                        best_t = 1e30
+                        best_wall = -1
+                        best_hx = 0.0
+                        best_hy = 0.0
+                        best_hz = 0.0
+
+                        if dx > 0:
+                            t = (front_dist - ox) / dx
+                            if t > 0 and t < best_t:
+                                best_t = t
+                                best_wall = 0
+                                best_hy = oy + dy * t
+                                best_hz = oz + dz * t
+                                best_hx = ox + dx * t
+                        if dy < 0:
+                            t = (-side_dist - oy) / dy
+                            if t > 0 and t < best_t:
+                                best_t = t
+                                best_wall = 1
+                                best_hx = ox + dx * t
+                                best_hy = oy + dy * t
+                                best_hz = oz + dz * t
+                        if dy > 0:
+                            t = (side_dist - oy) / dy
+                            if t > 0 and t < best_t:
+                                best_t = t
+                                best_wall = 2
+                                best_hx = ox + dx * t
+                                best_hy = oy + dy * t
+                                best_hz = oz + dz * t
+                        if dz > 0:
+                            t = (top_bottom_dist - oz) / dz
+                            if t > 0 and t < best_t:
+                                best_t = t
+                                best_wall = 3
+                                best_hx = ox + dx * t
+                                best_hy = oy + dy * t
+                                best_hz = oz + dz * t
+                        if dz < 0:
+                            t = (-top_bottom_dist - oz) / dz
+                            if t > 0 and t < best_t:
+                                best_t = t
+                                best_wall = 4
+                                best_hx = ox + dx * t
+                                best_hy = oy + dy * t
+                                best_hz = oz + dz * t
+                        if has_back == 1 and dx < 0:
+                            t = (-back_dist - ox) / dx
+                            if t > 0 and t < best_t:
+                                best_t = t
+                                best_wall = 5
+                                best_hx = ox + dx * t
+                                best_hy = oy + dy * t
+                                best_hz = oz + dz * t
+
+                        if best_wall < 0:
+                            active = 0
+                        else:
+                            w = best_wall
+                            c1 = best_hx
+                            if c1_axis[w] == 1:
+                                c1 = best_hy
+                            elif c1_axis[w] == 2:
+                                c1 = best_hz
+                            c2 = best_hy
+                            if c2_axis[w] == 0:
+                                c2 = best_hx
+                            elif c2_axis[w] == 2:
+                                c2 = best_hz
+
+                            col = ti_module.cast((c1 + col_add[w]) * col_scale[w], ti_module.i32)
+                            row = ti_module.cast((c2 + row_add[w]) * row_scale[w], ti_module.i32)
+                            col = ti_module.min(ti_module.max(col, 0), cols[w] - 1)
+                            row = ti_module.min(ti_module.max(row, 0), rows[w] - 1)
+                            ray_lux = lpr / area_m2[w]
+
+                            if w == 0:
+                                grid_front[row, col] += ray_lux
+                            elif w == 1:
+                                grid_left[row, col] += ray_lux
+                            elif w == 2:
+                                grid_right[row, col] += ray_lux
+                            elif w == 3:
+                                grid_top[row, col] += ray_lux
+                            elif w == 4:
+                                grid_bottom[row, col] += ray_lux
+                            elif w == 5:
+                                grid_back[row, col] += ray_lux
+                            hits[w] += 1
+
+                            if bounce < max_bounces and wall_reflectance > 0.0:
+                                nx, ny, nz = 0.0, 0.0, 0.0
+                                tx, ty, tz = 0.0, 0.0, 0.0
+                                bx, by, bz = 0.0, 0.0, 0.0
+                                if w == 0:
+                                    nx, ny, nz = -1.0, 0.0, 0.0
+                                    tx, ty, tz = 0.0, 1.0, 0.0
+                                    bx, by, bz = 0.0, 0.0, -1.0
+                                elif w == 1:
+                                    nx, ny, nz = 0.0, 1.0, 0.0
+                                    tx, ty, tz = 1.0, 0.0, 0.0
+                                    bx, by, bz = 0.0, 0.0, -1.0
+                                elif w == 2:
+                                    nx, ny, nz = 0.0, -1.0, 0.0
+                                    tx, ty, tz = 1.0, 0.0, 0.0
+                                    bx, by, bz = 0.0, 0.0, 1.0
+                                elif w == 3:
+                                    nx, ny, nz = 0.0, 0.0, -1.0
+                                    tx, ty, tz = 1.0, 0.0, 0.0
+                                    bx, by, bz = 0.0, -1.0, 0.0
+                                elif w == 4:
+                                    nx, ny, nz = 0.0, 0.0, 1.0
+                                    tx, ty, tz = 1.0, 0.0, 0.0
+                                    bx, by, bz = 0.0, 1.0, 0.0
+                                else:
+                                    nx, ny, nz = 1.0, 0.0, 0.0
+                                    tx, ty, tz = 0.0, 1.0, 0.0
+                                    bx, by, bz = 0.0, 0.0, 1.0
+
+                                ox = best_hx + nx * 0.01
+                                oy = best_hy + ny * 0.01
+                                oz = best_hz + nz * 0.01
+
+                                bu1 = ti_module.random(ti_module.f32)
+                                bu2 = ti_module.random(ti_module.f32)
+                                br = ti_module.sqrt(bu1)
+                                bphi = 2.0 * 3.14159265 * bu2
+                                blx = br * ti_module.cos(bphi)
+                                bly = br * ti_module.sin(bphi)
+                                blz = ti_module.sqrt(ti_module.max(0.0, 1.0 - bu1))
+
+                                ndx = blx * tx + bly * bx + blz * nx
+                                ndy = blx * ty + bly * by + blz * ny
+                                ndz = blx * tz + bly * bz + blz * nz
+                                nnorm = ti_module.sqrt(ndx * ndx + ndy * ndy + ndz * ndz)
+                                nnorm = ti_module.max(nnorm, 1e-10)
+                                dx = ndx / nnorm
+                                dy = ndy / nnorm
+                                dz = ndz / nnorm
+
+                                lpr = lpr * wall_reflectance
+                                if lpr <= 1e-8:
+                                    active = 0
+                            else:
+                                active = 0
+
+    _ti = ti_module
+    _ti_generate_rays = generate_rays
+    _ti_wall_finalize = wall_finalize
+    _ti_room_finalize = room_finalize
+    print(f"[GPU] Vulkan acceleration enabled - Taichi {ti_module.__version__}, "
+          f"backend: {ti_module.lang.impl.current_cfg().arch}")
+
+
+def _prepare_absorber_arrays(absorbers):
+    """Flatten absorber box list into fixed-size arrays for the Taichi kernel."""
+    k = len(absorbers)
+    if k == 0:
+        return (np.zeros((1, 3), dtype=np.float32), np.zeros((1, 3), dtype=np.float32),
+                np.zeros((1, 3, 3), dtype=np.float32), 0)
+    center = np.zeros((k, 3), dtype=np.float32)
+    half = np.zeros((k, 3), dtype=np.float32)
+    rot = np.zeros((k, 3, 3), dtype=np.float32)
+    for i, a in enumerate(absorbers):
+        center[i] = np.array(a['center'], dtype=np.float32)
+        half[i] = np.array(a['half_sizes'], dtype=np.float32)
+        rotation = a.get('rotation', None)
+        if rotation is not None:
+            qw, qx, qy, qz = rotation
+            R = np.array([
+                [1 - 2 * (qy**2 + qz**2), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+                [2 * (qx * qy + qw * qz), 1 - 2 * (qx**2 + qz**2), 2 * (qy * qz - qw * qx)],
+                [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx**2 + qy**2)]
+            ], dtype=np.float32)
+            rot[i] = R.T  # inverse rotation (R is orthonormal)
+        else:
+            rot[i] = np.eye(3, dtype=np.float32)
+    return center, half, rot, k
 
 
 def _calculate_lambertian_exponent(viewing_angle, ray_uniformity):
@@ -201,7 +558,7 @@ def _stl_check_absorption(stl_mesh_data, ray_positions, world_dirs, absorbed, xp
     
     # Transfer to CPU for trimesh
     try:
-        if GPU_AVAILABLE:
+        if (GPU_BACKEND == 'cuda'):
             origins_cpu = _cp.asnumpy(ray_positions[indices]).astype(np.float64)
             dirs_cpu = _cp.asnumpy(world_dirs[indices]).astype(np.float64)
         else:
@@ -292,11 +649,75 @@ def _stl_check_absorption(stl_mesh_data, ray_positions, world_dirs, absorbed, xp
             continue
     
     # Mark absorbed rays
-    if GPU_AVAILABLE:
+    if (GPU_BACKEND == 'cuda'):
         hits_gpu = _cp.array(all_hits)
         absorbed[indices[hits_gpu]] = True
     else:
         absorbed[indices[all_hits]] = True
+
+
+def _taichi_process_led_wall_batch(leds_data, params):
+    """Vulkan/Taichi-accelerated single-wall ray tracing (Intel Arc/AMD/Apple GPUs)."""
+    wall_dist = params['wall_dist']
+    rays_per_led = params['rays_per_led']
+    grid_size = params['grid_size']
+    wall_size = params['wall_size']
+    lumens_per_led = params['lumens_per_led']
+    absorbers = params.get('absorbers', [])
+    ray_uniformity = params.get('ray_uniformity', 0.0)
+    stl_mesh_data = params.get('stl_mesh_data', None)
+    per_led_lumens = params.get('per_led_lumens', None)
+
+    cell_size = wall_size / grid_size
+    cell_area_m2 = (cell_size * cell_size) / 10000.0
+    half_size = wall_size / 2
+
+    num_leds = len(leds_data)
+    total_rays = num_leds * rays_per_led
+
+    t0 = time.perf_counter()
+
+    positions = np.array([ld['position'] for ld in leds_data], dtype=np.float32)
+    directions = np.array([ld['direction'] for ld in leds_data], dtype=np.float32)
+    viewing = np.array([ld['viewing_angle'] for ld in leds_data], dtype=np.float32)
+    if per_led_lumens is not None:
+        led_lumens = np.asarray(per_led_lumens, dtype=np.float32)
+    else:
+        led_lumens = np.full(num_leds, lumens_per_led, dtype=np.float32)
+
+    _ext_la = leds_data[0].get('ext_lens_angle', None)
+    n_val = _calculate_lambertian_exponent(
+        float(_ext_la) if _ext_la is not None else float(leds_data[0]['viewing_angle']), ray_uniformity)
+    cos_max_f = float(np.cos(np.radians(max(float(leds_data[0]['viewing_angle']), 120.0) / 2.0)))
+    denom = 1.0 - cos_max_f ** (n_val + 1.0)
+    norm_factor = (n_val + 1.0) * (1.0 - cos_max_f) / denom if denom > 1e-12 else 1.0
+
+    abs_center, abs_half, abs_rot, num_absorbers = _prepare_absorber_arrays(absorbers)
+
+    out_positions = np.zeros((total_rays, 3), dtype=np.float32)
+    out_dirs = np.zeros((total_rays, 3), dtype=np.float32)
+    out_lumens = np.zeros(total_rays, dtype=np.float32)
+    out_absorbed = np.zeros(total_rays, dtype=np.int32)
+
+    _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
+                       out_positions, out_dirs, out_lumens, out_absorbed,
+                       total_rays, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led))
+
+    if stl_mesh_data is not None:
+        absorbed_bool = out_absorbed.astype(bool)
+        _stl_check_absorption(stl_mesh_data, out_positions, out_dirs, absorbed_bool, np)
+        out_absorbed = absorbed_bool.astype(np.int32)
+
+    grid = np.zeros((grid_size, grid_size), dtype=np.float64)
+    _ti_wall_finalize(out_positions, out_dirs, out_lumens, out_absorbed, grid,
+                       total_rays, float(wall_dist), float(half_size), float(cell_size),
+                       grid_size, float(cell_area_m2))
+
+    t1 = time.perf_counter()
+    print(f"[GPU] Wall ray tracing (Vulkan): {total_rays:,} rays in {t1-t0:.2f}s "
+          f"({total_rays/(t1-t0)/1e6:.1f}M rays/s)")
+
+    return grid
 
 
 def gpu_process_led_wall_batch(leds_data, params):
@@ -314,6 +735,8 @@ def gpu_process_led_wall_batch(leds_data, params):
         grid: (grid_size, grid_size) numpy array with lux values
     """
     _ensure_gpu_init()
+    if GPU_BACKEND == 'taichi':
+        return _taichi_process_led_wall_batch(leds_data, params)
     xp = _xp()
     
     wall_dist = params['wall_dist']
@@ -380,7 +803,7 @@ def gpu_process_led_wall_batch(leds_data, params):
         # ---- Sample random directions in viewing cone ----
         # Use reproducible-ish random with unique seed per batch
         batch_seed = (42 + batch_start) % (2**32)
-        if GPU_AVAILABLE:
+        if (GPU_BACKEND == 'cuda'):
             rng = _cp.random.RandomState(seed=batch_seed)
             u1 = rng.uniform(0, 1, batch_size).astype(xp.float32)
             u2 = rng.uniform(0, 1, batch_size).astype(xp.float32)
@@ -468,7 +891,7 @@ def gpu_process_led_wall_batch(leds_data, params):
 
         # Atomic scatter-add to grid
         # grid[gz, gy] += lux for each valid hit
-        if GPU_AVAILABLE:
+        if (GPU_BACKEND == 'cuda'):
             flat_idx = valid_gz * grid_size + valid_gy
             _cp.add.at(grid_accum.ravel(), flat_idx, valid_lux)
         else:
@@ -478,22 +901,154 @@ def gpu_process_led_wall_batch(leds_data, params):
         rays_processed += batch_size
 
     # Synchronize GPU to ensure all work is complete before timing
-    if GPU_AVAILABLE:
+    if (GPU_BACKEND == 'cuda'):
         _cp.cuda.Stream.null.synchronize()
 
     t1 = time.perf_counter()
     
-    device = "GPU" if GPU_AVAILABLE else "CPU"
+    device = "GPU" if (GPU_BACKEND == 'cuda') else "CPU"
     print(f"[{device}] Wall ray tracing: {total_rays:,} rays in {t1-t0:.2f}s "
           f"({total_rays/(t1-t0)/1e6:.1f}M rays/s)")
 
     # Transfer back to CPU
-    if GPU_AVAILABLE:
+    if (GPU_BACKEND == 'cuda'):
         result = _cp.asnumpy(grid_accum)
     else:
         result = grid_accum
 
     return result
+
+
+def _taichi_process_room_batch(leds_data, params):
+    """Vulkan/Taichi-accelerated room (multi-wall) ray tracing (Intel Arc/AMD/Apple GPUs)."""
+    front_dist = params['front_dist']
+    side_dist = params['side_dist']
+    top_bottom_dist = params['top_bottom_dist']
+    back_dist = params.get('back_dist')
+    num_rays_per_led = params['num_rays_per_led']
+    grid_size = params['grid_size']
+    lumens_per_led = params['lumens_per_led']
+    absorbers = params.get('absorbers', [])
+    ray_uniformity = params.get('ray_uniformity', 0.0)
+    grid_shapes = params['grid_shapes']
+    wall_specs = params['wall_specs']
+    stl_mesh_data = params.get('stl_mesh_data', None)
+    per_led_lumens = params.get('per_led_lumens', None)
+    max_bounces = params.get('max_bounces', 0)
+    wall_reflectance = params.get('wall_reflectance', 0.0)
+
+    num_leds = len(leds_data)
+    rays_per_led = num_rays_per_led * grid_size * grid_size
+    total_rays = num_leds * rays_per_led
+
+    wall_order = ['front', 'left', 'right', 'top', 'bottom', 'back']
+    c1_axis_map = {'front': 1, 'left': 0, 'right': 0, 'top': 0, 'bottom': 0, 'back': 1}
+    c2_axis_map = {'front': 2, 'left': 2, 'right': 2, 'top': 1, 'bottom': 1, 'back': 2}
+
+    col_add = np.zeros(6, dtype=np.float32)
+    col_scale = np.zeros(6, dtype=np.float32)
+    row_add = np.zeros(6, dtype=np.float32)
+    row_scale = np.zeros(6, dtype=np.float32)
+    rows = np.ones(6, dtype=np.int32)
+    cols = np.ones(6, dtype=np.int32)
+    area_m2 = np.ones(6, dtype=np.float32)
+    c1_axis = np.zeros(6, dtype=np.int32)
+    c2_axis = np.zeros(6, dtype=np.int32)
+
+    grids = {}
+    has_back = 1 if (back_dist is not None and 'back' in wall_specs) else 0
+
+    for i, wall_name in enumerate(wall_order):
+        if wall_name not in wall_specs:
+            grids[wall_name] = np.zeros((1, 1), dtype=np.float64)
+            continue
+        spec = wall_specs[wall_name]
+        shape = grid_shapes[wall_name]
+        grids[wall_name] = np.zeros(shape, dtype=np.float64)
+        rows[i] = shape[0]
+        cols[i] = shape[1]
+        c1_axis[i] = c1_axis_map[wall_name]
+        c2_axis[i] = c2_axis_map[wall_name]
+
+        if wall_name in ('front', 'back'):
+            cw = spec['size_y'] / spec['grid_y']
+            ch = spec['size_z'] / spec['grid_z']
+            col_add[i] = spec['size_y'] / 2.0
+            col_scale[i] = 1.0 / cw
+            row_add[i] = spec['size_z'] / 2.0
+            row_scale[i] = 1.0 / ch
+        elif wall_name in ('left', 'right'):
+            cw = spec['size_x'] / spec['grid_x']
+            ch = spec['size_z'] / spec['grid_z']
+            col_add[i] = -spec['x_min']
+            col_scale[i] = 1.0 / cw
+            row_add[i] = spec['size_z'] / 2.0
+            row_scale[i] = 1.0 / ch
+        else:
+            cw = spec['size_x'] / spec['grid_x']
+            ch = spec['size_y'] / spec['grid_y']
+            col_add[i] = -spec['x_min']
+            col_scale[i] = 1.0 / cw
+            row_add[i] = spec['size_y'] / 2.0
+            row_scale[i] = 1.0 / ch
+        area_m2[i] = (cw * ch) / 10000.0
+
+    t0 = time.perf_counter()
+
+    positions = np.array([ld['position'] for ld in leds_data], dtype=np.float32)
+    directions = np.array([ld['direction'] for ld in leds_data], dtype=np.float32)
+    viewing = np.array([ld['viewing_angle'] for ld in leds_data], dtype=np.float32)
+    if per_led_lumens is not None:
+        led_lumens = np.asarray(per_led_lumens, dtype=np.float32)
+    else:
+        led_lumens = np.full(num_leds, lumens_per_led, dtype=np.float32)
+
+    _ext_la = leds_data[0].get('ext_lens_angle', None)
+    n_val = _calculate_lambertian_exponent(
+        float(_ext_la) if _ext_la is not None else float(leds_data[0]['viewing_angle']), ray_uniformity)
+    cos_max_f = float(np.cos(np.radians(float(leds_data[0]['viewing_angle']) / 2.0)))
+    denom = 1.0 - cos_max_f ** (n_val + 1.0)
+    norm_factor = (n_val + 1.0) * (1.0 - cos_max_f) / denom if denom > 1e-12 else 1.0
+
+    abs_center, abs_half, abs_rot, num_absorbers = _prepare_absorber_arrays(absorbers)
+
+    out_positions = np.zeros((total_rays, 3), dtype=np.float32)
+    out_dirs = np.zeros((total_rays, 3), dtype=np.float32)
+    out_lumens = np.zeros(total_rays, dtype=np.float32)
+    out_absorbed = np.zeros(total_rays, dtype=np.int32)
+
+    _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
+                       out_positions, out_dirs, out_lumens, out_absorbed,
+                       total_rays, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led))
+
+    if stl_mesh_data is not None:
+        absorbed_bool = out_absorbed.astype(bool)
+        _stl_check_absorption(stl_mesh_data, out_positions, out_dirs, absorbed_bool, np)
+        out_absorbed = absorbed_bool.astype(np.int32)
+
+    hits = np.zeros(6, dtype=np.int32)
+    _ti_room_finalize(out_positions, out_dirs, out_lumens, out_absorbed,
+                       grids['front'], grids['left'], grids['right'],
+                       grids['top'], grids['bottom'], grids['back'],
+                       hits, col_add, col_scale, row_add, row_scale, rows, cols, area_m2,
+                       c1_axis, c2_axis, total_rays, float(front_dist), float(side_dist),
+                       float(top_bottom_dist), float(back_dist) if back_dist is not None else 0.0,
+                       has_back, int(max_bounces), float(wall_reflectance))
+
+    t1 = time.perf_counter()
+    ray_hits = {}
+    result_grids = {}
+    total_counted = 0
+    for i, wall_name in enumerate(wall_order):
+        if wall_name in wall_specs:
+            ray_hits[wall_name] = int(hits[i])
+            result_grids[wall_name] = grids[wall_name]
+            total_counted += int(hits[i])
+
+    print(f"[GPU] Room ray tracing (Vulkan): {total_rays:,} rays in {t1-t0:.2f}s "
+          f"({total_rays/(t1-t0)/1e6:.1f}M rays/s), {total_counted:,} wall hits")
+
+    return result_grids, ray_hits, total_rays
 
 
 def gpu_process_room_batch(leds_data, params):
@@ -514,6 +1069,8 @@ def gpu_process_room_batch(leds_data, params):
         total_rays: int
     """
     _ensure_gpu_init()
+    if GPU_BACKEND == 'taichi':
+        return _taichi_process_room_batch(leds_data, params)
     xp = _xp()
 
     front_dist = params['front_dist']
@@ -590,7 +1147,7 @@ def gpu_process_room_batch(leds_data, params):
         y_axes = xp.cross(z_axes, x_axes)
 
         # Random sampling
-        if GPU_AVAILABLE:
+        if (GPU_BACKEND == 'cuda'):
             rng = _cp.random.RandomState(seed=42 + batch_start)
             u1 = rng.uniform(0, 1, batch_size).astype(xp.float32)
             u2 = rng.uniform(0, 1, batch_size).astype(xp.float32)
@@ -764,7 +1321,7 @@ def gpu_process_room_batch(leds_data, params):
                 col = xp.clip(gi, 0, shape[1] - 1)
 
             flat_idx = row * shape[1] + col
-            if GPU_AVAILABLE:
+            if (GPU_BACKEND == 'cuda'):
                 _cp.add.at(grids[wall_name].ravel(), flat_idx, ray_lux.astype(xp.float64))
             else:
                 np.add.at(grids[wall_name].ravel(), flat_idx.astype(np.intp), ray_lux.astype(np.float64))
@@ -807,7 +1364,7 @@ def gpu_process_room_batch(leds_data, params):
                 bounce_oz = bounce_oz + n_xyz[:, 2] * 0.01
                 
                 # Generate cosine-weighted reflected directions (Malley's method)
-                if GPU_AVAILABLE:
+                if (GPU_BACKEND == 'cuda'):
                     rng_b = _cp.random.RandomState(seed=(42 + batch_start + (bounce_i + 1) * 31337) % (2**31))
                     bu1 = rng_b.uniform(0, 1, batch_size).astype(xp.float32)
                     bu2 = rng_b.uniform(0, 1, batch_size).astype(xp.float32)
@@ -903,7 +1460,7 @@ def gpu_process_room_batch(leds_data, params):
                     row_b = xp.clip(gj_b, 0, shape[0] - 1)
                     col_b = xp.clip(gi_b, 0, shape[1] - 1)
                     flat_b = row_b * shape[1] + col_b
-                    if GPU_AVAILABLE:
+                    if (GPU_BACKEND == 'cuda'):
                         _cp.add.at(grids[wall_name].ravel(), flat_b, ray_lux_b.astype(xp.float64))
                     else:
                         np.add.at(grids[wall_name].ravel(), flat_b.astype(np.intp), ray_lux_b.astype(np.float64))
@@ -920,11 +1477,11 @@ def gpu_process_room_batch(leds_data, params):
                 bounce_active = bounce_active & (bounce_lpr > 1e-8)
 
     # Synchronize GPU to ensure all work is complete before timing
-    if GPU_AVAILABLE:
+    if (GPU_BACKEND == 'cuda'):
         _cp.cuda.Stream.null.synchronize()
 
     t1 = time.perf_counter()
-    device = "GPU" if GPU_AVAILABLE else "CPU"
+    device = "GPU" if (GPU_BACKEND == 'cuda') else "CPU"
     total_counted = sum(ray_hits.values())
     print(f"[{device}] Room ray tracing: {total_rays:,} rays in {t1-t0:.2f}s "
           f"({total_rays/(t1-t0)/1e6:.1f}M rays/s), {total_counted:,} wall hits")
@@ -932,6 +1489,6 @@ def gpu_process_room_batch(leds_data, params):
     # Transfer to CPU
     result_grids = {}
     for wn, g in grids.items():
-        result_grids[wn] = _cp.asnumpy(g) if GPU_AVAILABLE else g.copy()
+        result_grids[wn] = _cp.asnumpy(g) if (GPU_BACKEND == 'cuda') else g.copy()
 
     return result_grids, ray_hits, total_rays
