@@ -86,10 +86,17 @@ class Problem:
     def __init__(self, base_cfg, variables, wall: WallSettings, camera: CameraSpec,
                  emission: EmissionSettings | None = None, objective: ObjectiveSpec | None = None,
                  constraints: ConstraintSpec | None = None, clear_base=False, name="optim",
-                 wall_dists=None):
+                 wall_dists=None, use_gpu=False, stl_mesh=None, diffuser=None):
         """``wall_dists``: optional list of distances (cm); the score is averaged over them
-        so a layout is optimised for a range instead of a single wall distance."""
+        so a layout is optimised for a range instead of a single wall distance.
+
+        ``use_gpu`` traces on the GPU backend (single process only). ``stl_mesh`` /
+        ``diffuser`` are forwarded to ``build_scene_from_config`` so the UI scene is
+        reproduced exactly."""
         self.name = name
+        self.use_gpu = bool(use_gpu)
+        self.stl_mesh = stl_mesh
+        self.diffuser = diffuser
         self.base_cfg = copy.deepcopy(base_cfg)
         if clear_base:
             self.base_cfg['custom_groups'] = []
@@ -152,7 +159,8 @@ class Problem:
         Lets a hand-made design be compared with optimiser output on identical
         wall / camera / emission settings.
         """
-        scene = build_scene_from_config(cfg, default_lumens=self.emission.default_lumens)
+        scene = build_scene_from_config(cfg, default_lumens=self.emission.default_lumens,
+                                        stl_mesh=self.stl_mesh, diffuser=self.diffuser)
         active = scene.active_leds
         penalties = self._geometry_penalties(active)
 
@@ -163,8 +171,8 @@ class Problem:
         scores, unis, e_avgs, covs, grids, last_metrics = [], [], [], [], [], None
         for wall, fov_mask in zip(self.walls, self._fov_masks):
             grid = compute_wall_intensity(scene.leds, wall, self.emission, absorbers=scene.absorbers,
-                                          stl_mesh_data=scene.stl_mesh_data, use_gpu=False, verbose=False,
-                                          parallel=False)
+                                          stl_mesh_data=scene.stl_mesh_data, use_gpu=self.use_gpu,
+                                          verbose=False, parallel=False)
             grid = np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
             fov = grid[fov_mask]
             coverage = float(np.count_nonzero(fov > 0) / max(1, fov.size))
@@ -226,13 +234,22 @@ class Problem:
         return pen
 
 
-def problem_from_spec(spec, spec_dir: Path | None = None) -> Problem:
-    """Build a Problem from a JSON-like spec dict (see optimization_specs/*.json)."""
+def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **problem_kwargs) -> Problem:
+    """Build a Problem from a JSON-like spec dict (see optimization_specs/*.json).
+
+    ``base_cfg`` overrides ``spec['base_config']`` (e.g. the live UI scene); extra
+    keyword arguments are forwarded to ``Problem`` (``stl_mesh``, ``diffuser``...).
+    """
     spec_dir = Path(spec_dir or ".")
-    base_path = Path(spec['base_config'])
-    if not base_path.is_absolute() and not base_path.exists():
-        base_path = spec_dir / base_path
-    base_cfg = load_config(base_path)
+    if base_cfg is None:
+        base_path = Path(spec['base_config'])
+        if not base_path.is_absolute() and not base_path.exists():
+            base_path = spec_dir / base_path
+        base_cfg = load_config(base_path)
+        default_name = base_path.stem + "_optim"
+    else:
+        base_cfg = copy.deepcopy(base_cfg)
+        default_name = str(base_cfg.get('name') or 'scene').lower().replace(' ', '_') + "_optim"
 
     wall_spec = dict(spec.get('wall', {}))
     dist = wall_spec.get('wall_dist', 100.0)
@@ -249,9 +266,10 @@ def problem_from_spec(spec, spec_dir: Path | None = None) -> Problem:
     if clear_base:
         working['custom_groups'] = []
     variables = [variable_from_spec(v, working) for v in spec['variables']]
+    problem_kwargs.setdefault('use_gpu', bool(spec.get('use_gpu', False)))
     return Problem(base_cfg, variables, wall, camera, emission, objective, constraints,
-                   clear_base=clear_base, name=spec.get('name', base_path.stem + "_optim"),
-                   wall_dists=wall_dists)
+                   clear_base=clear_base, name=spec.get('name', default_name),
+                   wall_dists=wall_dists, **problem_kwargs)
 
 
 def load_spec(path):

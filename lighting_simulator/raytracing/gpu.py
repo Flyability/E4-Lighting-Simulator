@@ -705,8 +705,9 @@ def _taichi_process_led_wall_batch(leds_data, params):
                        grid_size, float(cell_area_m2))
 
     t1 = time.perf_counter()
-    print(f"[GPU] Wall ray tracing (Vulkan): {total_rays:,} rays in {t1-t0:.2f}s "
-          f"({total_rays/(t1-t0)/1e6:.1f}M rays/s)")
+    if params.get('verbose', True):
+        print(f"[GPU] Wall ray tracing (Vulkan): {total_rays:,} rays in {t1-t0:.2f}s "
+              f"({total_rays/(t1-t0)/1e6:.1f}M rays/s)")
 
     return grid
 
@@ -898,8 +899,9 @@ def gpu_process_led_wall_batch(leds_data, params):
     t1 = time.perf_counter()
     
     device = "GPU" if (GPU_BACKEND == 'cuda') else "CPU"
-    print(f"[{device}] Wall ray tracing: {total_rays:,} rays in {t1-t0:.2f}s "
-          f"({total_rays/(t1-t0)/1e6:.1f}M rays/s)")
+    if params.get('verbose', True):
+        print(f"[{device}] Wall ray tracing: {total_rays:,} rays in {t1-t0:.2f}s "
+              f"({total_rays/(t1-t0)/1e6:.1f}M rays/s)")
 
     # Transfer back to CPU
     if (GPU_BACKEND == 'cuda'):

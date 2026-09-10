@@ -24,7 +24,10 @@ import viser
 import time
 import json
 import os
+import copy
 import hashlib
+import threading as _threading
+import traceback as _traceback
 import trimesh
 import webbrowser as _wb
 import socket as _socket
@@ -66,6 +69,12 @@ from lighting_simulator.simulation import (
 )
 from lighting_simulator.simulation import wall as _wall_engine
 from lighting_simulator.simulation import room as _room_engine
+from lighting_simulator.simulation import gpu_backend as _gpu_backend
+from lighting_simulator.optimization import (
+    OptimizerSpec as _OptimizerSpec,
+    problem_from_spec as _problem_from_spec,
+    run as _run_optimization,
+)
 from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
 from lighting_simulator.scene.absorbers import build_elios_absorbers, rotate_absorbers_z
 from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
@@ -213,6 +222,7 @@ def main():
     tab_panels = main_tabs.add_tab("Panels & LEDs")
     tab_fov = main_tabs.add_tab("FOV")
     tab_advanced = main_tabs.add_tab("Advanced")
+    tab_optim = main_tabs.add_tab("Optimize")
 
     # Display / Global: full-height left dock. Intensity Map is *not* stacked
     # above this (Viser's dock_below split defaults to 50/50 and cannot be
@@ -9756,6 +9766,473 @@ def main():
     
     # Button for room intensity map update
     update_room_button.on_click(lambda _: update_room_intensity_map())
+
+    # =====================================================================
+    # Optimize tab — runs lighting_simulator.optimization in a background thread
+    # =====================================================================
+    optim_specs_dir = ("optimization_specs" if os.path.isdir("optimization_specs")
+                       else os.path.join(_project_root, "optimization_specs"))
+    optim_output_dir = os.path.join("exports", "optim") if os.path.isdir("exports") \
+        else os.path.join(_project_root, "exports", "optim")
+    _OPTIM_NO_SPEC = "— none (build from UI) —"
+    _OPTIM_NO_GROUP = "(no custom groups)"
+    _optim_state = {
+        'thread': None, 'stop': _threading.Event(), 'budget': 1,
+        'best_cfg': None, 'evals': [], 'scores': [], 'bests': [], 'last_ui': 0.0,
+    }
+
+    def _optim_spec_names():
+        names = [_OPTIM_NO_SPEC]
+        if os.path.isdir(optim_specs_dir):
+            names += sorted((f[:-5] for f in os.listdir(optim_specs_dir) if f.lower().endswith(".json")),
+                            key=str.lower)
+        return names
+
+    def _optim_group_labels():
+        labels = []
+        for idx, g in enumerate(custom_groups):
+            name = (g.get('panel_slot_name') or g.get('template_name')
+                    or getattr(g.get('folder'), 'label', None) or f"Custom Group {g['id']}")
+            labels.append(f"{idx}: {name}")
+        return labels or [_OPTIM_NO_GROUP]
+
+    with tab_optim:
+        _optim_problem_folder = server.gui.add_folder("Problem")
+    with _optim_problem_folder:
+        server.gui.add_html(
+            "<div style='color:#888;font-size:12px;margin-bottom:6px;'>Optimise LED placement for wall "
+            "uniformity inside the main camera FOV. Pick a preset spec or build the problem from the "
+            "current scene; results are written to exports/optim/&lt;run name&gt;/.</div>"
+        )
+        optim_spec_dropdown = server.gui.add_dropdown(
+            "Preset spec", options=_optim_spec_names(), initial_value=_OPTIM_NO_SPEC,
+            hint="optimization_specs/*.json — fills the controls below",
+        )
+        optim_refresh_btn = server.gui.add_button("🔄 Refresh specs & groups")
+        optim_base_current = server.gui.add_checkbox(
+            "Start from current scene", initial_value=True,
+            hint="Off: start from the spec's base_config file",
+        )
+        optim_settings_current = server.gui.add_checkbox(
+            "Use UI wall / camera / emission", initial_value=True,
+            hint="Off: use the spec's wall, camera and emission sections",
+        )
+        optim_wall_dists = server.gui.add_text(
+            "Wall distances (cm)", initial_value="",
+            hint="Comma-separated; score is averaged over them. Empty = wall distance slider",
+        )
+        optim_grid = server.gui.add_slider(
+            "Wall grid resolution", min=5, max=200, step=5, initial_value=30,
+            hint="Cells per side of the evaluation grid (same meaning as in Intensity Map); coarser = faster",
+        )
+        optim_wall_size = server.gui.add_slider(
+            "Wall view size (cm)", min=100, max=2000, step=10, initial_value=int(wall_view_size.value),
+            hint="Physical extent of the evaluation grid; must cover the camera FOV footprint",
+        )
+        optim_rpp = server.gui.add_number("Rays per pixel", 300, min=10, max=100000, step=10)
+
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>Variables</div>")
+        optim_var_source = server.gui.add_dropdown(
+            "Variables from", options=["Selected group", "Preset spec"], initial_value="Selected group",
+        )
+        optim_group_dropdown = server.gui.add_dropdown("Group", options=_optim_group_labels())
+        optim_var_pose = server.gui.add_checkbox("Move / rotate group", initial_value=True)
+        optim_pos_delta = server.gui.add_vector3("± position (cm)", (2.0, 2.0, 2.0),
+                                                 min=(0.0, 0.0, 0.0), max=(50.0, 50.0, 50.0), step=0.5)
+        optim_rot_delta = server.gui.add_vector3("± rotation (°)", (15.0, 15.0, 20.0),
+                                                 min=(0.0, 0.0, 0.0), max=(180.0, 180.0, 180.0), step=1.0)
+        optim_var_tilts = server.gui.add_checkbox("Per-LED beam tilt (dynamic groups)", initial_value=False)
+        optim_tilt_range = server.gui.add_slider("± beam tilt (°)", min=5, max=90, step=5, initial_value=45)
+        optim_var_beam = server.gui.add_checkbox("Shared beam angle", initial_value=False)
+        optim_beam_range = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
+                                                       initial_value=(90, 130))
+        optim_var_states = server.gui.add_checkbox("LED on / off", initial_value=False)
+
+    with tab_optim:
+        _optim_obj_folder = server.gui.add_folder("Objective & constraints")
+    with _optim_obj_folder:
+        optim_metric = server.gui.add_dropdown(
+            "Metric", options=["u0", "u1", "cv"], initial_value="u0",
+            hint="u0 = Emin/Eavg, u1 = Emin/Emax, cv = σ/Eavg",
+        )
+        optim_min_pct = server.gui.add_slider("Emin percentile (%)", min=0.0, max=10.0, step=0.5, initial_value=2.0,
+                                              hint="0 = hard minimum (as in the legend)")
+        optim_cov_w = server.gui.add_slider("Coverage penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        optim_min_lux = server.gui.add_number("Min average lux (0 = off)", 0, min=0, step=10)
+        optim_lux_w = server.gui.add_slider("Lux penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        optim_max_leds = server.gui.add_number("Max active LEDs (0 = no limit)", 0, min=0, step=1)
+        optim_max_leds_w = server.gui.add_slider("Penalty per LED over limit", min=0.0, max=1.0, step=0.01,
+                                                 initial_value=0.05)
+        optim_led_cost = server.gui.add_slider("Cost per active LED", min=0.0, max=0.1, step=0.001, initial_value=0.0)
+        optim_spacing = server.gui.add_slider("Min LED spacing (cm, 0 = off)", min=0.0, max=10.0, step=0.1,
+                                              initial_value=0.0)
+        optim_spacing_w = server.gui.add_slider("Spacing penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        optim_keepout_html = server.gui.add_html(
+            "<div style='color:#888;font-size:12px;'>Keep-out boxes: none (defined in preset specs)</div>"
+        )
+
+    with tab_optim:
+        _optim_opt_folder = server.gui.add_folder("Optimizer")
+    with _optim_opt_folder:
+        optim_method = server.gui.add_dropdown(
+            "Method", options=["differential_evolution", "nelder_mead", "random_search"],
+            initial_value="differential_evolution",
+        )
+        optim_max_evals = server.gui.add_number("Max evaluations", 500, min=10, max=200000, step=10)
+        optim_population = server.gui.add_number("Population", 30, min=4, max=2000, step=1)
+        optim_seed = server.gui.add_number("Seed", 0, min=0, step=1)
+        optim_workers = server.gui.add_number("CPU workers (-1 = all cores)", 1, min=-1, max=128, step=1,
+                                              hint="Differential evolution only; ignored when the GPU is used")
+        optim_use_gpu = server.gui.add_checkbox(
+            "Use GPU", initial_value=_gpu_backend.HAS_GPU_MODULE,
+            hint="Single-process GPU tracing; falls back to CPU if no backend passes the self-test",
+        )
+        optim_polish = server.gui.add_checkbox("Polish with Nelder-Mead", initial_value=False)
+        optim_name = server.gui.add_text("Run name", initial_value="", hint="Output folder name; empty = auto")
+
+    with tab_optim:
+        _optim_run_folder = server.gui.add_folder("Run")
+    with _optim_run_folder:
+        optim_run_btn = server.gui.add_button("▶ Run optimization", color="green")
+        optim_stop_btn = server.gui.add_button("■ Stop", color="red", disabled=True)
+        optim_progress = server.gui.add_progress_bar(0.0)
+        optim_status_html = server.gui.add_html(
+            "<div style='color:#888;font-size:12px;'>Idle</div>"
+        )
+        optim_plot = server.gui.add_uplot(
+            data=(np.array([0.0]), np.array([0.0]), np.array([0.0])),
+            series=(
+                {"label": "eval"},
+                {"label": "score", "stroke": "#888888", "width": 1},
+                {"label": "best", "stroke": "#4CAF50", "width": 2},
+            ),
+            scales={"x": {"time": False}},
+            aspect=1.6,
+        )
+        optim_autoload = server.gui.add_checkbox("Load best into scene when finished", initial_value=True)
+        optim_load_btn = server.gui.add_button("📥 Load best into scene")
+        optim_save_name = server.gui.add_text("Save best as", initial_value="")
+        optim_save_btn = server.gui.add_button("💾 Save best to configs/")
+
+    def _optim_status(text, color="#ccc"):
+        optim_status_html.content = (
+            f"<div style='font-family:sans-serif;font-size:12px;color:{color};white-space:pre-wrap;'>{text}</div>"
+        )
+
+    def _optim_current_spec():
+        name = optim_spec_dropdown.value
+        if not name or name == _OPTIM_NO_SPEC:
+            return None, None
+        path = os.path.join(optim_specs_dir, f"{name}.json")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), os.path.dirname(os.path.abspath(path))
+
+    def _optim_apply_spec_to_controls(spec):
+        """Mirror a preset spec into the editable controls."""
+        wall = spec.get('wall', {})
+        dist = wall.get('wall_dist', 100)
+        optim_wall_dists.value = ", ".join(f"{d:g}" for d in (dist if isinstance(dist, list) else [dist]))
+        optim_grid.value = int(wall.get('grid_size', optim_grid.value))
+        optim_wall_size.value = int(wall.get('wall_size', optim_wall_size.value))
+        optim_rpp.value = int(wall.get('rays_per_pixel', optim_rpp.value))
+        obj = spec.get('objective', {})
+        optim_metric.value = obj.get('metric', 'u0')
+        optim_min_pct.value = float(obj.get('min_percentile', 0.0))
+        optim_cov_w.value = float(obj.get('coverage_weight', 1.0))
+        optim_min_lux.value = int(obj.get('min_avg_lux') or 0)
+        optim_lux_w.value = float(obj.get('lux_weight', 1.0))
+        con = spec.get('constraints', {})
+        optim_max_leds.value = int(con.get('max_leds') or 0)
+        optim_max_leds_w.value = float(con.get('max_leds_weight', 0.05))
+        optim_led_cost.value = float(con.get('led_cost', 0.0))
+        optim_spacing.value = float(con.get('min_led_spacing_cm') or 0.0)
+        optim_spacing_w.value = float(con.get('spacing_weight', 1.0))
+        n_keep = len(con.get('keep_out', []))
+        optim_keepout_html.content = (
+            f"<div style='color:#888;font-size:12px;'>Keep-out boxes: {n_keep} (from preset spec)</div>"
+        )
+        opt = spec.get('optimizer', {})
+        optim_method.value = opt.get('method', 'differential_evolution')
+        optim_max_evals.value = int(opt.get('max_evals', 300))
+        optim_population.value = int(opt.get('population', 20))
+        optim_seed.value = int(opt.get('seed', 0))
+        optim_workers.value = int(opt.get('workers', 1))
+        optim_polish.value = bool(opt.get('polish', False))
+        optim_name.value = spec.get('name', '')
+        optim_var_source.value = "Preset spec"
+        optim_base_current.value = False
+        optim_settings_current.value = False
+
+    @optim_spec_dropdown.on_update
+    def _(_):
+        try:
+            spec, _dir = _optim_current_spec()
+        except Exception as exc:
+            _optim_status(f"Could not read spec: {exc}", "#ff6666")
+            return
+        if spec is None:
+            optim_var_source.value = "Selected group"
+            optim_base_current.value = True
+            optim_settings_current.value = True
+            optim_keepout_html.content = (
+                "<div style='color:#888;font-size:12px;'>Keep-out boxes: none (defined in preset specs)</div>"
+            )
+            return
+        _optim_apply_spec_to_controls(spec)
+        _optim_status(f"Loaded preset '{optim_spec_dropdown.value}' — {len(spec.get('variables', []))} "
+                      f"variable group(s). Toggle the checkboxes above to reuse the current scene / UI settings.")
+
+    @optim_refresh_btn.on_click
+    def _(_):
+        cur = optim_spec_dropdown.value
+        optim_spec_dropdown.options = _optim_spec_names()
+        if cur in optim_spec_dropdown.options:
+            optim_spec_dropdown.value = cur
+        cur_g = optim_group_dropdown.value
+        optim_group_dropdown.options = _optim_group_labels()
+        if cur_g in optim_group_dropdown.options:
+            optim_group_dropdown.value = cur_g
+
+    def _optim_selected_group_index():
+        label = optim_group_dropdown.value or ""
+        if not label or label == _OPTIM_NO_GROUP or ':' not in label:
+            raise ValueError("Select a custom group (click 'Refresh specs & groups' after adding panels).")
+        idx = int(label.split(':', 1)[0])
+        if idx >= len(custom_groups):
+            raise ValueError("Group list is stale — click 'Refresh specs & groups'.")
+        return idx
+
+    def _optim_group_variables():
+        gi = _optim_selected_group_index()
+        group = custom_groups[gi]
+        variables = []
+        if optim_var_pose.value:
+            variables.append({'type': 'panel_pose', 'group_index': gi,
+                              'pos_delta': [float(v) for v in optim_pos_delta.value],
+                              'rot_delta': [float(v) for v in optim_rot_delta.value]})
+        if optim_var_tilts.value:
+            if not group.get('is_dynamic'):
+                raise ValueError("Per-LED beam tilt needs a dynamic (designer / template) group.")
+            t = float(optim_tilt_range.value)
+            variables.append({'type': 'beam_tilts', 'group_index': gi, 'tilt_range': [-t, t]})
+        if optim_var_beam.value:
+            lo, hi = optim_beam_range.value
+            variables.append({'type': 'beam_angle', 'group_index': gi, 'angle_range': [float(lo), float(hi)]})
+        if optim_var_states.value:
+            variables.append({'type': 'led_states', 'group_index': gi})
+        if not variables:
+            raise ValueError("Enable at least one variable checkbox.")
+        return variables
+
+    def _optim_build():
+        """Assemble (Problem, OptimizerSpec) from the preset spec and/or the UI controls."""
+        spec, spec_dir = _optim_current_spec()
+        use_spec_vars = optim_var_source.value == "Preset spec"
+        if use_spec_vars and spec is None:
+            raise ValueError("Pick a preset spec, or set 'Variables from' to 'Selected group'.")
+        work = copy.deepcopy(spec) if spec else {}
+
+        base_cfg = None
+        if optim_base_current.value or spec is None:
+            base_cfg = get_current_config()
+            base_cfg['name'] = current_config_name[0] or 'scene'
+            work.pop('base_config', None)
+
+        if optim_settings_current.value or spec is None:
+            work['wall'] = {'wall_dist': float(wall_dist_slider.value)}
+            work['camera'] = {'pos_x': float(camera_pos_x.value), 'pos_y': float(camera_pos_y.value),
+                              'pitch': float(camera_pitch.value), 'fov_h': float(camera_fov_h.value),
+                              'fov_v': float(camera_fov_v.value)}
+            work['emission'] = {'default_lumens': float(led_lumens_slider.value),
+                                'ray_uniformity': float(ray_uniformity_slider.value)}
+        work.setdefault('wall', {})
+        dists_txt = optim_wall_dists.value.strip()
+        if dists_txt:
+            work['wall']['wall_dist'] = [float(t) for t in dists_txt.replace(';', ',').split(',') if t.strip()]
+        work['wall']['grid_size'] = int(optim_grid.value)
+        work['wall']['wall_size'] = float(optim_wall_size.value)
+        work['wall']['rays_per_pixel'] = int(optim_rpp.value)
+
+        work['objective'] = {
+            'metric': optim_metric.value,
+            'min_percentile': float(optim_min_pct.value),
+            'coverage_weight': float(optim_cov_w.value),
+            'min_avg_lux': float(optim_min_lux.value) or None,
+            'lux_weight': float(optim_lux_w.value),
+        }
+        keep_out = (spec or {}).get('constraints', {}).get('keep_out', [])
+        work['constraints'] = {
+            'max_leds': int(optim_max_leds.value) or None,
+            'max_leds_weight': float(optim_max_leds_w.value),
+            'led_cost': float(optim_led_cost.value),
+            'min_led_spacing_cm': float(optim_spacing.value) or None,
+            'spacing_weight': float(optim_spacing_w.value),
+            'keep_out': keep_out,
+            'keep_out_weight': float((spec or {}).get('constraints', {}).get('keep_out_weight', 1.0)),
+        }
+
+        if not use_spec_vars:
+            work['variables'] = _optim_group_variables()
+            work['clear_base'] = False
+
+        run_name = optim_name.value.strip()
+        if run_name:
+            work['name'] = run_name
+        elif base_cfg is not None:
+            work['name'] = f"{str(base_cfg['name']).lower().replace(' ', '_')}_optim"
+
+        # Reproduce the live scene exactly: STL occluder and diffuser are UI-only state.
+        extra = {}
+        if base_cfg is not None:
+            if stl_absorber_enable.value and stl_mesh_data[0] is not None:
+                extra['stl_mesh'] = stl_mesh_data[0]
+            if diffuser_enable_chk.value:
+                extra['diffuser'] = (float(diffuser_angle_slider.value),
+                                     float(diffuser_transmission_slider.value) / 100.0)
+
+        problem = _problem_from_spec(work, spec_dir, base_cfg=base_cfg, use_gpu=optim_use_gpu.value, **extra)
+        opt = _OptimizerSpec(
+            method=optim_method.value, max_evals=int(optim_max_evals.value), seed=int(optim_seed.value),
+            population=int(optim_population.value), workers=int(optim_workers.value),
+            polish=bool(optim_polish.value), log_every=0,
+        )
+        return problem, opt
+
+    def _optim_refresh_ui(logger, final=False):
+        st = _optim_state
+        n_done = max(logger.n, logger.n_external)
+        optim_progress.value = float(min(100.0, 100.0 * n_done / max(1, st['budget'])))
+        best = logger.best
+        elapsed = time.perf_counter() - logger.t0
+        rate = n_done / elapsed if elapsed > 0 else 0.0
+        head = "Finished" if final else "Running"
+        _optim_status(
+            f"{head}: {n_done}/{st['budget']} evals, {elapsed:.0f}s ({rate:.1f} eval/s)"
+            + (" [GPU]" if logger.problem.use_gpu else " [CPU]")
+            + f"\nBest: {best.summary() if best else '—'}",
+            "#4CAF50" if final else "#ccc",
+        )
+        xs, ys, bs = st['evals'], st['scores'], st['bests']
+        if len(xs) > 1:
+            step = max(1, len(xs) // 1500)
+            optim_plot.data = (np.asarray(xs[::step], float), np.asarray(ys[::step], float),
+                               np.asarray(bs[::step], float))
+
+    def _optim_on_eval(logger, ev, x):
+        st = _optim_state
+        st['evals'].append(max(logger.n, logger.n_external))
+        st['scores'].append(ev.score)
+        st['bests'].append(logger.best.score)
+        now = time.perf_counter()
+        if now - st['last_ui'] >= 0.3:
+            st['last_ui'] = now
+            _optim_refresh_ui(logger)
+
+    def _optim_load_best():
+        cfg = _optim_state['best_cfg']
+        if cfg is None:
+            print("[optim] No optimised configuration yet.")
+            return
+        project_loaded[0] = True
+        current_config_name[0] = cfg.get('name', 'optim')
+        apply_config(cfg)
+        save_name_input.value = cfg.get('name', '')
+        optim_group_dropdown.options = _optim_group_labels()
+        if show_intensity_map.value:
+            update_intensity_map()
+        print(f"[optim] Loaded best configuration into the scene: {cfg.get('description', '')}")
+
+    def _optim_worker(problem, opt):
+        st = _optim_state
+        logger_ref = [None]
+
+        def on_eval(logger, ev, x):
+            logger_ref[0] = logger
+            _optim_on_eval(logger, ev, x)
+
+        try:
+            summary, _best = _run_optimization(problem, opt, output_dir=optim_output_dir,
+                                               on_eval=on_eval, stop_event=st['stop'])
+            best_path = os.path.join(optim_output_dir, problem.name, "best_config.json")
+            with open(best_path, "r", encoding="utf-8") as f:
+                st['best_cfg'] = json.load(f)
+            if logger_ref[0] is not None:
+                _optim_refresh_ui(logger_ref[0], final=True)
+            if summary.get('stopped'):
+                _optim_status(f"Stopped after {summary['evaluations']} evals.\nBest: {_best.summary()}\n"
+                              f"Saved: {best_path}", "#ffaa00")
+            else:
+                _optim_status(f"Finished: {summary['evaluations']} evals in {summary['elapsed_s']}s\n"
+                              f"Best: {_best.summary()}\nSaved: {best_path}", "#4CAF50")
+            if not optim_save_name.value.strip():
+                optim_save_name.value = problem.name
+            if optim_autoload.value:
+                _optim_load_best()
+        except Exception as exc:
+            _traceback.print_exc()
+            _optim_status(f"Optimisation failed: {exc}", "#ff6666")
+        finally:
+            st['thread'] = None
+            optim_run_btn.disabled = False
+            optim_stop_btn.disabled = True
+
+    @optim_run_btn.on_click
+    def _(_):
+        st = _optim_state
+        if st['thread'] is not None:
+            _optim_status("An optimisation is already running — press Stop first.", "#ffaa00")
+            return
+        try:
+            problem, opt = _optim_build()
+        except Exception as exc:
+            _traceback.print_exc()
+            _optim_status(f"Cannot build problem: {exc}", "#ff6666")
+            return
+        if problem.use_gpu:
+            _optim_status("Checking GPU backend…")
+            if not _gpu_backend.gpu_available():
+                problem.use_gpu = False
+                print("[optim] GPU requested but unavailable — using CPU.")
+        st['stop'].clear()
+        st['budget'] = opt.max_evals
+        st['best_cfg'] = None
+        st['evals'], st['scores'], st['bests'], st['last_ui'] = [], [], [], 0.0
+        optim_progress.value = 0.0
+        optim_plot.data = (np.array([0.0]), np.array([0.0]), np.array([0.0]))
+        optim_run_btn.disabled = True
+        optim_stop_btn.disabled = False
+        backend = _gpu_backend.gpu_backend_label() if problem.use_gpu else "CPU"
+        _optim_status(f"Starting '{problem.name}': {problem.dim} variables, {opt.max_evals} evals, "
+                      f"{len(problem.walls)} wall distance(s), {backend}…")
+        t = _threading.Thread(target=_optim_worker, args=(problem, opt), daemon=True, name="optimizer")
+        st['thread'] = t
+        t.start()
+
+    @optim_stop_btn.on_click
+    def _(_):
+        if _optim_state['thread'] is not None:
+            _optim_state['stop'].set()
+            _optim_status("Stopping after the current evaluation…", "#ffaa00")
+
+    optim_load_btn.on_click(lambda _: _optim_load_best())
+
+    @optim_save_btn.on_click
+    def _(_):
+        cfg = _optim_state['best_cfg']
+        if cfg is None:
+            _optim_status("Nothing to save yet — run an optimisation first.", "#ffaa00")
+            return
+        name = optim_save_name.value.strip()
+        if not name:
+            _optim_status("Enter a name in 'Save best as'.", "#ffaa00")
+            return
+        cfg = dict(cfg)
+        cfg['name'] = name
+        path = os.path.join(config_dir, f"{name.lower().replace(' ', '_')}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        config_dropdown.options = get_available_configs()
+        _optim_status(f"Saved best configuration to {path}", "#4CAF50")
 
     # Capture default values so reset restores them
     defaults = {

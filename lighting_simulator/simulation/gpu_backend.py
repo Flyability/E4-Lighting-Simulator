@@ -5,12 +5,17 @@ drivers. All engine code should go through this adapter instead of importing
 ``lighting_simulator.raytracing.gpu`` directly.
 """
 
+import threading
+
 try:
     from lighting_simulator.raytracing import gpu as _gpu
     HAS_GPU_MODULE = True
 except ImportError:  # pragma: no cover - only when optional deps are missing
     _gpu = None
     HAS_GPU_MODULE = False
+
+# One kernel launch at a time: the UI and a background optimiser may share the device.
+_gpu_lock = threading.Lock()
 
 # Relative flux mismatch (GPU vs CPU) above which the GPU backend is rejected.
 _SELF_TEST_TOLERANCE = 0.10
@@ -67,14 +72,15 @@ def gpu_available():
     global _self_test_passed
     if not HAS_GPU_MODULE:
         return False
-    _gpu._ensure_gpu_init()
-    if not _gpu.GPU_AVAILABLE:
-        return False
-    if _self_test_passed is None:
-        _self_test_passed = _self_test()
-        if not _self_test_passed:
-            _gpu.GPU_AVAILABLE = False
-            _gpu.GPU_BACKEND = 'cpu'
+    with _gpu_lock:
+        _gpu._ensure_gpu_init()
+        if not _gpu.GPU_AVAILABLE:
+            return False
+        if _self_test_passed is None:
+            _self_test_passed = _self_test()
+            if not _self_test_passed:
+                _gpu.GPU_AVAILABLE = False
+                _gpu.GPU_BACKEND = 'cpu'
     return bool(_self_test_passed)
 
 
@@ -96,8 +102,10 @@ def gpu_backend_label():
 
 
 def gpu_process_led_wall_batch(leds_data, params):
-    return _gpu.gpu_process_led_wall_batch(leds_data, params)
+    with _gpu_lock:
+        return _gpu.gpu_process_led_wall_batch(leds_data, params)
 
 
 def gpu_process_room_batch(leds_data, params):
-    return _gpu.gpu_process_room_batch(leds_data, params)
+    with _gpu_lock:
+        return _gpu.gpu_process_room_batch(leds_data, params)

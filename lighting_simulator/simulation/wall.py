@@ -181,6 +181,7 @@ def compute_wall_intensity(leds, settings: WallSettings, emission: EmissionSetti
             'absorbers': absorbers,
             'stl_mesh_data': None,  # GPU always traces without mesh
             'ray_uniformity': emission.ray_uniformity,
+            'verbose': verbose,
         }
         if verbose:
             print(f"[GPU] {gpu_backend.gpu_backend_label()} acceleration for {len(active)} LEDs...")

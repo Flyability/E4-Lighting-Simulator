@@ -1,0 +1,35 @@
+{
+  "name": "ludo_refine",
+  "evaluations": 12,
+  "elapsed_s": 0.11,
+  "best_score": 0.24125364683013673,
+  "best": {
+    "score": 0.24125364683013673,
+    "uniformity_pct": 75.87463531698633,
+    "coverage": 1.0,
+    "e_avg": 882.860322759265,
+    "n_active": 8,
+    "penalties": {
+      "coverage": 0.0
+    }
+  },
+  "best_x": {
+    "group0.dx": 0.0,
+    "group0.dy": 0.0,
+    "group0.dz": 0.0,
+    "group0.drot_x": 0.0,
+    "group0.drot_y": 0.0,
+    "group0.drot_z": 0.0
+  },
+  "optimizer": {
+    "method": "random_search",
+    "max_evals": 200,
+    "seed": 0,
+    "population": 5,
+    "workers": 1,
+    "polish": false,
+    "log_every": 0,
+    "x0": null
+  },
+  "stopped": true
+}

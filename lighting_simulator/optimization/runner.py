@@ -39,12 +39,20 @@ class OptimizerSpec:
     x0: list | None = None
 
 
+class OptimizationStopped(Exception):
+    """Raised inside the objective when the caller's ``stop_event`` is set."""
+
+
 class RunLogger:
-    def __init__(self, problem: Problem, out_dir: Path, log_every=10):
+    def __init__(self, problem: Problem, out_dir: Path, log_every=10, on_eval=None, stop_event=None):
+        """``on_eval(logger, evaluation, x)`` is called after every logged evaluation
+        (from the optimiser thread); ``stop_event`` (threading.Event) aborts the run."""
         self.problem = problem
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.log_every = log_every
+        self.on_eval = on_eval
+        self.stop_event = stop_event
         self.best: Evaluation | None = None
         self.best_x = None
         self.n = 0
@@ -68,6 +76,10 @@ class RunLogger:
             print(f"  [{self.n:5d}] NEW BEST {ev.summary()}")
         elif self.log_every and self.n % self.log_every == 0:
             print(f"  [{self.n:5d}] {ev.summary()}  (best {self.best.score:.4f})")
+        if self.on_eval is not None:
+            self.on_eval(self, ev, x)
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise OptimizationStopped()
         return ev.score
 
     def _save_best(self):
@@ -103,20 +115,45 @@ def _snap_integers(problem, x):
     return x
 
 
-def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim"):
-    """Optimise ``problem`` and return (summary dict, best Evaluation)."""
+def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eval=None, stop_event=None):
+    """Optimise ``problem`` and return (summary dict, best Evaluation).
+
+    ``on_eval`` / ``stop_event`` are forwarded to ``RunLogger`` for live progress and
+    cancellation (a stopped run still writes its summary and best config).
+    """
     from scipy import optimize
 
+    if problem.use_gpu and opt.workers != 1:
+        # GPU contexts cannot be shared with forked/spawned evaluation workers.
+        print("[optim] use_gpu=True: forcing workers=1")
+        opt = OptimizerSpec(**{**asdict(opt), 'workers': 1})
+
     out_dir = Path(output_dir) / problem.name
-    logger = RunLogger(problem, out_dir, log_every=opt.log_every)
+    logger = RunLogger(problem, out_dir, log_every=opt.log_every, on_eval=on_eval, stop_event=stop_event)
     bounds = problem.bounds
     lo = np.array([b[0] for b in bounds]); hi = np.array([b[1] for b in bounds])
     x0 = np.clip(np.asarray(opt.x0, float) if opt.x0 is not None else problem.x0, lo, hi)
     rng = np.random.default_rng(opt.seed)
 
-    print(f"[optim] {problem.name}: {problem.dim} variables, method={opt.method}, budget={opt.max_evals} evals")
-    print(f"[optim] initial guess: {problem.evaluate(x0).summary()}")
+    print(f"[optim] {problem.name}: {problem.dim} variables, method={opt.method}, budget={opt.max_evals} evals"
+          + (" [GPU]" if problem.use_gpu else ""))
+    stopped = False
+    try:
+        logger(x0)  # initial guess is eval #1 so ``best`` is always defined
+        print(f"[optim] initial guess: {logger.best.summary()}")
+        _run_method(problem, opt, logger, x0, lo, hi, rng, optimize)
+    except OptimizationStopped:
+        stopped = True
+        print(f"[optim] stopped by user after {logger.n} evaluations")
 
+    summary = logger.close({"optimizer": asdict(opt), "stopped": stopped})
+    print(f"[optim] done: {summary['evaluations']} evals in {summary['elapsed_s']}s → {logger.best.summary()}")
+    print(f"[optim] best config: {out_dir / 'best_config.json'}")
+    return summary, logger.best
+
+
+def _run_method(problem, opt, logger, x0, lo, hi, rng, optimize):
+    bounds = problem.bounds
     if opt.method == "differential_evolution":
         n = problem.dim
         popsize = max(1, math.ceil(opt.population / n))
@@ -168,14 +205,9 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim"):
     else:
         raise ValueError(f"unknown optimizer method {opt.method!r}")
 
-    summary = logger.close({"optimizer": asdict(opt)})
-    print(f"[optim] done: {summary['evaluations']} evals in {summary['elapsed_s']}s → {logger.best.summary()}")
-    print(f"[optim] best config: {out_dir / 'best_config.json'}")
-    return summary, logger.best
 
-
-def run_spec(spec, spec_dir=None):
+def run_spec(spec, spec_dir=None, **run_kwargs):
     from .problem import problem_from_spec
     problem = problem_from_spec(spec, spec_dir)
     opt = OptimizerSpec(**spec.get('optimizer', {}))
-    return run(problem, opt, output_dir=spec.get('output_dir', 'exports/optim'))
+    return run(problem, opt, output_dir=spec.get('output_dir', 'exports/optim'), **run_kwargs)

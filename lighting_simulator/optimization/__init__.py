@@ -20,7 +20,7 @@ from .problem import (
     load_spec,
     problem_from_spec,
 )
-from .runner import OptimizerSpec, run, run_spec
+from .runner import OptimizationStopped, OptimizerSpec, run, run_spec
 from .variables import (
     BeamAngle,
     BeamTilts,
@@ -33,6 +33,6 @@ from .variables import (
 
 __all__ = [
     "BeamAngle", "BeamTilts", "CameraSpec", "ConstraintSpec", "Duct", "DuctRingLayout",
-    "Evaluation", "LedStates", "ObjectiveSpec", "OptimizerSpec", "PanelPose", "Problem",
+    "Evaluation", "LedStates", "ObjectiveSpec", "OptimizationStopped", "OptimizerSpec", "PanelPose", "Problem",
     "load_spec", "problem_from_spec", "run", "run_spec", "variable_from_spec",
 ]
