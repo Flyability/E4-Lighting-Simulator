@@ -1,10 +1,10 @@
 """Compatibility wrapper for the Viser lighting simulator.
 
-The application logic now lives under the lighting_app package so the project has
-an easier structure to extend without breaking the historical entrypoint.
+The application now lives in the ``lighting_simulator`` package
+(``lighting_simulator.ui.app``); this keeps the historical entrypoint working.
 """
 
-from lighting_app.legacy_interactive import main
+from lighting_simulator.ui.app import main
 
 
 if __name__ == "__main__":

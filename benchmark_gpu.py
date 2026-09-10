@@ -5,7 +5,8 @@ from gpu_raytrace import gpu_process_led_wall_batch, GPU_AVAILABLE
 import multiprocessing
 
 # Import CPU worker
-from interactive_lighting import _process_led_wall_worker, _calculate_lambertian_exponent, LED
+from lighting_simulator.domain.led import LED
+from lighting_simulator.simulation.wall import _wall_worker as _process_led_wall_worker
 
 print(f'GPU Available: {GPU_AVAILABLE}')
 print(f'CPU cores: {multiprocessing.cpu_count()}')
@@ -48,7 +49,7 @@ for i, led in enumerate(leds):
         'rays_per_led': rays_per,
         'grid_size': 50,
         'wall_size': 80.0,
-        'lumens_per_led': 300.0,
+        'lumens': 300.0,
         'absorbers': [],
         'stl_mesh_data': None,
         'ray_uniformity': 0.0,

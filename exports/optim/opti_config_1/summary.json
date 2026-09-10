@@ -1,0 +1,52 @@
+{
+  "name": "opti_config_1",
+  "evaluations": 5037,
+  "elapsed_s": 25.67,
+  "best_score": 0.14748198564632686,
+  "best": {
+    "score": 0.14748198564632686,
+    "uniformity_pct": 86.25180143536731,
+    "coverage": 1.0,
+    "e_avg": 707.6061024280694,
+    "n_active": 10,
+    "penalties": {
+      "led_cost": 0.01,
+      "coverage": 0.0
+    }
+  },
+  "best_x": {
+    "front_duct.theta_center": 49.76786130879381,
+    "front_duct.arc_span": 94.46163588041777,
+    "front_duct.axial_center": -0.6268360245239464,
+    "front_duct.row_pitch": 1.3154791700089563,
+    "front_duct.tilt_axial[0]": -52.516045674800345,
+    "front_duct.tilt_axial[1]": -35.69030207952499,
+    "front_duct.tilt_axial[2]": 47.27732448190036,
+    "front_duct.tilt_axial[3]": -26.85491034276445,
+    "front_duct.tilt_axial[4]": 43.6446100768669,
+    "front_duct.tilt_axial[5]": -11.809052187222361,
+    "front_duct.tilt_axial[6]": 51.08247132533954,
+    "front_duct.tilt_axial[7]": -6.712441551735702,
+    "front_duct.tilt_axial[8]": 32.76560136527176,
+    "front_duct.beam": 116.79242891693558,
+    "front_duct.on[0]": 1.0,
+    "front_duct.on[1]": 1.0,
+    "front_duct.on[2]": 0.0,
+    "front_duct.on[3]": 0.0,
+    "front_duct.on[4]": 1.0,
+    "front_duct.on[5]": 1.0,
+    "front_duct.on[6]": 1.0,
+    "front_duct.on[7]": 0.0,
+    "front_duct.on[8]": 0.0
+  },
+  "optimizer": {
+    "method": "differential_evolution",
+    "max_evals": 5000,
+    "seed": 7,
+    "population": 60,
+    "workers": -1,
+    "polish": false,
+    "log_every": 5,
+    "x0": null
+  }
+}

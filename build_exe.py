@@ -34,11 +34,6 @@ mesh_worker = os.path.join(script_dir, "_mesh_worker.py")
 if os.path.isfile(mesh_worker):
     datas.append((mesh_worker, "."))
 
-# Also bundle gpu_raytrace.py
-gpu_rt = os.path.join(script_dir, "gpu_raytrace.py")
-if os.path.isfile(gpu_rt):
-    datas.append((gpu_rt, "."))
-
 # CSV files
 for f in os.listdir(script_dir):
     if f.endswith(".csv"):
@@ -95,6 +90,7 @@ cmd = [
     *hidden_args,
     "--collect-all", "viser",
     "--collect-all", "trimesh",
+    "--collect-submodules", "lighting_simulator",
     os.path.join(script_dir, "interactive_lighting.py"),
 ]
 

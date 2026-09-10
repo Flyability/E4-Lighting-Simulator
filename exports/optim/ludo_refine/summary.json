@@ -1,0 +1,52 @@
+{
+  "name": "ludo_refine",
+  "evaluations": 2016,
+  "elapsed_s": 10.88,
+  "best_score": 0.12520477157535492,
+  "best": {
+    "score": 0.12520477157535492,
+    "uniformity_pct": 87.4795228424645,
+    "coverage": 1.0,
+    "e_avg": 1071.4222340429023,
+    "n_active": 14,
+    "penalties": {
+      "coverage": 0.0
+    }
+  },
+  "best_x": {
+    "group0.dx": -1.7458510733406778,
+    "group0.dy": 1.1731667577479703,
+    "group0.dz": -1.353278914660344,
+    "group0.drot_x": 3.216566852888174,
+    "group0.drot_y": -9.341290993319017,
+    "group0.drot_z": 15.530001098844775,
+    "group0.tilt[0]": 12.612437730967244,
+    "group0.tilt[1]": 0.4008674148488911,
+    "group0.tilt[2]": 13.988857078722285,
+    "group0.tilt[3]": 17.74035027583077,
+    "group0.tilt[4]": -20.212686351850195,
+    "group0.tilt[5]": -9.69884555925638,
+    "group0.tilt[6]": -26.589720730323606,
+    "group0.tilt[7]": -13.035083668161473,
+    "group0.tilt[8]": 11.363068703016456,
+    "group0.on[0]": 1.0,
+    "group0.on[1]": 1.0,
+    "group0.on[2]": 1.0,
+    "group0.on[3]": 1.0,
+    "group0.on[4]": 0.0,
+    "group0.on[5]": 1.0,
+    "group0.on[6]": 0.0,
+    "group0.on[7]": 1.0,
+    "group0.on[8]": 1.0
+  },
+  "optimizer": {
+    "method": "differential_evolution",
+    "max_evals": 2000,
+    "seed": 0,
+    "population": 40,
+    "workers": -1,
+    "polish": false,
+    "log_every": 5,
+    "x0": null
+  }
+}

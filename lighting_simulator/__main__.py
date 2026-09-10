@@ -1,4 +1,4 @@
-from .legacy_interactive import main
+from .ui.app import main
 
 if __name__ == "__main__":
     main()

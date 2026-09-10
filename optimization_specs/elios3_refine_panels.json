@@ -1,0 +1,31 @@
+{
+  "name": "elios3_refine_panels",
+  "base_config": "configs/Elios3.json",
+  "clear_base": false,
+
+  "wall":     { "wall_dist": 100, "grid_size": 30, "wall_size": 250, "rays_per_pixel": 4 },
+  "emission": { "default_lumens": 168, "ray_uniformity": 0.0 },
+  "camera":   { "pos_x": 10, "pos_y": -4, "pitch": 0, "fov_h": 75, "fov_v": 60 },
+
+  "objective": { "metric": "u0", "coverage_weight": 1.0 },
+
+  "constraints": { "max_leds": 32, "max_leds_weight": 0.05, "led_cost": 0.001 },
+
+  "variables": [
+    { "type": "panel_pose", "group_index": 0, "pos_delta": [1.5, 1.5, 1.5], "rot_delta": [10, 10, 15] },
+    { "type": "panel_pose", "group_index": 1, "pos_delta": [1.5, 1.5, 1.5], "rot_delta": [10, 10, 15] },
+    { "type": "panel_pose", "group_index": 2, "pos_delta": [1.5, 1.5, 1.5], "rot_delta": [10, 10, 15] },
+    { "type": "panel_pose", "group_index": 3, "pos_delta": [1.5, 1.5, 1.5], "rot_delta": [10, 10, 15] },
+    { "type": "led_states", "group_index": 0 },
+    { "type": "led_states", "group_index": 1 },
+    { "type": "led_states", "group_index": 2 },
+    { "type": "led_states", "group_index": 3 },
+    { "type": "beam_angle", "group_index": 0, "angle_range": [90, 130] },
+    { "type": "beam_angle", "group_index": 1, "angle_range": [90, 130] },
+    { "type": "beam_angle", "group_index": 2, "angle_range": [90, 130] },
+    { "type": "beam_angle", "group_index": 3, "angle_range": [90, 130] }
+  ],
+
+  "optimizer": { "method": "differential_evolution", "max_evals": 600, "population": 40, "seed": 0, "workers": -1, "log_every": 1 },
+  "output_dir": "exports/optim"
+}

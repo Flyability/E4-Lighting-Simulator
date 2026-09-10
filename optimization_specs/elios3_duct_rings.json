@@ -1,0 +1,40 @@
+{
+  "name": "elios3_duct_rings",
+  "base_config": "configs/elios3.json",
+  "clear_base": true,
+
+  "wall":     { "wall_dist": 50, "grid_size": 30, "wall_size": 250, "rays_per_pixel": 300 },
+  "emission": { "default_lumens": 168, "ray_uniformity": 0.0 },
+  "camera":   { "pos_x": 10, "pos_y": -4, "pitch": 0, "fov_h": 75, "fov_v": 60 },
+
+  "objective": { "metric": "u0", "min_percentile": 2.0, "coverage_weight": 1.0 },
+
+  "constraints": {
+    "max_leds": 18, "max_leds_weight": 0.05,
+    "led_cost": 0.001,
+    "min_led_spacing_cm": 0.8,
+    "keep_out": []
+  },
+
+  "variables": [
+    {
+      "type": "duct_ring",
+      "name": "front_duct",
+      "duct": { "center": [6.3, 12.0, 0.0], "axis": [0, 0, 1], "radius": 8.5, "reference": [1, 0, 0], "mount_offset": 0.0 },
+      "placement": "arc",
+      "n_leds": 9, "n_rows": 3,
+      "theta_range": [-30, 90],
+      "arc_span_range": [10, 100],
+      "axial_range": [-3.0, 1.0],
+      "row_pitch_range": [0.8, 2.0],
+      "tilt_axial_range": [-60, 60], "shared_tilt": false,
+      "beam_angle_range": [90, 130], "shared_beam_angle": true,
+      "optimize_enabled": true,
+      "led_size": 1.0,
+      "mirror_xz": true
+    }
+  ],
+
+  "optimizer": { "method": "differential_evolution", "max_evals": 4000, "population": 60, "seed": 0, "workers": -1, "log_every": 5 },
+  "output_dir": "exports/optim"
+}

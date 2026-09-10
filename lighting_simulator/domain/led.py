@@ -1,0 +1,77 @@
+from dataclasses import dataclass, field
+import numpy as np
+
+
+@dataclass
+class LED:
+    """A single square LED in the lighting simulator.
+
+    Attributes:
+        position (np.array): The position of the LED in 3D space.
+        direction (np.array): The direction the LED is facing.
+        lumens (float): The intensity of the LED.
+        color (tuple): The color of the LED as an RGB tuple.
+        width (float): The width of the LED in centimeters. Default is 1.0.
+        view_angle (float): The view angle of the LED in degrees. Default is 60.0.
+        enabled (bool): Whether the LED is enabled or not. Default is True.
+    """
+    position: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=float))  # Default position at origin
+    direction: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 1.0], dtype=float))  # Default direction along +Z axis
+    lumens: float = 100.0  # Default intensity
+    color: tuple = (1.0, 1.0, 1.0)  # Default to white light
+    width: float = 1.0 # in centimeters
+    viewing_angle: float = 60.0 # in degrees
+    enabled: bool = True
+
+    def __post_init__(self):
+        # Convert position and direction to numpy arrays and ensure they are of type float
+        self.position = np.array(self.position,dtype=float,copy=True)
+        self.direction = np.array(self.direction,dtype=float,copy=True)
+                
+        # Check values and types
+        if self.position.shape != (3,):
+            raise ValueError("LED position must contain exactly 3 values")
+
+        if self.direction.shape != (3,):
+            raise ValueError("LED direction must contain exactly 3 values")
+
+        if self.width <= 0:
+            raise ValueError("LED width must be positive")
+
+        if not 0 < self.viewing_angle <= 180:
+            raise ValueError("LED viewing angle must be between 0 and 180 degrees")
+
+        if self.lumens < 0:
+            raise ValueError("LED lumens cannot be negative")
+
+        if len(self.color) != 3 or not all(0 <= value <= 1 for value in self.color):
+            raise ValueError("LED color must be an RGB tuple with values in [0, 1]")
+
+        # Normalize the direction vector
+        norm = np.linalg.norm(self.direction)
+        if norm < 1e-10:
+            raise ValueError("LED direction cannot be the zero vector")
+
+        self.direction = self.direction / norm
+
+    def get_visualization_rays(self, ray_length=60.0):
+        """Chief ray plus four marginal rays at the viewing-angle edge.
+
+        Returns a list of (origin, unit_direction) tuples.
+        """
+        z_axis = self.direction
+        if abs(z_axis[2]) < 0.9:
+            x_axis = np.cross(z_axis, [0, 0, 1])
+        else:
+            x_axis = np.cross(z_axis, [0, 1, 0])
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+
+        rays = [(self.position.copy(), self.direction.copy())]
+        theta = np.radians(self.viewing_angle / 2.0)
+        s, c = np.sin(theta), np.cos(theta)
+        for local_dir in [(s, 0, c), (-s, 0, c), (0, s, c), (0, -s, c)]:
+            world_dir = local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis
+            world_dir = world_dir / np.linalg.norm(world_dir)
+            rays.append((self.position.copy(), world_dir))
+        return rays

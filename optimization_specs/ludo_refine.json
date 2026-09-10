@@ -1,0 +1,22 @@
+{
+  "name": "ludo_refine",
+  "base_config": "configs/ludos_panels_n4.json",
+  "clear_base": false,
+
+  "wall":     { "wall_dist": 50, "grid_size": 30, "wall_size": 250, "rays_per_pixel": 300 },
+  "emission": { "default_lumens": 168, "ray_uniformity": 0.0 },
+  "camera":   { "pos_x": 10, "pos_y": -4, "pitch": 0, "fov_h": 75, "fov_v": 60 },
+
+  "objective": { "metric": "u0", "min_percentile": 2.0, "coverage_weight": 1.0 },
+
+  "constraints": { "led_cost": 0.0 },
+
+  "variables": [
+    { "type": "panel_pose", "group_index": 0, "pos_delta": [2.0, 2.0, 2.0], "rot_delta": [15, 15, 20] },
+    { "type": "beam_tilts", "group_index": 0, "tilt_range": [-30, 30] },
+    { "type": "led_states", "group_index": 0 }
+  ],
+
+  "optimizer": { "method": "differential_evolution", "max_evals": 3000, "population": 40, "seed": 0, "workers": -1, "log_every": 5 },
+  "output_dir": "exports/optim"
+}
