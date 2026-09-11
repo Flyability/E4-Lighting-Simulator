@@ -700,6 +700,6 @@
     "kind": "custom_group",
     "key": 0
   },
-  "name": "ludos_panels_n4_optim",
-  "description": "Optimised: score=1.2132 U=78.7% cov=100% Eavg=383lx LEDs=8 drv=2 I=1.2A normal[Eavg=383lx VIO=0%] [normal.vio=1.000]"
+  "name": "ludos_panels_n4_optim_optim",
+  "description": "Optimised: score=1.2072 U=79.3% cov=100% Eavg=382lx LEDs=8 drv=2 I=1.2A normal[Eavg=382lx VIO=0%] [normal.vio=1.000]"
 }

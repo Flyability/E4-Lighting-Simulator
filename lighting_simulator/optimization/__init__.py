@@ -11,12 +11,15 @@ or programmatically::
     summary, best = run_spec(spec, spec_dir)
 """
 
+from .electrical import DriverModel
 from .problem import (
     CameraSpec,
     ConstraintSpec,
     Evaluation,
+    ModeSpec,
     ObjectiveSpec,
     Problem,
+    VioSpec,
     load_spec,
     problem_from_spec,
 )
@@ -26,13 +29,15 @@ from .variables import (
     BeamTilts,
     Duct,
     DuctRingLayout,
+    GroupCurrent,
     LedStates,
     PanelPose,
     variable_from_spec,
 )
 
 __all__ = [
-    "BeamAngle", "BeamTilts", "CameraSpec", "ConstraintSpec", "Duct", "DuctRingLayout",
-    "Evaluation", "LedStates", "ObjectiveSpec", "OptimizationStopped", "OptimizerSpec", "PanelPose", "Problem",
+    "BeamAngle", "BeamTilts", "CameraSpec", "ConstraintSpec", "DriverModel", "Duct", "DuctRingLayout",
+    "Evaluation", "GroupCurrent", "LedStates", "ModeSpec", "ObjectiveSpec", "OptimizationStopped",
+    "OptimizerSpec", "PanelPose", "Problem", "VioSpec",
     "load_spec", "problem_from_spec", "run", "run_spec", "variable_from_spec",
 ]

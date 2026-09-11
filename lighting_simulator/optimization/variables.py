@@ -18,6 +18,8 @@ from lighting_simulator.domain.geometry import euler_xyz_matrix, normalize, rodr
 from lighting_simulator.domain.mirroring import mirror_group_config_xz
 from lighting_simulator.scene.builder import euler_applies
 
+from .electrical import DriverModel
+
 
 def _pairs(values, n):
     """Broadcast a scalar / 2-list / list-of-2-lists to n (lo, hi) pairs."""
@@ -50,13 +52,17 @@ class Duct:
         v = np.cross(a, u)
         return a, u, v
 
-    def led_pose(self, theta_deg, axial, tilt_axial_deg=0.0, tilt_tangential_deg=0.0):
-        """(position, direction, row_direction) of an LED on the surface."""
+    def led_pose(self, theta_deg, axial, tilt_axial_deg=0.0, tilt_tangential_deg=0.0, radial=0.0):
+        """(position, direction, row_direction) of an LED on the surface.
+
+        ``radial`` is an extra stand-off (cm) on top of ``mount_offset`` — the
+        mechanical tolerance around the duct."""
         a, u, v = self.frame()
         th = math.radians(theta_deg)
         normal = math.cos(th) * u + math.sin(th) * v
         tangent = np.cross(a, normal)
-        position = np.asarray(self.center, float) + (self.radius + self.mount_offset) * normal + axial * a
+        position = (np.asarray(self.center, float) + (self.radius + self.mount_offset + radial) * normal
+                    + axial * a)
         direction = normal
         if abs(tilt_axial_deg) > 1e-9:  # tilt toward +axis
             direction = rodrigues_rotation(tangent, -math.radians(tilt_axial_deg)) @ direction
@@ -87,7 +93,11 @@ class DuctRingLayout(VariableGroup):
       - ``"free"``: every LED has its own (theta, axial) — arbitrary pattern.
       - ``"arc"``: ``n_rows × n_cols`` regular lattice; variables are the arc
         centre/span and axial centre/pitch — the panel keeps a rectangular shape.
-    Optional per-LED or shared tilt, beam angle and on/off state.
+        With ``n_rows_range`` / ``n_cols_range`` the counts themselves become
+        integer variables (``n_leds`` / ``n_rows`` are then the maxima).
+    Optional per-LED or shared tilt, beam angle, on/off state, radial stand-off
+    tolerance (``radial_range``) and drive current (``current_range`` → lumens
+    via ``driver``).
     """
 
     name: str
@@ -95,10 +105,14 @@ class DuctRingLayout(VariableGroup):
     n_leds: int = 6
     placement: str = "arc"
     n_rows: int = 1
+    n_rows_range: tuple | None = None
+    n_cols_range: tuple | None = None
     theta_range: tuple = (-60.0, 60.0)
     axial_range: tuple = (-1.5, 1.5)
     arc_span_range: tuple = (10.0, 120.0)
     row_pitch_range: tuple = (0.8, 2.0)
+    radial_range: tuple | None = None
+    """Stand-off tolerance (cm) added to ``duct.mount_offset``, e.g. ``[-1, 1]`` for ±10 mm."""
     tilt_axial_range: tuple | None = (-30.0, 30.0)
     tilt_tangential_range: tuple | None = None
     shared_tilt: bool = True
@@ -106,6 +120,9 @@ class DuctRingLayout(VariableGroup):
     shared_beam_angle: bool = True
     default_beam_angle: float = 120.0
     optimize_enabled: bool = False
+    current_range: tuple | None = None
+    """Shared drive current (A); converted to lumens with ``driver``."""
+    driver: DriverModel = field(default_factory=DriverModel)
     led_size: float = 0.5
     color: tuple = (1.0, 0.0, 1.0)
     mirror_xz: bool = False
@@ -117,7 +134,16 @@ class DuctRingLayout(VariableGroup):
     def __post_init__(self):
         if isinstance(self.duct, dict):
             self.duct = Duct(**self.duct)
+        if isinstance(self.driver, dict):
+            self.driver = DriverModel(**self.driver)
         self.n_rows = max(1, int(self.n_rows))
+        self._variable_counts = self.placement == "arc" and (self.n_rows_range or self.n_cols_range)
+        if self._variable_counts:
+            r_lo, r_hi = (int(v) for v in (self.n_rows_range or (self.n_rows, self.n_rows)))
+            max_cols = self.n_leds // self.n_rows
+            c_lo, c_hi = (int(v) for v in (self.n_cols_range or (max_cols, max_cols)))
+            self.n_rows, self.n_leds = r_hi, r_hi * c_hi
+            self._count_bounds = ((r_lo, r_hi), (c_lo, c_hi))
         if self.placement == "arc" and self.n_leds % self.n_rows:
             raise ValueError(f"{self.name}: n_leds={self.n_leds} not divisible by n_rows={self.n_rows}")
 
@@ -127,6 +153,10 @@ class DuctRingLayout(VariableGroup):
                           x0=np.interp(i, [0, max(1, self.n_leds - 1)], self.theta_range))
                 self._add(f"axial[{i}]", *self.axial_range)
         elif self.placement == "arc":
+            if self._variable_counts:
+                (r_lo, r_hi), (c_lo, c_hi) = self._count_bounds
+                self._add("n_rows", r_lo, r_hi, integer=True, x0=r_hi)
+                self._add("n_cols", c_lo, c_hi, integer=True, x0=c_hi)
             self._add("theta_center", *self.theta_range)
             self._add("arc_span", *self.arc_span_range)
             self._add("axial_center", *self.axial_range)
@@ -135,6 +165,8 @@ class DuctRingLayout(VariableGroup):
         else:
             raise ValueError(f"unknown placement {self.placement!r}")
 
+        if self.radial_range is not None:
+            self._add("radial", *self.radial_range, x0=0.0)
         n_tilt = 1 if self.shared_tilt else self.n_leds
         if self.tilt_axial_range is not None:
             for i in range(n_tilt):
@@ -150,6 +182,10 @@ class DuctRingLayout(VariableGroup):
         if self.optimize_enabled:
             for i in range(self.n_leds):
                 self._add(f"on[{i}]", 0, 1, integer=True, x0=1)
+        if self.current_range is not None:
+            lo, hi = self.current_range
+            hi = min(float(hi), self.driver.max_current_a)
+            self._add("current_a", lo, hi)
 
     def _add(self, name, lo, hi, integer=False, x0=None):
         self.names.append(f"{self.name}.{name}")
@@ -167,13 +203,17 @@ class DuctRingLayout(VariableGroup):
                 axials.append(next(it))
             rows = [list(range(self.n_leds))]
         else:
+            n_rows = self.n_rows
+            n_cols = self.n_leds // self.n_rows
+            if self._variable_counts:
+                n_rows = int(round(next(it)))
+                n_cols = int(round(next(it)))
             tc, span, ac = next(it), next(it), next(it)
             pitch = next(it) if self.n_rows > 1 else 0.0
-            n_cols = self.n_leds // self.n_rows
             col_th = np.linspace(tc - span / 2, tc + span / 2, n_cols) if n_cols > 1 else np.array([tc])
-            row_ax = (np.arange(self.n_rows) - (self.n_rows - 1) / 2) * pitch + ac
+            row_ax = (np.arange(n_rows) - (n_rows - 1) / 2) * pitch + ac
             thetas, axials, rows = [], [], []
-            for r in range(self.n_rows):
+            for r in range(n_rows):
                 rows.append(list(range(len(thetas), len(thetas) + n_cols)))
                 for th in col_th:
                     thetas.append(float(th))
@@ -182,7 +222,9 @@ class DuctRingLayout(VariableGroup):
 
     def apply(self, x, cfg):
         thetas, axials, rows, rest = self._layout(x)
+        n_out = len(thetas)  # ≤ self.n_leds when counts are variables
         it = iter(rest)
+        radial = next(it) if self.radial_range is not None else 0.0
         n_tilt = 1 if self.shared_tilt else self.n_leds
         tilt_ax = [next(it) for _ in range(n_tilt)] if self.tilt_axial_range is not None else [0.0]
         tilt_tan = [next(it) for _ in range(n_tilt)] if self.tilt_tangential_range is not None else [0.0]
@@ -191,6 +233,7 @@ class DuctRingLayout(VariableGroup):
         else:
             beams = [self.default_beam_angle]
         states = [bool(round(next(it))) for _ in range(self.n_leds)] if self.optimize_enabled else [True] * self.n_leds
+        current_a = float(next(it)) if self.current_range is not None else None
 
         positions, directions, row_dirs = [], [], []
         for i, (th, ax) in enumerate(zip(thetas, axials)):
@@ -198,6 +241,7 @@ class DuctRingLayout(VariableGroup):
                 th, ax,
                 tilt_ax[i if len(tilt_ax) > 1 else 0],
                 tilt_tan[i if len(tilt_tan) > 1 else 0],
+                radial=radial,
             )
             positions.append([float(v) for v in p])
             directions.append([float(v) for v in d])
@@ -209,19 +253,20 @@ class DuctRingLayout(VariableGroup):
             'position': [0.0, 0.0, 0.0],
             'rotation_x': 0.0, 'rotation_y': 0.0, 'rotation_z': 0.0,
             'is_dynamic': True,
-            'num_leds': self.n_leds,
+            'num_leds': n_out,
             'led_positions': positions,
             'led_rotations': directions,
             'led_row_directions': row_dirs,
-            'led_sizes': [self.led_size] * self.n_leds,
-            'led_viewing_angles': [float(beams[i if len(beams) > 1 else 0]) for i in range(self.n_leds)],
-            'led_beam_tilts': [0.0] * self.n_leds,
-            'led_states': states,
+            'led_sizes': [self.led_size] * n_out,
+            'led_viewing_angles': [float(beams[i if len(beams) > 1 else 0]) for i in range(n_out)],
+            'led_beam_tilts': [0.0] * n_out,
+            'led_states': states[:n_out],
             'led_rows': rows,
             'led_euler_angles': [],
             'led_lumens': [],
-            'lumens_override_enabled': False,
-            'lumens_value': 100,
+            'lumens_override_enabled': current_a is not None,
+            'lumens_value': self.driver.lumens(current_a) if current_a is not None else 100,
+            'drive_current_a': current_a,
             'template_name': None,
             'initial_pos': [0.0, 0.0, 0.0],
             'initial_rot': [0, 0, 0],
@@ -380,12 +425,42 @@ class BeamTilts(VariableGroup):
         cfg['custom_groups'][self.group_index]['led_beam_tilts'] = [float(v) for v in x]
 
 
+@dataclass
+class GroupCurrent(VariableGroup):
+    """Shared drive current (A) of an existing group, applied as a lumens override."""
+
+    group_index: int
+    current_range: tuple = (0.5, 3.0)
+    driver: DriverModel = field(default_factory=DriverModel)
+    names: list = field(default_factory=list, init=False)
+    bounds: list = field(default_factory=list, init=False)
+    integrality: list = field(default_factory=list, init=False)
+    x0: list = field(default_factory=list, init=False)
+
+    def __post_init__(self):
+        if isinstance(self.driver, dict):
+            self.driver = DriverModel(**self.driver)
+        lo, hi = self.current_range
+        hi = min(float(hi), self.driver.max_current_a)
+        self.names = [f"group{self.group_index}.current_a"]
+        self.bounds = [(float(lo), hi)]
+        self.integrality = [False]
+        self.x0 = [(float(lo) + hi) / 2]
+
+    def apply(self, x, cfg):
+        g = cfg['custom_groups'][self.group_index]
+        g['lumens_override_enabled'] = True
+        g['lumens_value'] = self.driver.lumens(x[0])
+        g['drive_current_a'] = float(x[0])
+
+
 VARIABLE_TYPES = {
     'duct_ring': DuctRingLayout,
     'panel_pose': PanelPose,
     'led_states': LedStates,
     'beam_angle': BeamAngle,
     'beam_tilts': BeamTilts,
+    'group_current': GroupCurrent,
 }
 
 

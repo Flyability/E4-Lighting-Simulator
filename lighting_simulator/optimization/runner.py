@@ -58,18 +58,22 @@ class RunLogger:
         self.n = 0
         self.n_external = 0
         """Evaluations performed in worker processes (not individually logged)."""
+        self.records = []
+        """In-memory history ``(eval_no, Evaluation without grid, x)`` for the report."""
         self.t0 = time.perf_counter()
         self._hist = open(self.out_dir / "history.csv", "w", newline="", encoding="utf-8")
         self._csv = csv.writer(self._hist)
-        self._csv.writerow(["eval", "t_s", "score", "uniformity_pct", "coverage", "e_avg", "n_active"]
-                           + problem.names)
+        self._csv.writerow(["eval", "t_s", "score", "uniformity_pct", "coverage", "e_avg", "n_active",
+                            "n_drivers", "total_current_a"] + problem.names)
 
     def __call__(self, x):
         ev = self.problem.evaluate(x)
         self.n += 1
         self._csv.writerow([self.n, f"{time.perf_counter() - self.t0:.2f}", f"{ev.score:.6f}",
-                            f"{ev.uniformity_pct:.3f}", f"{ev.coverage:.4f}", f"{ev.e_avg:.2f}", ev.n_active]
+                            f"{ev.uniformity_pct:.3f}", f"{ev.coverage:.4f}", f"{ev.e_avg:.2f}", ev.n_active,
+                            ev.n_drivers, f"{ev.total_current_a:.3f}"]
                            + [f"{v:.5g}" for v in np.asarray(x, float)])
+        self.records.append((max(self.n, self.n_external), ev, np.array(x, dtype=float)))
         if self.best is None or ev.score < self.best.score:
             self.best, self.best_x = ev, np.array(x, dtype=float)
             self._save_best()
@@ -97,7 +101,7 @@ class RunLogger:
             "evaluations": max(self.n, self.n_external),
             "elapsed_s": round(time.perf_counter() - self.t0, 2),
             "best_score": self.best.score if self.best else None,
-            "best": {k: v for k, v in asdict(self.best).items() if k not in ("metrics", "grid")} if self.best else None,
+            "best": {k: v for k, v in asdict(self.best).items() if k not in ("metrics", "grid", "vio_grid")} if self.best else None,
             "best_x": dict(zip(self.problem.names, map(float, self.best_x))) if self.best_x is not None else None,
         }
         if extra:
@@ -115,11 +119,13 @@ def _snap_integers(problem, x):
     return x
 
 
-def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eval=None, stop_event=None):
+def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eval=None, stop_event=None,
+        report=True):
     """Optimise ``problem`` and return (summary dict, best Evaluation).
 
     ``on_eval`` / ``stop_event`` are forwarded to ``RunLogger`` for live progress and
-    cancellation (a stopped run still writes its summary and best config).
+    cancellation (a stopped run still writes its summary and best config). ``report``
+    renders ``report.pdf`` next to the other outputs.
     """
     from scipy import optimize
 
@@ -146,7 +152,21 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
         stopped = True
         print(f"[optim] stopped by user after {logger.n} evaluations")
 
-    summary = logger.close({"optimizer": asdict(opt), "stopped": stopped})
+    elapsed = time.perf_counter() - logger.t0
+    report_path = None
+    if report and logger.records:
+        try:
+            from .report import write_report
+            report_path = write_report(problem, logger.records, opt, out_dir, x0=x0, elapsed=elapsed,
+                                       stopped=stopped)
+            print(f"[optim] report: {report_path}")
+        except Exception:  # a report failure must not lose the optimisation result
+            import traceback
+            traceback.print_exc()
+            print("[optim] report generation failed (see traceback above)")
+
+    summary = logger.close({"optimizer": asdict(opt), "stopped": stopped,
+                            "report": str(report_path) if report_path else None})
     print(f"[optim] done: {summary['evaluations']} evals in {summary['elapsed_s']}s → {logger.best.summary()}")
     print(f"[optim] best config: {out_dir / 'best_config.json'}")
     return summary, logger.best

@@ -70,6 +70,12 @@ print("[smoke] groups:", groups)
 find("Group").value = groups[0]
 find("Move / rotate group").value = True
 find("LED on / off").value = True
+find("Drive current (→ lumens)").value = True
+find("Require flash lux target").value = True
+find("Require VIO FOV coverage").value = True
+find("Wall distances (cm)").value = "50, 150"
+find("Min beam angle off camera axis (°, 0 = off)").value = 30
+find("Symmetry penalty weight (0 = off)").value = 0.5
 find("Max evaluations").value = 40
 find("Population").value = 8
 find("Rays per pixel").value = 50

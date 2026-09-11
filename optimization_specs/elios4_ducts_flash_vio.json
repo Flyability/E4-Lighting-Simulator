@@ -1,0 +1,61 @@
+{
+  "name": "elios4_ducts_flash_vio",
+  "description": "Meeting requirements: LEDs on the duct rings (cooling), flash for photogrammetry (41 klx @ 50 cm), normal lighting for VIO (>=50 % of the VIO FOV above 120 lx @ 3 m), few drivers, beams >= 30 deg off the camera axis, XZ symmetry.",
+  "base_config": "configs/elios3.json",
+  "clear_base": true,
+
+  "wall":     { "wall_dist": [50, 100, 200], "grid_size": 30, "wall_size": 300, "rays_per_pixel": 300 },
+  "emission": { "default_lumens": 168, "ray_uniformity": 0.0 },
+  "camera":   { "pos_x": 10, "pos_y": -4, "pitch": 0, "fov_h": 75, "fov_v": 60 },
+
+  "driver": { "voltage_v": 6.0, "efficacy_lm_per_w": 180.0, "max_current_a": 13.0, "leds_per_driver": 4 },
+
+  "vio": {
+    "position": [10, 0, 0],
+    "cam1_pitch": 45, "cam1_yaw": 0, "cam2_pitch": -45, "cam2_yaw": 0,
+    "long_fov": 170, "landscape": true,
+    "wall_dist": 300, "wall_size": 1200, "grid_size": 40
+  },
+
+  "modes": [
+    { "name": "normal", "vio_min_lux": 120, "vio_min_fraction": 0.5, "vio_weight": 1.0 },
+    { "name": "flash", "current_a": 13.0, "min_avg_lux": 41000, "min_avg_lux_dist": 50, "lux_weight": 1.0 }
+  ],
+
+  "objective": { "metric": "u0", "min_percentile": 2.0, "coverage_weight": 1.0 },
+
+  "constraints": {
+    "max_leds": 24, "max_leds_weight": 0.05,
+    "led_cost": 0.002,
+    "max_drivers": 6, "max_drivers_weight": 0.1, "driver_cost": 0.01,
+    "max_total_current_a": 40.0, "current_weight": 1.0,
+    "min_led_spacing_cm": 0.8,
+    "min_beam_angle_deg": 30, "beam_angle_axis": [1, 0, 0], "beam_angle_weight": 0.5,
+    "symmetry_weight": 0.5, "symmetry_tol_cm": 0.5,
+    "keep_out": []
+  },
+
+  "variables": [
+    {
+      "type": "duct_ring",
+      "name": "front_duct",
+      "duct": { "center": [6.3, 12.0, 0.0], "axis": [0, 0, 1], "radius": 8.5, "reference": [1, 0, 0], "mount_offset": 0.0 },
+      "placement": "arc",
+      "n_leds": 12, "n_rows": 3,
+      "n_rows_range": [1, 3], "n_cols_range": [1, 4],
+      "theta_range": [-30, 90],
+      "arc_span_range": [10, 100],
+      "axial_range": [-3.0, 1.0],
+      "row_pitch_range": [0.8, 2.0],
+      "radial_range": [-1.0, 1.0],
+      "tilt_axial_range": [-60, 60], "shared_tilt": false,
+      "beam_angle_range": [90, 130], "shared_beam_angle": true,
+      "current_range": [0.3, 3.0],
+      "led_size": 1.0,
+      "mirror_xz": true
+    }
+  ],
+
+  "optimizer": { "method": "differential_evolution", "max_evals": 6000, "population": 80, "seed": 0, "workers": -1, "log_every": 10 },
+  "output_dir": "exports/optim"
+}

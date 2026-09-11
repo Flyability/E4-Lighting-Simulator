@@ -1,25 +1,28 @@
 {
   "name": "ludo_refine",
   "evaluations": 12,
-  "elapsed_s": 0.11,
-  "best_score": 0.24125364683013673,
+  "elapsed_s": 0.1,
+  "best_score": 0.21525974755963384,
   "best": {
-    "score": 0.24125364683013673,
-    "uniformity_pct": 75.87463531698633,
+    "score": 0.21525974755963384,
+    "uniformity_pct": 78.47402524403661,
     "coverage": 1.0,
-    "e_avg": 882.860322759265,
+    "e_avg": 734.9440311867618,
     "n_active": 8,
     "penalties": {
       "coverage": 0.0
-    }
+    },
+    "n_drivers": 8,
+    "total_current_a": 1.2444444444444445,
+    "modes": {}
   },
   "best_x": {
-    "group0.dx": 0.0,
-    "group0.dy": 0.0,
-    "group0.dz": 0.0,
-    "group0.drot_x": 0.0,
-    "group0.drot_y": 0.0,
-    "group0.drot_z": 0.0
+    "group0.dx": -1.7804820758830346,
+    "group0.dy": -0.5121514228349279,
+    "group0.dz": -2.0,
+    "group0.drot_x": -4.891233384282554,
+    "group0.drot_y": 4.4535850380283595,
+    "group0.drot_z": 4.66734787032862
   },
   "optimizer": {
     "method": "random_search",

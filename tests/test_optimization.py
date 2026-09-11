@@ -97,8 +97,39 @@ def test_run_methods_produce_outputs(tmp_path, method):
     spec['wall'] = {"wall_dist": 100, "grid_size": 10, "wall_size": 250, "rays_per_pixel": 1}
     problem = problem_from_spec(spec, spec_dir)
     summary, best = run(problem, OptimizerSpec(method=method, max_evals=12, population=6, log_every=0),
-                        output_dir=tmp_path)
+                        output_dir=tmp_path, report=False)
     out = tmp_path / problem.name
     assert (out / "best_config.json").exists() and (out / "history.csv").exists()
     assert summary['best_score'] == pytest.approx(best.score)
     assert len(build_scene_from_config(load_config(out / "best_config.json")).leds) > 0
+
+
+def test_requirements_spec_modes_drivers_and_report(tmp_path):
+    spec, spec_dir = load_spec("optimization_specs/elios4_ducts_flash_vio.json")
+    spec['wall'].update({"grid_size": 10, "rays_per_pixel": 1})
+    spec['vio'].update({"grid_size": 8})
+    problem = problem_from_spec(spec, spec_dir)
+    names = problem.names
+    assert names[:2] == ["front_duct.n_rows", "front_duct.n_cols"] and problem.integrality[:2].all()
+    assert "front_duct.radial" in names and names[-1] == "front_duct.current_a"
+
+    x = problem.x0.copy()
+    x[0], x[1] = 2, 3  # 2 rows x 3 cols, mirrored -> 12 LEDs
+    ev = problem.evaluate(x)
+    assert ev.n_active == 12 and ev.n_drivers == 3  # 4 LEDs per driver
+    cfg = problem.decode(x)
+    g = cfg['custom_groups'][0]
+    assert g['num_leds'] == 6 and g['lumens_override_enabled']
+    assert g['lumens_value'] == pytest.approx(g['drive_current_a'] * 6.0 * 180.0)
+    assert ev.total_current_a == pytest.approx(12 * g['drive_current_a'])
+    assert set(ev.modes) == {"normal", "flash"}
+    assert ev.modes['flash']['scale'] == pytest.approx(13.0 / g['drive_current_a'])
+    assert 0.0 <= ev.modes['normal']['vio_fraction'] <= 1.0
+
+    summary, best = run(problem, OptimizerSpec(method="random_search", max_evals=8, population=4, log_every=0),
+                        output_dir=tmp_path)
+    out = tmp_path / problem.name
+    assert summary['report'] and (out / "report.pdf").stat().st_size > 10_000
+    assert (out / "initial_config.json").exists()
+    with open(out / "report.pdf", "rb") as f:
+        assert f.read(5) == b"%PDF-"

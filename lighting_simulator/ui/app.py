@@ -9847,6 +9847,40 @@ def main():
         optim_beam_range = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
                                                        initial_value=(90, 130))
         optim_var_states = server.gui.add_checkbox("LED on / off", initial_value=False)
+        optim_var_current = server.gui.add_checkbox("Drive current (→ lumens)", initial_value=False,
+                                                    hint="Shared per-LED current; lumens = I · V · efficacy")
+        optim_current_range = server.gui.add_multi_slider("Current range (A)", min=0.1, max=13.0, step=0.1,
+                                                          initial_value=(0.5, 3.0))
+
+    with tab_optim:
+        _optim_elec_folder = server.gui.add_folder("Electrical & operating modes")
+    with _optim_elec_folder:
+        server.gui.add_html(
+            "<div style='color:#888;font-size:12px;margin-bottom:6px;'>LED flux is linear in current. "
+            "Modes share the geometry: <b>normal</b> = design current, <b>flash</b> = pulse current.</div>"
+        )
+        optim_drv_voltage = server.gui.add_number("LED forward voltage (V)", 6.0, min=1.0, max=60.0, step=0.1)
+        optim_drv_efficacy = server.gui.add_number("Efficacy (lm/W)", 180.0, min=10.0, max=400.0, step=5.0)
+        optim_drv_max_current = server.gui.add_number("Max current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1)
+        optim_leds_per_driver = server.gui.add_number("LEDs per driver", 4, min=1, max=64, step=1)
+        optim_max_drivers = server.gui.add_number("Max drivers (0 = no limit)", 0, min=0, step=1)
+        optim_driver_cost = server.gui.add_slider("Cost per driver", min=0.0, max=0.2, step=0.005, initial_value=0.0)
+        optim_max_current = server.gui.add_number("Max total current (A, 0 = off)", 0.0, min=0.0, step=1.0)
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>Flash (photogrammetry)</div>")
+        optim_flash_enable = server.gui.add_checkbox("Require flash lux target", initial_value=False)
+        optim_flash_current = server.gui.add_number("Flash current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1)
+        optim_flash_lux = server.gui.add_number("Flash avg lux in FOV", 41000, min=0, step=1000)
+        optim_flash_dist = server.gui.add_number("… at wall distance (cm)", 50, min=10, max=1500, step=5,
+                                                 hint="Must be one of the wall distances above (nearest is used)")
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>VIO coverage (normal mode)</div>")
+        optim_vio_enable = server.gui.add_checkbox("Require VIO FOV coverage", initial_value=False,
+                                                   hint="Uses the VIO camera poses from the FOV tab")
+        optim_vio_lux = server.gui.add_number("Min lux on VIO wall", 120, min=0, step=10)
+        optim_vio_fraction = server.gui.add_slider("Min share of VIO FOV lit (%)", min=0, max=100, step=5,
+                                                   initial_value=50)
+        optim_vio_dist = server.gui.add_number("VIO wall distance (cm)", 300, min=50, max=2000, step=10)
+        optim_vio_wall_size = server.gui.add_number("VIO wall size (cm)", 1200, min=100, max=5000, step=50)
+        optim_vio_grid = server.gui.add_number("VIO wall grid resolution", 40, min=5, max=200, step=5)
 
     with tab_optim:
         _optim_obj_folder = server.gui.add_folder("Objective & constraints")
@@ -9867,6 +9901,14 @@ def main():
         optim_spacing = server.gui.add_slider("Min LED spacing (cm, 0 = off)", min=0.0, max=10.0, step=0.1,
                                               initial_value=0.0)
         optim_spacing_w = server.gui.add_slider("Spacing penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        optim_min_beam_angle = server.gui.add_slider("Min beam angle off camera axis (°, 0 = off)", min=0, max=90,
+                                                     step=5, initial_value=0,
+                                                     hint="Prefer LEDs tilted at least this far from +X")
+        optim_beam_angle_w = server.gui.add_slider("Beam angle penalty weight", min=0.0, max=5.0, step=0.1,
+                                                   initial_value=0.5)
+        optim_symmetry_w = server.gui.add_slider("Symmetry penalty weight (0 = off)", min=0.0, max=5.0, step=0.1,
+                                                 initial_value=0.0,
+                                                 hint="Share of LEDs without a left/right mirror partner")
         optim_keepout_html = server.gui.add_html(
             "<div style='color:#888;font-size:12px;'>Keep-out boxes: none (defined in preset specs)</div>"
         )
@@ -9899,11 +9941,14 @@ def main():
         optim_status_html = server.gui.add_html(
             "<div style='color:#888;font-size:12px;'>Idle</div>"
         )
+        _OPTIM_EMPTY_PLOT = tuple(np.array([0.0]) for _ in range(4))
         optim_plot = server.gui.add_uplot(
-            data=(np.array([0.0]), np.array([0.0]), np.array([0.0])),
+            data=_OPTIM_EMPTY_PLOT,
             series=(
                 {"label": "eval"},
-                {"label": "score", "stroke": "#888888", "width": 1},
+                {"label": "score", "stroke": "transparent", "width": 0,
+                 "points": {"show": True, "size": 4, "fill": "#9e9e9e", "stroke": "#9e9e9e"}},
+                {"label": "trend (moving avg)", "stroke": "#ff9800", "width": 2, "dash": [6, 4]},
                 {"label": "best", "stroke": "#4CAF50", "width": 2},
             ),
             scales={"x": {"time": False}},
@@ -9911,6 +9956,7 @@ def main():
         )
         optim_autoload = server.gui.add_checkbox("Load best into scene when finished", initial_value=True)
         optim_load_btn = server.gui.add_button("📥 Load best into scene")
+        optim_report_btn = server.gui.add_button("📄 Open PDF report", disabled=True)
         optim_save_name = server.gui.add_text("Save best as", initial_value="")
         optim_save_btn = server.gui.add_button("💾 Save best to configs/")
 
@@ -9947,6 +9993,33 @@ def main():
         optim_led_cost.value = float(con.get('led_cost', 0.0))
         optim_spacing.value = float(con.get('min_led_spacing_cm') or 0.0)
         optim_spacing_w.value = float(con.get('spacing_weight', 1.0))
+        optim_min_beam_angle.value = int(con.get('min_beam_angle_deg') or 0)
+        optim_beam_angle_w.value = float(con.get('beam_angle_weight', 0.5))
+        optim_symmetry_w.value = float(con.get('symmetry_weight', 0.0))
+        optim_max_drivers.value = int(con.get('max_drivers') or 0)
+        optim_driver_cost.value = float(con.get('driver_cost', 0.0))
+        optim_max_current.value = float(con.get('max_total_current_a') or 0.0)
+        drv = spec.get('driver', {})
+        optim_drv_voltage.value = float(drv.get('voltage_v', 6.0))
+        optim_drv_efficacy.value = float(drv.get('efficacy_lm_per_w', 180.0))
+        optim_drv_max_current.value = float(drv.get('max_current_a', 13.0))
+        optim_leds_per_driver.value = int(drv.get('leds_per_driver', 1))
+        vio = spec.get('vio') or {}
+        optim_vio_dist.value = int(vio.get('wall_dist', 300))
+        optim_vio_wall_size.value = int(vio.get('wall_size', 1200))
+        optim_vio_grid.value = int(vio.get('grid_size', 40))
+        optim_flash_enable.value = False
+        optim_vio_enable.value = False
+        for m in spec.get('modes', []):
+            if m.get('min_avg_lux'):
+                optim_flash_enable.value = True
+                optim_flash_current.value = float(m.get('current_a') or optim_flash_current.value)
+                optim_flash_lux.value = int(m['min_avg_lux'])
+                optim_flash_dist.value = int(m.get('min_avg_lux_dist') or optim_flash_dist.value)
+            if m.get('vio_min_lux'):
+                optim_vio_enable.value = True
+                optim_vio_lux.value = int(m['vio_min_lux'])
+                optim_vio_fraction.value = int(round(100 * float(m.get('vio_min_fraction', 0.5))))
         n_keep = len(con.get('keep_out', []))
         optim_keepout_html.content = (
             f"<div style='color:#888;font-size:12px;'>Keep-out boxes: {n_keep} (from preset spec)</div>"
@@ -10020,6 +10093,9 @@ def main():
             variables.append({'type': 'beam_angle', 'group_index': gi, 'angle_range': [float(lo), float(hi)]})
         if optim_var_states.value:
             variables.append({'type': 'led_states', 'group_index': gi})
+        if optim_var_current.value:
+            lo, hi = optim_current_range.value
+            variables.append({'type': 'group_current', 'group_index': gi, 'current_range': [float(lo), float(hi)]})
         if not variables:
             raise ValueError("Enable at least one variable checkbox.")
         return variables
@@ -10065,11 +10141,42 @@ def main():
             'max_leds': int(optim_max_leds.value) or None,
             'max_leds_weight': float(optim_max_leds_w.value),
             'led_cost': float(optim_led_cost.value),
+            'max_drivers': int(optim_max_drivers.value) or None,
+            'driver_cost': float(optim_driver_cost.value),
+            'max_total_current_a': float(optim_max_current.value) or None,
             'min_led_spacing_cm': float(optim_spacing.value) or None,
             'spacing_weight': float(optim_spacing_w.value),
+            'min_beam_angle_deg': float(optim_min_beam_angle.value) or None,
+            'beam_angle_weight': float(optim_beam_angle_w.value),
+            'symmetry_weight': float(optim_symmetry_w.value),
             'keep_out': keep_out,
             'keep_out_weight': float((spec or {}).get('constraints', {}).get('keep_out_weight', 1.0)),
         }
+        work['driver'] = {
+            'voltage_v': float(optim_drv_voltage.value),
+            'efficacy_lm_per_w': float(optim_drv_efficacy.value),
+            'max_current_a': float(optim_drv_max_current.value),
+            'leds_per_driver': int(optim_leds_per_driver.value),
+        }
+        modes = [{'name': 'normal'}]
+        if optim_vio_enable.value:
+            modes[0].update({'vio_min_lux': float(optim_vio_lux.value),
+                             'vio_min_fraction': float(optim_vio_fraction.value) / 100.0})
+            work['vio'] = {
+                'position': [float(vio_pos_x.value), float(vio_pos_y.value), float(vio_pos_z.value)],
+                'cam1_pitch': float(vio_cam1_pitch.value), 'cam1_yaw': float(vio_cam1_yaw.value),
+                'cam2_pitch': float(vio_cam2_pitch.value), 'cam2_yaw': float(vio_cam2_yaw.value),
+                'long_fov': float(vio_long_fov.value), 'landscape': bool(vio_landscape.value),
+                'wall_dist': float(optim_vio_dist.value), 'wall_size': float(optim_vio_wall_size.value),
+                'grid_size': int(optim_vio_grid.value),
+            }
+        else:
+            work.pop('vio', None)
+        if optim_flash_enable.value:
+            modes.append({'name': 'flash', 'current_a': float(optim_flash_current.value),
+                          'min_avg_lux': float(optim_flash_lux.value),
+                          'min_avg_lux_dist': float(optim_flash_dist.value)})
+        work['modes'] = modes if (optim_vio_enable.value or optim_flash_enable.value) else []
 
         if not use_spec_vars:
             work['variables'] = _optim_group_variables()
@@ -10114,8 +10221,12 @@ def main():
         )
         xs, ys, bs = st['evals'], st['scores'], st['bests']
         if len(xs) > 1:
+            y = np.asarray(ys, float)
+            win = max(5, len(y) // 20)  # ~5 % of the run; centred moving average
+            kernel = np.ones(win) / win
+            trend = np.convolve(np.pad(y, (win // 2, win - 1 - win // 2), mode='edge'), kernel, mode='valid')
             step = max(1, len(xs) // 1500)
-            optim_plot.data = (np.asarray(xs[::step], float), np.asarray(ys[::step], float),
+            optim_plot.data = (np.asarray(xs[::step], float), y[::step], trend[::step],
                                np.asarray(bs[::step], float))
 
     def _optim_on_eval(logger, ev, x):
@@ -10158,12 +10269,15 @@ def main():
                 st['best_cfg'] = json.load(f)
             if logger_ref[0] is not None:
                 _optim_refresh_ui(logger_ref[0], final=True)
+            st['report'] = summary.get('report')
+            optim_report_btn.disabled = not st['report']
+            report_line = f"\nReport: {st['report']}" if st['report'] else "\n(report generation failed — see console)"
             if summary.get('stopped'):
                 _optim_status(f"Stopped after {summary['evaluations']} evals.\nBest: {_best.summary()}\n"
-                              f"Saved: {best_path}", "#ffaa00")
+                              f"Saved: {best_path}{report_line}", "#ffaa00")
             else:
                 _optim_status(f"Finished: {summary['evaluations']} evals in {summary['elapsed_s']}s\n"
-                              f"Best: {_best.summary()}\nSaved: {best_path}", "#4CAF50")
+                              f"Best: {_best.summary()}\nSaved: {best_path}{report_line}", "#4CAF50")
             if not optim_save_name.value.strip():
                 optim_save_name.value = problem.name
             if optim_autoload.value:
@@ -10196,9 +10310,11 @@ def main():
         st['stop'].clear()
         st['budget'] = opt.max_evals
         st['best_cfg'] = None
+        st['report'] = None
+        optim_report_btn.disabled = True
         st['evals'], st['scores'], st['bests'], st['last_ui'] = [], [], [], 0.0
         optim_progress.value = 0.0
-        optim_plot.data = (np.array([0.0]), np.array([0.0]), np.array([0.0]))
+        optim_plot.data = _OPTIM_EMPTY_PLOT
         optim_run_btn.disabled = True
         optim_stop_btn.disabled = False
         backend = _gpu_backend.gpu_backend_label() if problem.use_gpu else "CPU"
@@ -10215,6 +10331,14 @@ def main():
             _optim_status("Stopping after the current evaluation…", "#ffaa00")
 
     optim_load_btn.on_click(lambda _: _optim_load_best())
+
+    @optim_report_btn.on_click
+    def _(_):
+        path = _optim_state.get('report')
+        if path and os.path.exists(path):
+            _wb.open("file://" + os.path.abspath(path))
+        else:
+            _optim_status("No report available for the last run.", "#ffaa00")
 
     @optim_save_btn.on_click
     def _(_):
