@@ -46,7 +46,10 @@ def objective(cfg):
 ```
 
 `scripts/ui_smoke.py` drives the real GUI callbacks headlessly (load config →
-wall map → room map) and is a quick end-to-end check after UI edits.
+wall map → room map) and is a quick end-to-end check after UI edits;
+`scripts/ui_optim_smoke.py` does the same for the Optimize tab. `scripts/benchmark_gpu.py`
+and `scripts/test_gpu.py` compare GPU vs CPU tracing; `scripts/beam_calibration.py` is a
+standalone beam-profile calibration tool.
 
 ## LED placement optimisation
 
@@ -74,16 +77,18 @@ Variable groups (`type`):
 - `beam_angle` — shared viewing angle of a group.
 - `beam_tilts` — per-LED beam tilt inside a dynamic group.
 
-Output goes to `exports/optim/<name>/`: `best_config.json` (copy to `configs/` and
-open it in the UI via *Load Configuration*), `history.csv`, `summary.json`.
-Evaluations are deterministic (fixed Monte Carlo seeds) so the optimiser sees a
-smooth objective; raise `rays_per_pixel` for less noise (≈5 ms/eval at 30×30 cells ×
-30 rays, so budgets of thousands are cheap).
+Output goes to `exports/optim/<name>/` (git-ignored): `best_config.json` (copy to
+`configs/` and open it in the UI via *Load Configuration*), `best2_config.json`,
+`initial_config.json`, `history.csv`, `summary.json` and `report.pdf`.
+Ray sampling is random Monte Carlo; the optimiser re-checks every new best with a
+fresh sample and the report re-evaluates the top designs with 4× the rays before
+ranking them. Use ~1 cm cells inside the FOV (grid 60–80 with `"wall_size": "auto"`)
+and ≥ 1000 rays per pixel for the search.
 
 ## Notes
 
 - GPU acceleration is auto-detected; `simulation/gpu_backend.py` runs a one-off
   CPU-vs-GPU self-test and silently falls back to CPU if the driver returns
-  inconsistent results.
-- `gpu_raytrace.py` at the repo root is a compatibility shim for the old
-  benchmark scripts; the implementation is `lighting_simulator/raytracing/gpu.py`.
+  inconsistent results. *Advanced → GPU → Purge GPU memory* releases device buffers.
+- `interactive_lighting.py` is a 4-line legacy entry point kept for `LightingSim.bat`
+  and `build_exe.py`.

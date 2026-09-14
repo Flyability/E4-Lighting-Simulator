@@ -1,14 +1,16 @@
-"""Benchmark: GPU vs CPU ray tracing performance."""
-import sys, time, numpy as np
-sys.path.insert(0, '.')
-from gpu_raytrace import gpu_process_led_wall_batch, GPU_AVAILABLE
+"""Benchmark: GPU vs CPU ray tracing performance.  Usage: PYTHONPATH=. python scripts/benchmark_gpu.py"""
+import time, numpy as np
+from lighting_simulator.raytracing import gpu as _gpu
+from lighting_simulator.raytracing.gpu import gpu_process_led_wall_batch
 import multiprocessing
 
 # Import CPU worker
 from lighting_simulator.domain.led import LED
 from lighting_simulator.simulation.wall import _wall_worker as _process_led_wall_worker
 
-print(f'GPU Available: {GPU_AVAILABLE}')
+_gpu._ensure_gpu_init()
+GPU_AVAILABLE = _gpu.GPU_AVAILABLE
+print(f'GPU Available: {GPU_AVAILABLE} ({_gpu.GPU_BACKEND})')
 print(f'CPU cores: {multiprocessing.cpu_count()}')
 print()
 

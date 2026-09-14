@@ -1,9 +1,10 @@
-"""Quick test of GPU ray tracing performance."""
-import sys, time, numpy as np
-sys.path.insert(0, '.')
-from gpu_raytrace import gpu_process_led_wall_batch, GPU_AVAILABLE
+"""Quick test of GPU ray tracing performance.  Usage: PYTHONPATH=. python scripts/test_gpu.py"""
+import time, numpy as np
+from lighting_simulator.raytracing import gpu as _gpu
+from lighting_simulator.raytracing.gpu import gpu_process_led_wall_batch
 
-print(f'GPU Available: {GPU_AVAILABLE}')
+_gpu._ensure_gpu_init()
+print(f'GPU Available: {_gpu.GPU_AVAILABLE} ({_gpu.GPU_BACKEND})')
 
 # Create test LEDs simulating typical scenario
 leds_data = []

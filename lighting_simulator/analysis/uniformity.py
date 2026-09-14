@@ -109,13 +109,31 @@ def uniformity_metrics(values, min_percentile=0.0):
     )
 
 
-def uniformity_html(metrics: UniformityMetrics):
-    """HTML card for the intensity legend panel."""
+def uniformity_html(metrics: UniformityMetrics, robust: UniformityMetrics | None = None, percentile=0.0):
+    """HTML card for the intensity legend panel.
+
+    ``robust`` (optional) is the same region evaluated with a percentile E_min;
+    it is shown next to the hard-minimum figures for comparison with the optimiser.
+    """
     label, detail, color = metrics.ev_classification()
+    robust_rows = ""
+    robust_head = ""
+    if robust is not None and percentile > 0:
+        robust_head = (
+            f"<div style='font-size:12px;color:#ccc;margin:-4px 0 6px;'>"
+            f"P{percentile:g}-robust U<sub>0</sub>: <b style='color:#4CAF50;'>{robust.uniformity_pct:.1f}%</b>"
+            f" <span style='color:#888;'>(optimiser metric)</span></div>"
+        )
+        robust_rows = (
+            f"<tr><td style='padding:1px 6px 1px 0;'>E<sub>min</sub> (P{percentile:g})</td><td>{robust.e_min:.1f} lx</td></tr>"
+            f"<tr><td style='padding:1px 6px 1px 0;'>U<sub>0</sub> (P{percentile:g}/E<sub>avg</sub>)</td><td>{robust.u0:.3f}</td></tr>"
+            f"<tr><td style='padding:1px 6px 1px 0;'>U<sub>1</sub> (P{percentile:g}/E<sub>max</sub>)</td><td>{robust.u1:.3f}</td></tr>"
+        )
     return (
         "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
         "<div style='font-weight:600;margin-bottom:4px;'>Pattern Uniformity</div>"
         f"<div style='font-size:22px;font-weight:700;color:{color};margin:2px 0 6px;'>{metrics.uniformity_pct:.1f}%</div>"
+        + robust_head +
         "<table style='font-size:11px;color:#ccc;border-collapse:collapse;width:100%;'>"
         f"<tr><td style='padding:1px 6px 1px 0;'>E<sub>max</sub></td><td>{metrics.e_max:.1f} lx</td></tr>"
         f"<tr><td style='padding:1px 6px 1px 0;'>E<sub>min</sub></td><td>{metrics.e_min:.1f} lx</td></tr>"
@@ -123,6 +141,7 @@ def uniformity_html(metrics: UniformityMetrics):
         f"<tr><td style='padding:1px 6px 1px 0;'>U<sub>0</sub> (E<sub>min</sub>/E<sub>avg</sub>)</td><td>{metrics.u0:.3f}</td></tr>"
         f"<tr><td style='padding:1px 6px 1px 0;'>U<sub>1</sub> (E<sub>min</sub>/E<sub>max</sub>)</td><td>{metrics.u1:.3f}</td></tr>"
         f"<tr><td style='padding:1px 6px 1px 0;'>CV (&sigma;/E<sub>avg</sub>)</td><td>{metrics.cv:.3f}</td></tr>"
+        + robust_rows +
         "<tr><td colspan='2' style='padding-top:4px;'></td></tr>"
         f"<tr><td style='padding:1px 6px 1px 0;'>EV<sub>max</sub></td><td>{metrics.ev_max:.2f} stops</td></tr>"
         f"<tr><td style='padding:1px 6px 1px 0;'>EV<sub>min</sub></td><td>{metrics.ev_min:.2f} stops</td></tr>"
@@ -135,7 +154,14 @@ def uniformity_html(metrics: UniformityMetrics):
     )
 
 
-def compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None, fov_trapezoid=None):
-    """Legacy one-shot helper: region selection + metrics + HTML ('' if unlit)."""
-    metrics = uniformity_metrics(select_region(grid, fov_bounds, wall_size_cm, fov_trapezoid))
-    return uniformity_html(metrics) if metrics else ""
+def compute_uniformity_html(grid, fov_bounds=None, wall_size_cm=None, fov_trapezoid=None, min_percentile=0.0):
+    """Legacy one-shot helper: region selection + metrics + HTML ('' if unlit).
+
+    ``min_percentile`` > 0 adds the percentile-based (optimiser) U0 next to the hard-minimum one.
+    """
+    region = select_region(grid, fov_bounds, wall_size_cm, fov_trapezoid)
+    metrics = uniformity_metrics(region)
+    if not metrics:
+        return ""
+    robust = uniformity_metrics(region, min_percentile) if min_percentile > 0 else None
+    return uniformity_html(metrics, robust, min_percentile)

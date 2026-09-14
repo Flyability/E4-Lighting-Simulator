@@ -64,16 +64,34 @@ def fire_update(handle):
 find("Select Configuration").value = "ludos_panels_n4"
 click("📂 Load Configuration")
 time.sleep(3)
-click("🔄 Refresh specs & groups")
+
+MODE_REFINE = "1 · Refine the current panels"
+MODE_DUCTS = "2 · Design LEDs on the ducts (from scratch)"
+MODE_PRESET = "3 · Run a preset spec file"
+
+
+def run_and_wait(label):
+    t0 = time.time()
+    click("▶ Run optimization")
+    while find("▶ Run optimization").disabled and time.time() - t0 < 180:
+        time.sleep(0.5)
+    print(f"[smoke] {label} finished in {time.time() - t0:.1f}s")
+
+
+# --- mode 1: refine -------------------------------------------------------
+find("Design mode").value = MODE_REFINE
+fire_update(find("Design mode"))
+click("🔄 Refresh group list")
 groups = find("Group").options
 print("[smoke] groups:", groups)
 find("Group").value = groups[0]
-find("Move / rotate group").value = True
+find("Move / rotate the panel").value = True
 find("LED on / off").value = True
 find("Drive current (→ lumens)").value = True
 find("Require flash lux target").value = True
 find("Require VIO FOV coverage").value = True
 find("Wall distances (cm)").value = "50, 150"
+find("Wall size").value = "Auto: fit camera FOV at each distance"
 find("Min beam angle off camera axis (°, 0 = off)").value = 30
 find("Symmetry penalty weight (0 = off)").value = 0.5
 find("Max evaluations").value = 40
@@ -85,25 +103,32 @@ find("Max active LEDs (0 = no limit)").value = 6
 find("Load best into scene when finished").value = True
 find("Show intensity on wall").value = True
 find("Rays per pixel (↑quality, ↓speed)").value = 20
-
-t0 = time.time()
-click("▶ Run optimization")
-while find("▶ Run optimization").disabled and time.time() - t0 < 180:
-    time.sleep(0.5)
-print(f"[smoke] optimisation finished in {time.time() - t0:.1f}s")
+run_and_wait("refine")
 print("[smoke] Project Name field:", find("Project Name").value)
 
-# preset spec path
-find("Preset spec").value = "ludo_refine"
-fire_update(find("Preset spec"))
-print("[smoke] after preset: metric=", find("Metric").value, "evals=", find("Max evaluations").value,
-      "vars from=", find("Variables from").value)
+# --- mode 3: preset as written, then with overrides -------------------------
+find("Design mode").value = MODE_PRESET
+fire_update(find("Design mode"))
+find("Spec file").value = "ludo_refine"
+fire_update(find("Spec file"))
+find("Start from the current scene").value = True
+find("Use the Evaluation folder (walls, camera, emission)").value = True
+fire_update(find("Use the Evaluation folder (walls, camera, emission)"))
 find("Max evaluations").value = 20
-find("Start from current scene").value = True
-find("Use UI wall / camera / emission").value = True
-t0 = time.time()
-click("▶ Run optimization")
-while find("▶ Run optimization").disabled and time.time() - t0 < 180:
-    time.sleep(0.5)
-print(f"[smoke] preset optimisation finished in {time.time() - t0:.1f}s")
+run_and_wait("preset (overrides)")
+
+# --- copy preset into controls -> switches to the matching mode -------------
+find("Spec file").value = "elios4_ducts_flash_vio"
+fire_update(find("Spec file"))
+click("📋 Copy spec into the controls & switch mode")
+print("[smoke] after copy: mode=", find("Design mode").value, "radius=", find("Duct radius (cm)").value,
+      "tol arc=", find("± around the duct (cm along circumference)").value, "rows=", find("Max rows (along axis)").value)
+assert find("Design mode").value == MODE_DUCTS
+
+# --- mode 2: ducts -----------------------------------------------------------
+find("± duct centre shift (cm)").value = (2.0, 2.0, 0.0)
+find("Max evaluations").value = 30
+find("Method").value = "random_search"
+find("Rays per pixel").value = 50
+run_and_wait("ducts")
 print("[smoke] errors:", errors or "none")

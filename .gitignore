@@ -5,6 +5,13 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+
+# IDE
+.idea/
+
+# Simulation / optimisation outputs
+exports/
 
 # Virtual environments
 .venv

@@ -114,6 +114,26 @@ _ti_generate_rays = None
 _ti_wall_finalize = None
 _ti_room_finalize = None
 
+# Rays per Taichi launch; the four ray buffers cost 32 B/ray host + device.
+TAICHI_MAX_BATCH = 4_000_000
+
+
+def purge_memory():
+    """Release cached device memory held by the active backend. Returns a status string."""
+    import gc
+    gc.collect()
+    if GPU_BACKEND == 'cuda' and _cp is not None:
+        pool = _cp.get_default_memory_pool()
+        cached = pool.total_bytes() - pool.used_bytes()
+        pool.free_all_blocks()
+        _cp.get_default_pinned_memory_pool().free_all_blocks()
+        return f"CUDA: released {cached/1e6:.0f} MB of cached blocks, {pool.used_bytes()/1e6:.0f} MB still in use"
+    if GPU_BACKEND == 'taichi' and _ti is not None:
+        _ti.reset()  # drops every device buffer; the runtime and kernels are rebuilt below
+        _init_taichi_backend()
+        return "Vulkan: runtime reset, all device buffers released"
+    return "no GPU backend active"
+
 
 def _init_taichi_backend():
     """Initialize Taichi with the Vulkan arch and compile the ray-tracing kernels.
@@ -150,9 +170,10 @@ def _init_taichi_backend():
                        out_positions: ti_module.types.ndarray(), out_dirs: ti_module.types.ndarray(),
                        out_lumens: ti_module.types.ndarray(), out_absorbed: ti_module.types.ndarray(),
                        num_rays: ti_module.i32, rays_per_led: ti_module.i32, num_absorbers: ti_module.i32,
-                       n_val: ti_module.f32, norm_factor: ti_module.f32, rays_per_led_f: ti_module.f32):
+                       n_val: ti_module.f32, norm_factor: ti_module.f32, rays_per_led_f: ti_module.f32,
+                       ray_offset: ti_module.i32):
         for idx in range(num_rays):
-            led_idx = idx // rays_per_led
+            led_idx = (idx + ray_offset) // rays_per_led
             pos = ti_module.Vector([positions[led_idx, 0], positions[led_idx, 1], positions[led_idx, 2]])
             z_axis = ti_module.Vector([directions[led_idx, 0], directions[led_idx, 1], directions[led_idx, 2]])
             va = viewing[led_idx]
@@ -685,24 +706,27 @@ def _taichi_process_led_wall_batch(leds_data, params):
 
     abs_center, abs_half, abs_rot, num_absorbers = _prepare_absorber_arrays(absorbers)
 
-    out_positions = np.zeros((total_rays, 3), dtype=np.float32)
-    out_dirs = np.zeros((total_rays, 3), dtype=np.float32)
-    out_lumens = np.zeros(total_rays, dtype=np.float32)
-    out_absorbed = np.zeros(total_rays, dtype=np.int32)
-
-    _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
-                       out_positions, out_dirs, out_lumens, out_absorbed,
-                       total_rays, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led))
-
-    if stl_mesh_data is not None:
-        absorbed_bool = out_absorbed.astype(bool)
-        _stl_check_absorption(stl_mesh_data, out_positions, out_dirs, absorbed_bool, np)
-        out_absorbed = absorbed_bool.astype(np.int32)
-
     grid = np.zeros((grid_size, grid_size), dtype=np.float64)
-    _ti_wall_finalize(out_positions, out_dirs, out_lumens, out_absorbed, grid,
-                       total_rays, float(wall_dist), float(half_size), float(cell_size),
-                       grid_size, float(cell_area_m2))
+    batch = min(total_rays, TAICHI_MAX_BATCH)
+    out_positions = np.zeros((batch, 3), dtype=np.float32)
+    out_dirs = np.zeros((batch, 3), dtype=np.float32)
+    out_lumens = np.zeros(batch, dtype=np.float32)
+    out_absorbed = np.zeros(batch, dtype=np.int32)
+
+    for start in range(0, total_rays, batch):
+        n = min(batch, total_rays - start)
+        _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
+                           out_positions, out_dirs, out_lumens, out_absorbed,
+                           n, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led), start)
+
+        if stl_mesh_data is not None:
+            absorbed_bool = out_absorbed[:n].astype(bool)
+            _stl_check_absorption(stl_mesh_data, out_positions[:n], out_dirs[:n], absorbed_bool, np)
+            out_absorbed[:n] = absorbed_bool.astype(np.int32)
+
+        _ti_wall_finalize(out_positions, out_dirs, out_lumens, out_absorbed, grid,
+                           n, float(wall_dist), float(half_size), float(cell_size),
+                           grid_size, float(cell_area_m2))
 
     t1 = time.perf_counter()
     if params.get('verbose', True):
@@ -1005,28 +1029,31 @@ def _taichi_process_room_batch(leds_data, params):
 
     abs_center, abs_half, abs_rot, num_absorbers = _prepare_absorber_arrays(absorbers)
 
-    out_positions = np.zeros((total_rays, 3), dtype=np.float32)
-    out_dirs = np.zeros((total_rays, 3), dtype=np.float32)
-    out_lumens = np.zeros(total_rays, dtype=np.float32)
-    out_absorbed = np.zeros(total_rays, dtype=np.int32)
-
-    _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
-                       out_positions, out_dirs, out_lumens, out_absorbed,
-                       total_rays, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led))
-
-    if stl_mesh_data is not None:
-        absorbed_bool = out_absorbed.astype(bool)
-        _stl_check_absorption(stl_mesh_data, out_positions, out_dirs, absorbed_bool, np)
-        out_absorbed = absorbed_bool.astype(np.int32)
-
+    batch = min(total_rays, TAICHI_MAX_BATCH)
+    out_positions = np.zeros((batch, 3), dtype=np.float32)
+    out_dirs = np.zeros((batch, 3), dtype=np.float32)
+    out_lumens = np.zeros(batch, dtype=np.float32)
+    out_absorbed = np.zeros(batch, dtype=np.int32)
     hits = np.zeros(6, dtype=np.int32)
-    _ti_room_finalize(out_positions, out_dirs, out_lumens, out_absorbed,
-                       grids['front'], grids['left'], grids['right'],
-                       grids['top'], grids['bottom'], grids['back'],
-                       hits, col_add, col_scale, row_add, row_scale, rows, cols, area_m2,
-                       c1_axis, c2_axis, total_rays, float(front_dist), float(side_dist),
-                       float(top_bottom_dist), float(back_dist) if back_dist is not None else 0.0,
-                       has_back, int(max_bounces), float(wall_reflectance))
+
+    for start in range(0, total_rays, batch):
+        n = min(batch, total_rays - start)
+        _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
+                           out_positions, out_dirs, out_lumens, out_absorbed,
+                           n, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led), start)
+
+        if stl_mesh_data is not None:
+            absorbed_bool = out_absorbed[:n].astype(bool)
+            _stl_check_absorption(stl_mesh_data, out_positions[:n], out_dirs[:n], absorbed_bool, np)
+            out_absorbed[:n] = absorbed_bool.astype(np.int32)
+
+        _ti_room_finalize(out_positions, out_dirs, out_lumens, out_absorbed,
+                           grids['front'], grids['left'], grids['right'],
+                           grids['top'], grids['bottom'], grids['back'],
+                           hits, col_add, col_scale, row_add, row_scale, rows, cols, area_m2,
+                           c1_axis, c2_axis, n, float(front_dist), float(side_dist),
+                           float(top_bottom_dist), float(back_dist) if back_dist is not None else 0.0,
+                           has_back, int(max_bounces), float(wall_reflectance))
 
     t1 = time.perf_counter()
     ray_hits = {}

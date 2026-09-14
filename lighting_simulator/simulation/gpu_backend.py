@@ -109,3 +109,11 @@ def gpu_process_led_wall_batch(leds_data, params):
 def gpu_process_room_batch(leds_data, params):
     with _gpu_lock:
         return _gpu.gpu_process_room_batch(leds_data, params)
+
+
+def purge_memory():
+    """Free cached device memory (waits for any running kernel). Returns a status string."""
+    if not HAS_GPU_MODULE:
+        return "GPU module not available"
+    with _gpu_lock:
+        return _gpu.purge_memory()

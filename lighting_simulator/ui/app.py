@@ -2466,6 +2466,10 @@ def main():
             "Black threshold (lux)", min=0, max=10000, step=10, initial_value=0
         )
         server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Cells below this lux are drawn pitch black (0 = off). Applies to wall and room maps after the next update.</div>")
+        uniformity_percentile_slider = server.gui.add_slider(
+            "Robust Eₘᵢₙ percentile (%)", min=0.0, max=10.0, step=0.5, initial_value=2.0,
+            hint="Adds U0 = P(E)/Eavg to the legend (the optimiser's metric); 0 hides it. Legend updates instantly.",
+        )
         cell_area_html = server.gui.add_html(
             "<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
             "Cell area: calculating..."
@@ -2523,6 +2527,26 @@ def main():
         export_lux_matrix_button = server.gui.add_button("Export Lux Matrix (±40cm)")
 
     # --- CSV Pattern Import (initially collapsed) ---
+    with tab_advanced:
+        _gpu_folder = server.gui.add_folder("🎮 GPU", expand_by_default=False)
+    with _gpu_folder:
+        gpu_status_html = server.gui.add_html(
+            "<div style='font-size:11px;color:#888;'>Backend is initialised on the first ray trace.</div>"
+        )
+        gpu_purge_btn = server.gui.add_button("🧹 Purge GPU memory",
+                                              hint="Release cached device buffers (Vulkan: resets the runtime)")
+
+        @gpu_purge_btn.on_click
+        def _(_):
+            try:
+                t0 = time.perf_counter()
+                msg = _gpu_backend.purge_memory()
+                gpu_status_html.content = (f"<div style='font-size:11px;color:#4CAF50;'>{msg} "
+                                           f"({time.perf_counter() - t0:.1f}s)</div>")
+            except Exception as exc:
+                gpu_status_html.content = f"<div style='font-size:11px;color:#ff6666;'>Purge failed: {exc}</div>"
+            print(f"[GPU] purge: {gpu_status_html.content}")
+
     with tab_advanced:
         _csv_folder = server.gui.add_folder("📊 Import CSV Pattern", expand_by_default=False)
     with _csv_folder:
@@ -6050,6 +6074,7 @@ def main():
             grid,
             fov_trapezoid=(*_trap, camera_pos_y.value),
             wall_size_cm=wall_size_cm,
+            min_percentile=float(uniformity_percentile_slider.value),
         )
         if not html:
             html = _empty_fov_html()
@@ -6060,7 +6085,9 @@ def main():
         if fov_lux.size == 0:
             html = _empty_fov_html()
         else:
-            html = _compute_uniformity_html(fov_lux.reshape(1, -1)) or _empty_fov_html()
+            html = (_compute_uniformity_html(fov_lux.reshape(1, -1),
+                                             min_percentile=float(uniformity_percentile_slider.value))
+                    or _empty_fov_html())
         return html + _compute_vio_occupancy_html()
 
     def _refresh_uniformity():
@@ -9598,6 +9625,7 @@ def main():
     intensity_rays_slider.on_update(lambda _: None)  # No auto-update - manual button only
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_threshold_slider.on_update(lambda _: _refresh_uniformity())
+    uniformity_percentile_slider.on_update(lambda _: _refresh_uniformity())
     intensity_grid_size.on_update(lambda _: update_cell_area_info())  # Update cell area when resolution changes
     wall_view_size.on_update(lambda _: update_cell_area_info())  # Update cell area when wall size changes
     
@@ -9796,52 +9824,40 @@ def main():
             labels.append(f"{idx}: {name}")
         return labels or [_OPTIM_NO_GROUP]
 
-    with tab_optim:
-        _optim_problem_folder = server.gui.add_folder("Problem")
-    with _optim_problem_folder:
-        server.gui.add_html(
-            "<div style='color:#888;font-size:12px;margin-bottom:6px;'>Optimise LED placement for wall "
-            "uniformity inside the main camera FOV. Pick a preset spec or build the problem from the "
-            "current scene; results are written to exports/optim/&lt;run name&gt;/.</div>"
-        )
-        optim_spec_dropdown = server.gui.add_dropdown(
-            "Preset spec", options=_optim_spec_names(), initial_value=_OPTIM_NO_SPEC,
-            hint="optimization_specs/*.json — fills the controls below",
-        )
-        optim_refresh_btn = server.gui.add_button("🔄 Refresh specs & groups")
-        optim_base_current = server.gui.add_checkbox(
-            "Start from current scene", initial_value=True,
-            hint="Off: start from the spec's base_config file",
-        )
-        optim_settings_current = server.gui.add_checkbox(
-            "Use UI wall / camera / emission", initial_value=True,
-            hint="Off: use the spec's wall, camera and emission sections",
-        )
-        optim_wall_dists = server.gui.add_text(
-            "Wall distances (cm)", initial_value="",
-            hint="Comma-separated; score is averaged over them. Empty = wall distance slider",
-        )
-        optim_grid = server.gui.add_slider(
-            "Wall grid resolution", min=5, max=200, step=5, initial_value=30,
-            hint="Cells per side of the evaluation grid (same meaning as in Intensity Map); coarser = faster",
-        )
-        optim_wall_size = server.gui.add_slider(
-            "Wall view size (cm)", min=100, max=2000, step=10, initial_value=int(wall_view_size.value),
-            hint="Physical extent of the evaluation grid; must cover the camera FOV footprint",
-        )
-        optim_rpp = server.gui.add_number("Rays per pixel", 300, min=10, max=100000, step=10)
+    _MODE_REFINE = "1 · Refine the current panels"
+    _MODE_DUCTS = "2 · Design LEDs on the ducts (from scratch)"
+    _MODE_PRESET = "3 · Run a preset spec file"
 
-        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>Variables</div>")
-        optim_var_source = server.gui.add_dropdown(
-            "Variables from", options=["Selected group", "Preset spec"], initial_value="Selected group",
+    with tab_optim:
+        server.gui.add_html(
+            "<div style='color:#bbb;font-size:12px;line-height:1.4;margin-bottom:4px;'>"
+            "<b>How it works</b> — the optimiser repeatedly ray-traces candidate LED layouts and keeps the one "
+            "with the most uniform light inside the main-camera FOV (plus your constraints). Pick a design mode:"
+            "<ul style='margin:4px 0 0 14px;padding:0;'>"
+            "<li><b>1 Refine</b>: keep the scene, nudge one existing panel (position, tilt, beam, on/off, current).</li>"
+            "<li><b>2 Ducts</b>: remove all LEDs and place a new symmetric lattice on the duct rings within tolerances.</li>"
+            "<li><b>3 Preset</b>: run a JSON spec from <code>optimization_specs/</code> as-is (optionally overriding parts with the UI).</li>"
+            "</ul>Camera, emission and VIO poses always come from the FOV / Intensity tabs. "
+            "Results go to <code>exports/optim/&lt;run name&gt;/</code> (best_config.json + report.pdf).</div>",
+            order=1,
         )
+        optim_mode = server.gui.add_dropdown("Design mode", options=[_MODE_REFINE, _MODE_DUCTS, _MODE_PRESET],
+                                             initial_value=_MODE_REFINE, order=2)
+
+    # -- ① Refine ---------------------------------------------------------
+    with tab_optim:
+        _optim_refine_folder = server.gui.add_folder("① Panel to refine", order=10)
+    with _optim_refine_folder:
         optim_group_dropdown = server.gui.add_dropdown("Group", options=_optim_group_labels())
-        optim_var_pose = server.gui.add_checkbox("Move / rotate group", initial_value=True)
+        optim_refresh_groups_btn = server.gui.add_button("🔄 Refresh group list")
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>What may change</div>")
+        optim_var_pose = server.gui.add_checkbox("Move / rotate the panel", initial_value=True)
         optim_pos_delta = server.gui.add_vector3("± position (cm)", (2.0, 2.0, 2.0),
                                                  min=(0.0, 0.0, 0.0), max=(50.0, 50.0, 50.0), step=0.5)
         optim_rot_delta = server.gui.add_vector3("± rotation (°)", (15.0, 15.0, 20.0),
                                                  min=(0.0, 0.0, 0.0), max=(180.0, 180.0, 180.0), step=1.0)
-        optim_var_tilts = server.gui.add_checkbox("Per-LED beam tilt (dynamic groups)", initial_value=False)
+        optim_var_tilts = server.gui.add_checkbox("Per-LED beam tilt", initial_value=False,
+                                                  hint="Dynamic (designer / template) groups only")
         optim_tilt_range = server.gui.add_slider("± beam tilt (°)", min=5, max=90, step=5, initial_value=45)
         optim_var_beam = server.gui.add_checkbox("Shared beam angle", initial_value=False)
         optim_beam_range = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
@@ -9852,8 +9868,239 @@ def main():
         optim_current_range = server.gui.add_multi_slider("Current range (A)", min=0.1, max=13.0, step=0.1,
                                                           initial_value=(0.5, 3.0))
 
+    # -- ③ Preset ---------------------------------------------------------
     with tab_optim:
-        _optim_elec_folder = server.gui.add_folder("Electrical & operating modes")
+        _optim_preset_folder = server.gui.add_folder("③ Preset spec", order=30)
+    with _optim_preset_folder:
+        optim_spec_dropdown = server.gui.add_dropdown(
+            "Spec file", options=_optim_spec_names(), initial_value=_OPTIM_NO_SPEC,
+            hint="optimization_specs/*.json",
+        )
+        optim_refresh_specs_btn = server.gui.add_button("🔄 Refresh spec list")
+        optim_spec_info_html = server.gui.add_html("<div style='color:#888;font-size:12px;'>No spec selected.</div>")
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>Overrides (off = use the spec as written)</div>")
+        optim_preset_use_scene = server.gui.add_checkbox(
+            "Start from the current scene", initial_value=False,
+            hint="Replaces the spec's base_config with the loaded scene",
+        )
+        optim_preset_use_wall = server.gui.add_checkbox(
+            "Use the Evaluation folder (walls, camera, emission)", initial_value=False,
+        )
+        optim_preset_use_obj = server.gui.add_checkbox(
+            "Use the Objective / Electrical folders", initial_value=False,
+        )
+        optim_copy_preset_btn = server.gui.add_button(
+            "📋 Copy spec into the controls & switch mode",
+            hint="Fills every folder from the spec, then selects mode 1 or 2 so you can edit and run it",
+        )
+
+    # -- Evaluation (modes 1 & 2, or preset override) -------------------------
+    with tab_optim:
+        _optim_eval_folder = server.gui.add_folder("Evaluation walls", order=40)
+    with _optim_eval_folder:
+        server.gui.add_html(
+            "<div style='color:#888;font-size:12px;margin-bottom:4px;'>Where uniformity is measured. Camera FOV "
+            "and LED lumens are taken from the FOV / Intensity tabs.</div>"
+        )
+        optim_wall_dists = server.gui.add_text(
+            "Wall distances (cm)", initial_value="",
+            hint="Comma-separated; score is averaged over them. Empty = Intensity Map wall distance",
+        )
+        optim_grid = server.gui.add_slider(
+            "Wall grid resolution", min=5, max=200, step=5, initial_value=60,
+            hint="Cells per side. Aim for ~1 cm cells inside the FOV (auto wall size at 50 cm ≈ 80 cm → 60–80); "
+                 "coarser blurs beam overlaps, finer needs more rays",
+        )
+        _WS_AUTO, _WS_FIXED, _WS_LIST = "Auto: fit camera FOV at each distance", "Fixed size", "Custom list"
+        optim_wall_size_mode = server.gui.add_dropdown("Wall size", options=[_WS_AUTO, _WS_FIXED, _WS_LIST],
+                                                       initial_value=_WS_AUTO)
+        optim_wall_size = server.gui.add_slider(
+            "Fixed wall size (cm)", min=100, max=2000, step=10, initial_value=int(wall_view_size.value),
+            visible=False,
+        )
+        optim_wall_sizes = server.gui.add_text(
+            "Wall sizes per distance (cm)", initial_value="", visible=False,
+            hint="Comma list matching 'Wall distances'",
+        )
+        optim_rpp = server.gui.add_number("Rays per pixel", 1500, min=10, max=100000, step=10,
+                                          hint="Rays are random: aim for ≥ 1000 hits per FOV cell (≈ 3 % noise). "
+                                               "Every new best is re-checked with fresh rays")
+
+        @optim_wall_size_mode.on_update
+        def _(_):
+            optim_wall_size.visible = optim_wall_size_mode.value == _WS_FIXED
+            optim_wall_sizes.visible = optim_wall_size_mode.value == _WS_LIST
+
+    with tab_optim:
+        _optim_duct_folder = server.gui.add_folder("② Ducts", order=20)
+    with _optim_duct_folder:
+        server.gui.add_html(
+            "<div style='color:#888;font-size:12px;margin-bottom:6px;'>Enter the nominal duct geometry and the "
+            "mechanical tolerances; the optimiser places an LED lattice on the duct surface (and its "
+            "left/right mirror) anywhere inside those tolerances. Existing LEDs are removed.</div>"
+        )
+        duct_show = server.gui.add_checkbox("Show ducts in 3D", initial_value=True)
+        duct_center = server.gui.add_vector3("Duct centre (cm)", (6.3, 12.0, 0.0), step=0.1)
+        duct_radius = server.gui.add_number("Duct radius (cm)", 8.5, min=1.0, max=50.0, step=0.1)
+        duct_axis = server.gui.add_dropdown("Duct axis", options=["Z (vertical)", "Y (lateral)", "X (forward)"],
+                                            initial_value="Z (vertical)")
+        duct_mirror = server.gui.add_checkbox("Mirror across XZ (symmetric pair)", initial_value=True)
+        duct_theta0 = server.gui.add_slider("Nominal LED position on duct (°, 0 = +X)", min=-180, max=180,
+                                            step=5, initial_value=30)
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>Tolerances</div>")
+        duct_tol_radius = server.gui.add_number("± radius / stand-off (cm)", 2.0, min=0.0, max=20.0, step=0.5)
+        duct_tol_arc = server.gui.add_number("± around the duct (cm along circumference)", 20.0,
+                                             min=0.0, max=100.0, step=1.0)
+        duct_tol_axial = server.gui.add_number("± along duct axis (cm)", 2.0, min=0.0, max=20.0, step=0.5)
+        duct_tol_center = server.gui.add_vector3("± duct centre shift (cm)", (0.0, 0.0, 0.0),
+                                                 min=(0.0, 0.0, 0.0), max=(50.0, 50.0, 50.0), step=0.5)
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>LED lattice</div>")
+        duct_rows = server.gui.add_number("Max rows (along axis)", 3, min=1, max=8, step=1)
+        duct_cols = server.gui.add_number("Max columns (around duct)", 4, min=1, max=12, step=1)
+        duct_var_counts = server.gui.add_checkbox("Optimise row / column count", initial_value=True)
+        duct_span_cm = server.gui.add_multi_slider("Lattice arc span (cm)", min=1, max=60, step=1,
+                                                   initial_value=(3, 25))
+        duct_pitch_cm = server.gui.add_multi_slider("Row pitch (cm)", min=0.5, max=5.0, step=0.1,
+                                                    initial_value=(0.8, 2.0))
+        duct_tilt = server.gui.add_slider("± beam tilt toward axis (°)", min=0, max=90, step=5, initial_value=60)
+        duct_tilt_shared = server.gui.add_checkbox("Shared tilt for all LEDs", initial_value=False)
+        duct_beam = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
+                                                initial_value=(90, 130))
+        duct_current = server.gui.add_multi_slider("Drive current range (A)", min=0.1, max=13.0, step=0.1,
+                                                   initial_value=(0.3, 3.0))
+        duct_on_off = server.gui.add_checkbox("Optimise per-LED on/off", initial_value=False)
+        duct_led_size = server.gui.add_number("LED size (cm)", 1.0, min=0.2, max=3.0, step=0.1)
+
+    _DUCT_AXES = {"Z (vertical)": ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+                  "Y (lateral)": ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
+                  "X (forward)": ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0])}
+
+    def _optim_duct_variables():
+        from lighting_simulator.optimization.variables import arc_cm_to_deg
+        axis, ref = _DUCT_AXES[duct_axis.value]
+        r = float(duct_radius.value)
+        d_theta = arc_cm_to_deg(duct_tol_arc.value, r)
+        span_lo, span_hi = (arc_cm_to_deg(v, r) for v in duct_span_cm.value)
+        rows, cols = int(duct_rows.value), int(duct_cols.value)
+        t = float(duct_tilt.value)
+        var = {
+            'type': 'duct_ring', 'name': 'duct',
+            'duct': {'center': [float(v) for v in duct_center.value], 'axis': axis, 'radius': r,
+                     'reference': ref, 'mount_offset': 0.0},
+            'placement': 'arc',
+            'n_leds': rows * cols, 'n_rows': rows,
+            'theta_range': [float(duct_theta0.value) - d_theta, float(duct_theta0.value) + d_theta],
+            'arc_span_range': [max(0.5, span_lo), max(span_lo + 0.5, span_hi)],
+            'axial_range': [-float(duct_tol_axial.value), float(duct_tol_axial.value)],
+            'row_pitch_range': [float(v) for v in duct_pitch_cm.value],
+            'radial_range': [-float(duct_tol_radius.value), float(duct_tol_radius.value)],
+            'tilt_axial_range': [-t, t] if t > 0 else None,
+            'shared_tilt': bool(duct_tilt_shared.value),
+            'beam_angle_range': [float(v) for v in duct_beam.value], 'shared_beam_angle': True,
+            'current_range': [float(v) for v in duct_current.value],
+            'optimize_enabled': bool(duct_on_off.value),
+            'led_size': float(duct_led_size.value),
+            'mirror_xz': bool(duct_mirror.value),
+        }
+        if duct_var_counts.value:
+            var['n_rows_range'] = [1, rows]
+            var['n_cols_range'] = [1, cols]
+        if any(v > 0 for v in duct_tol_center.value):
+            var['center_delta'] = [float(v) for v in duct_tol_center.value]
+        return [var]
+
+    _duct_preview_handles = []
+
+    def _duct_sector_wireframe_m(center, axis, ref, theta_lo, theta_hi, r_lo, r_hi, t_lo, t_hi, n_arc=32):
+        """Edges (metres) of a cylindrical-shell sector: a box 'wrapped' around the duct."""
+        from lighting_simulator.optimization.variables import Duct
+        a, u, v = Duct(center=tuple(center), axis=tuple(axis), radius=1.0, reference=tuple(ref)).frame()
+        c = np.asarray(center, float)
+
+        def p(theta_deg, r, t):
+            th = np.radians(theta_deg)
+            return c + r * (np.cos(th) * u + np.sin(th) * v) + t * a
+
+        segs = []
+        thetas = np.linspace(theta_lo, theta_hi, n_arc + 1)
+        for r in (r_lo, r_hi):
+            for t in (t_lo, t_hi):
+                pts = np.array([p(th, r, t) for th in thetas])
+                segs += [[pts[k], pts[k + 1]] for k in range(n_arc)]
+        for th in (theta_lo, theta_hi):
+            for t in (t_lo, t_hi):
+                segs.append([p(th, r_lo, t), p(th, r_hi, t)])
+            for r in (r_lo, r_hi):
+                segs.append([p(th, r, t_lo), p(th, r, t_hi)])
+        return np.asarray(segs, float) / 100.0
+
+    def _draw_duct_preview(_=None):
+        from lighting_simulator.optimization.variables import arc_cm_to_deg
+        for h in _duct_preview_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        _duct_preview_handles.clear()
+        if not duct_show.value or optim_mode.value != _MODE_DUCTS:
+            return
+        axis, ref = _DUCT_AXES[duct_axis.value]
+        axis = np.asarray(axis, float)
+        centers = [np.asarray(duct_center.value, float)]
+        if duct_mirror.value:
+            centers.append(centers[0] * np.array([1.0, -1.0, 1.0]))
+        r = float(duct_radius.value)
+        tol_r, tol_t = float(duct_tol_radius.value), float(duct_tol_axial.value)
+        theta0 = float(duct_theta0.value)
+        d_theta = arc_cm_to_deg(duct_tol_arc.value, r)
+        half_span = arc_cm_to_deg(duct_span_cm.value[1], r) / 2.0
+        shift = float(max(duct_tol_center.value))
+        half = tol_t + 2.0
+        from lighting_simulator.optimization.variables import Duct
+        _a, _u, _v = Duct(center=(0, 0, 0), axis=tuple(axis), radius=1.0, reference=tuple(ref)).frame()
+        # XZ mirroring flips theta only if the circumferential direction runs along Y
+        mirror_sign = -1.0 if abs(_v[1]) > 0.5 else 1.0
+        for i, c in enumerate(centers):
+            th0 = theta0 * (mirror_sign if i == 1 else 1.0)
+            for k, t in enumerate((-half, 0.0, half)):  # the duct itself
+                segs = _circle_line_segments_m(c + axis * t, r, axis, n_seg=64)
+                _duct_preview_handles.append(server.scene.add_line_segments(
+                    f"/optim_ducts/{i}/ring_{k}", points=segs, colors=(1.0, 0.55, 0.1), line_width=2.0))
+            # tolerance box for the lattice centre: ± arc, ± radius, ± axial (+ centre shift on r/t)
+            segs = _duct_sector_wireframe_m(c, axis, ref, th0 - d_theta, th0 + d_theta,
+                                            max(0.1, r - tol_r - shift), r + tol_r + shift,
+                                            -tol_t - shift, tol_t + shift)
+            _duct_preview_handles.append(server.scene.add_line_segments(
+                f"/optim_ducts/{i}/tol_box", points=segs, colors=(1.0, 0.85, 0.2), line_width=2.5))
+            # envelope reachable by any LED of the lattice (adds half the max arc span each side)
+            if half_span > 0:
+                segs = _duct_sector_wireframe_m(c, axis, ref, th0 - d_theta - half_span, th0 + d_theta + half_span,
+                                                max(0.1, r - tol_r - shift), r + tol_r + shift,
+                                                -tol_t - shift, tol_t + shift)
+                _duct_preview_handles.append(server.scene.add_line_segments(
+                    f"/optim_ducts/{i}/envelope", points=segs, colors=(1.0, 0.95, 0.6), line_width=1.0))
+
+    for _h in (duct_show, duct_center, duct_radius, duct_axis, duct_mirror, duct_tol_radius,
+               duct_tol_axial, duct_theta0, duct_tol_arc, duct_span_cm, duct_tol_center):
+        _h.on_update(_draw_duct_preview)
+
+    def _optim_mode_changed(_=None):
+        mode = optim_mode.value
+        preset = mode == _MODE_PRESET
+        _optim_refine_folder.visible = mode == _MODE_REFINE
+        _optim_duct_folder.visible = mode == _MODE_DUCTS
+        _optim_preset_folder.visible = preset
+        _optim_eval_folder.visible = (not preset) or optim_preset_use_wall.value
+        _optim_obj_folder.visible = (not preset) or optim_preset_use_obj.value
+        _optim_elec_folder.visible = (not preset) or optim_preset_use_obj.value
+        _draw_duct_preview()
+
+    optim_mode.on_update(_optim_mode_changed)
+    optim_preset_use_wall.on_update(_optim_mode_changed)
+    optim_preset_use_obj.on_update(_optim_mode_changed)
+
+    with tab_optim:
+        _optim_elec_folder = server.gui.add_folder("Electrical & operating modes", order=60)
     with _optim_elec_folder:
         server.gui.add_html(
             "<div style='color:#888;font-size:12px;margin-bottom:6px;'>LED flux is linear in current. "
@@ -9883,16 +10130,17 @@ def main():
         optim_vio_grid = server.gui.add_number("VIO wall grid resolution", 40, min=5, max=200, step=5)
 
     with tab_optim:
-        _optim_obj_folder = server.gui.add_folder("Objective & constraints")
+        _optim_obj_folder = server.gui.add_folder("Objective & constraints", order=50)
     with _optim_obj_folder:
         optim_metric = server.gui.add_dropdown(
             "Metric", options=["u0", "u1", "cv"], initial_value="u0",
-            hint="u0 = Emin/Eavg, u1 = Emin/Emax, cv = σ/Eavg",
+            hint="u0 = Emin/Eavg (Emin at the percentile below), u1 = Emin/Emax, cv = σ/Eavg (uses all cells; "
+                 "least sensitive to ray noise)",
         )
         optim_min_pct = server.gui.add_slider("Emin percentile (%)", min=0.0, max=10.0, step=0.5, initial_value=2.0,
-                                              hint="0 = hard minimum (as in the legend)")
+                                              hint="0 = single darkest cell (very noisy on fine grids); 2–5 recommended")
         optim_cov_w = server.gui.add_slider("Coverage penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
-        optim_min_lux = server.gui.add_number("Min average lux (0 = off)", 0, min=0, step=10)
+        optim_min_lux = server.gui.add_number("Min average lux, normal mode (0 = off)", 0, min=0, step=10)
         optim_lux_w = server.gui.add_slider("Lux penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
         optim_max_leds = server.gui.add_number("Max active LEDs (0 = no limit)", 0, min=0, step=1)
         optim_max_leds_w = server.gui.add_slider("Penalty per LED over limit", min=0.0, max=1.0, step=0.01,
@@ -9914,14 +10162,15 @@ def main():
         )
 
     with tab_optim:
-        _optim_opt_folder = server.gui.add_folder("Optimizer")
+        _optim_opt_folder = server.gui.add_folder("Optimizer", order=70)
     with _optim_opt_folder:
         optim_method = server.gui.add_dropdown(
             "Method", options=["differential_evolution", "nelder_mead", "random_search"],
             initial_value="differential_evolution",
         )
-        optim_max_evals = server.gui.add_number("Max evaluations", 500, min=10, max=200000, step=10)
-        optim_population = server.gui.add_number("Population", 30, min=4, max=2000, step=1)
+        optim_max_evals = server.gui.add_number("Max evaluations", 3000, min=10, max=200000, step=10)
+        optim_population = server.gui.add_number("Population", 60, min=4, max=2000, step=1,
+                                                 hint="≈ 3× the number of variables")
         optim_seed = server.gui.add_number("Seed", 0, min=0, step=1)
         optim_workers = server.gui.add_number("CPU workers (-1 = all cores)", 1, min=-1, max=128, step=1,
                                               hint="Differential evolution only; ignored when the GPU is used")
@@ -9933,7 +10182,7 @@ def main():
         optim_name = server.gui.add_text("Run name", initial_value="", hint="Output folder name; empty = auto")
 
     with tab_optim:
-        _optim_run_folder = server.gui.add_folder("Run")
+        _optim_run_folder = server.gui.add_folder("Run", order=80)
     with _optim_run_folder:
         optim_run_btn = server.gui.add_button("▶ Run optimization", color="green")
         optim_stop_btn = server.gui.add_button("■ Stop", color="red", disabled=True)
@@ -9941,7 +10190,7 @@ def main():
         optim_status_html = server.gui.add_html(
             "<div style='color:#888;font-size:12px;'>Idle</div>"
         )
-        _OPTIM_EMPTY_PLOT = tuple(np.array([0.0]) for _ in range(4))
+        _OPTIM_EMPTY_PLOT = tuple(np.array([1.0]) for _ in range(4))  # > 0 so the log axis is valid
         optim_plot = server.gui.add_uplot(
             data=_OPTIM_EMPTY_PLOT,
             series=(
@@ -9954,11 +10203,23 @@ def main():
             scales={"x": {"time": False}},
             aspect=1.6,
         )
+        optim_plot_log = server.gui.add_checkbox("Logarithmic score axis", initial_value=True,
+                                                 hint="Can be toggled while an optimisation is running")
+
+        def _optim_plot_scale(_=None):
+            # uPlot distr: 1 = linear, 3 = logarithmic (scores are always > 0)
+            optim_plot.scales = {"x": {"time": False},
+                                 "y": {"distr": 3, "log": 10} if optim_plot_log.value else {"distr": 1}}
+
+        optim_plot_log.on_update(_optim_plot_scale)
+        _optim_plot_scale()
         optim_autoload = server.gui.add_checkbox("Load best into scene when finished", initial_value=True)
         optim_load_btn = server.gui.add_button("📥 Load best into scene")
         optim_report_btn = server.gui.add_button("📄 Open PDF report", disabled=True)
         optim_save_name = server.gui.add_text("Save best as", initial_value="")
         optim_save_btn = server.gui.add_button("💾 Save best to configs/")
+
+    _optim_mode_changed()  # initial folder visibility for the default mode
 
     def _optim_status(text, color="#ccc"):
         optim_status_html.content = (
@@ -9979,7 +10240,17 @@ def main():
         dist = wall.get('wall_dist', 100)
         optim_wall_dists.value = ", ".join(f"{d:g}" for d in (dist if isinstance(dist, list) else [dist]))
         optim_grid.value = int(wall.get('grid_size', optim_grid.value))
-        optim_wall_size.value = int(wall.get('wall_size', optim_wall_size.value))
+        ws = wall.get('wall_size')
+        if isinstance(ws, list):
+            optim_wall_sizes.value = ", ".join(f"{s:g}" for s in ws)
+            optim_wall_size_mode.value = _WS_LIST
+        elif ws == "auto" or ws is None:
+            optim_wall_size_mode.value = _WS_AUTO
+        else:
+            optim_wall_size_mode.value = _WS_FIXED
+            optim_wall_size.value = int(ws)
+        optim_wall_size.visible = optim_wall_size_mode.value == _WS_FIXED
+        optim_wall_sizes.visible = optim_wall_size_mode.value == _WS_LIST
         optim_rpp.value = int(wall.get('rays_per_pixel', optim_rpp.value))
         obj = spec.get('objective', {})
         optim_metric.value = obj.get('metric', 'u0')
@@ -10032,11 +10303,101 @@ def main():
         optim_workers.value = int(opt.get('workers', 1))
         optim_polish.value = bool(opt.get('polish', False))
         optim_name.value = spec.get('name', '')
-        optim_var_source.value = "Preset spec"
-        optim_base_current.value = False
-        optim_settings_current.value = False
+        _optim_apply_spec_variables(spec)
+
+    def _optim_apply_spec_variables(spec):
+        """Fill the ①/② folders from the spec's variables and select the matching mode."""
+        variables = spec.get('variables', [])
+        ducts = [v for v in variables if v.get('type') == 'duct_ring']
+        if ducts:
+            import math as _math
+            v = ducts[0]
+            d = v.get('duct', {})
+            r = float(d.get('radius', duct_radius.value))
+            duct_center.value = tuple(float(c) for c in d.get('center', duct_center.value))
+            duct_radius.value = r
+            ax = np.asarray(d.get('axis', [0, 0, 1]), float)
+            duct_axis.value = max(_DUCT_AXES, key=lambda k: abs(np.dot(_DUCT_AXES[k][0], ax)))
+            duct_mirror.value = bool(v.get('mirror_xz', False))
+            th = v.get('theta_range', [-60, 60])
+            duct_theta0.value = int(round((th[0] + th[1]) / 2 / 5) * 5)
+            duct_tol_arc.value = round(r * _math.radians((th[1] - th[0]) / 2), 1)
+            span = v.get('arc_span_range', [10, 120])
+            duct_span_cm.value = (max(1, int(round(r * _math.radians(span[0])))),
+                                  max(2, int(round(r * _math.radians(span[1])))))
+            axial = v.get('axial_range', [-1.5, 1.5])
+            duct_tol_axial.value = max(abs(axial[0]), abs(axial[1]))
+            rad = v.get('radial_range')
+            duct_tol_radius.value = max(abs(rad[0]), abs(rad[1])) if rad else 0.0
+            duct_tol_center.value = tuple(float(c) for c in v.get('center_delta', (0.0, 0.0, 0.0)))
+            n_rows = int(v.get('n_rows', 1))
+            n_cols = max(1, int(v.get('n_leds', n_rows)) // n_rows)
+            rr, cc = v.get('n_rows_range'), v.get('n_cols_range')
+            duct_var_counts.value = bool(rr or cc)
+            duct_rows.value = int(rr[1]) if rr else n_rows
+            duct_cols.value = int(cc[1]) if cc else n_cols
+            duct_pitch_cm.value = tuple(float(p) for p in v.get('row_pitch_range', (0.8, 2.0)))
+            tilt = v.get('tilt_axial_range')
+            duct_tilt.value = int(max(abs(tilt[0]), abs(tilt[1]))) if tilt else 0
+            duct_tilt_shared.value = bool(v.get('shared_tilt', True))
+            duct_beam.value = tuple(float(b) for b in v.get('beam_angle_range', (90, 130)))
+            duct_current.value = tuple(float(c) for c in v.get('current_range', (0.3, 3.0)))
+            duct_on_off.value = bool(v.get('optimize_enabled', False))
+            duct_led_size.value = float(v.get('led_size', 1.0))
+            optim_mode.value = _MODE_DUCTS
+        else:
+            types = {v.get('type') for v in variables}
+            gi = next((int(v['group_index']) for v in variables if 'group_index' in v), None)
+            if gi is not None:
+                label = next((l for l in optim_group_dropdown.options if l.startswith(f"{gi}:")), None)
+                if label:
+                    optim_group_dropdown.value = label
+            optim_var_pose.value = 'panel_pose' in types
+            optim_var_tilts.value = 'beam_tilts' in types
+            optim_var_beam.value = 'beam_angle' in types
+            optim_var_states.value = 'led_states' in types
+            optim_var_current.value = 'group_current' in types
+            for v in variables:
+                if v.get('type') == 'panel_pose':
+                    optim_pos_delta.value = tuple(float(x) for x in v.get('pos_delta', (2, 2, 2)))
+                    optim_rot_delta.value = tuple(float(x) for x in v.get('rot_delta', (10, 10, 10)))
+                elif v.get('type') == 'beam_tilts':
+                    t = v.get('tilt_range', (-20, 20))
+                    optim_tilt_range.value = int(max(abs(t[0]), abs(t[1])))
+                elif v.get('type') == 'beam_angle':
+                    optim_beam_range.value = tuple(float(x) for x in v.get('angle_range', (60, 130)))
+                elif v.get('type') == 'group_current':
+                    optim_current_range.value = tuple(float(x) for x in v.get('current_range', (0.5, 3.0)))
+            optim_mode.value = _MODE_REFINE
+        _optim_mode_changed()
+
+    def _optim_describe_spec(spec):
+        kinds = {}
+        for v in spec.get('variables', []):
+            kinds[v.get('type')] = kinds.get(v.get('type'), 0) + 1
+        wall = spec.get('wall', {})
+        dist = wall.get('wall_dist', '?')
+        modes = ", ".join(m.get('name', '?') for m in spec.get('modes', [])) or "none"
+        return ("<div style='color:#bbb;font-size:12px;line-height:1.4;'>"
+                f"<b>{spec.get('name', '')}</b><br>{spec.get('description', '')}<br>"
+                f"base: <code>{spec.get('base_config', '?')}</code>"
+                f"{' (cleared)' if spec.get('clear_base') else ''}<br>"
+                f"walls: {dist} cm · grid {wall.get('grid_size', '?')} · {wall.get('rays_per_pixel', '?')} rpp<br>"
+                f"variables: {', '.join(f'{k} ×{n}' for k, n in kinds.items()) or 'none'}<br>"
+                f"modes: {modes} · optimizer: {spec.get('optimizer', {}).get('method', '?')}, "
+                f"{spec.get('optimizer', {}).get('max_evals', '?')} evals</div>")
 
     @optim_spec_dropdown.on_update
+    def _(_):
+        try:
+            spec, _dir = _optim_current_spec()
+        except Exception as exc:
+            optim_spec_info_html.content = f"<div style='color:#ff6666;font-size:12px;'>Could not read spec: {exc}</div>"
+            return
+        optim_spec_info_html.content = (_optim_describe_spec(spec) if spec
+                                        else "<div style='color:#888;font-size:12px;'>No spec selected.</div>")
+
+    @optim_copy_preset_btn.on_click
     def _(_):
         try:
             spec, _dir = _optim_current_spec()
@@ -10044,23 +10405,21 @@ def main():
             _optim_status(f"Could not read spec: {exc}", "#ff6666")
             return
         if spec is None:
-            optim_var_source.value = "Selected group"
-            optim_base_current.value = True
-            optim_settings_current.value = True
-            optim_keepout_html.content = (
-                "<div style='color:#888;font-size:12px;'>Keep-out boxes: none (defined in preset specs)</div>"
-            )
+            _optim_status("Select a spec file first.", "#ffaa00")
             return
         _optim_apply_spec_to_controls(spec)
-        _optim_status(f"Loaded preset '{optim_spec_dropdown.value}' — {len(spec.get('variables', []))} "
-                      f"variable group(s). Toggle the checkboxes above to reuse the current scene / UI settings.")
+        _optim_status(f"Copied '{optim_spec_dropdown.value}' into the controls — now in mode "
+                      f"'{optim_mode.value}'. Edit anything and press Run.")
 
-    @optim_refresh_btn.on_click
+    @optim_refresh_specs_btn.on_click
     def _(_):
         cur = optim_spec_dropdown.value
         optim_spec_dropdown.options = _optim_spec_names()
         if cur in optim_spec_dropdown.options:
             optim_spec_dropdown.value = cur
+
+    @optim_refresh_groups_btn.on_click
+    def _(_):
         cur_g = optim_group_dropdown.value
         optim_group_dropdown.options = _optim_group_labels()
         if cur_g in optim_group_dropdown.options:
@@ -10069,10 +10428,10 @@ def main():
     def _optim_selected_group_index():
         label = optim_group_dropdown.value or ""
         if not label or label == _OPTIM_NO_GROUP or ':' not in label:
-            raise ValueError("Select a custom group (click 'Refresh specs & groups' after adding panels).")
+            raise ValueError("Select a custom group (click 'Refresh group list' after adding panels).")
         idx = int(label.split(':', 1)[0])
         if idx >= len(custom_groups):
-            raise ValueError("Group list is stale — click 'Refresh specs & groups'.")
+            raise ValueError("Group list is stale — click 'Refresh group list'.")
         return idx
 
     def _optim_group_variables():
@@ -10100,35 +10459,30 @@ def main():
             raise ValueError("Enable at least one variable checkbox.")
         return variables
 
-    def _optim_build():
-        """Assemble (Problem, OptimizerSpec) from the preset spec and/or the UI controls."""
-        spec, spec_dir = _optim_current_spec()
-        use_spec_vars = optim_var_source.value == "Preset spec"
-        if use_spec_vars and spec is None:
-            raise ValueError("Pick a preset spec, or set 'Variables from' to 'Selected group'.")
-        work = copy.deepcopy(spec) if spec else {}
-
-        base_cfg = None
-        if optim_base_current.value or spec is None:
-            base_cfg = get_current_config()
-            base_cfg['name'] = current_config_name[0] or 'scene'
-            work.pop('base_config', None)
-
-        if optim_settings_current.value or spec is None:
-            work['wall'] = {'wall_dist': float(wall_dist_slider.value)}
-            work['camera'] = {'pos_x': float(camera_pos_x.value), 'pos_y': float(camera_pos_y.value),
-                              'pitch': float(camera_pitch.value), 'fov_h': float(camera_fov_h.value),
-                              'fov_v': float(camera_fov_v.value)}
-            work['emission'] = {'default_lumens': float(led_lumens_slider.value),
-                                'ray_uniformity': float(ray_uniformity_slider.value)}
-        work.setdefault('wall', {})
+    def _optim_ui_wall_sections(work):
+        """Walls / camera / emission from the UI into ``work``."""
+        work['camera'] = {'pos_x': float(camera_pos_x.value), 'pos_y': float(camera_pos_y.value),
+                          'pitch': float(camera_pitch.value), 'fov_h': float(camera_fov_h.value),
+                          'fov_v': float(camera_fov_v.value)}
+        work['emission'] = {'default_lumens': float(led_lumens_slider.value),
+                            'ray_uniformity': float(ray_uniformity_slider.value)}
         dists_txt = optim_wall_dists.value.strip()
-        if dists_txt:
-            work['wall']['wall_dist'] = [float(t) for t in dists_txt.replace(';', ',').split(',') if t.strip()]
-        work['wall']['grid_size'] = int(optim_grid.value)
-        work['wall']['wall_size'] = float(optim_wall_size.value)
-        work['wall']['rays_per_pixel'] = int(optim_rpp.value)
+        dists = ([float(t) for t in dists_txt.replace(';', ',').split(',') if t.strip()] if dists_txt
+                 else [float(wall_dist_slider.value)])
+        wall = {'wall_dist': dists, 'grid_size': int(optim_grid.value), 'rays_per_pixel': int(optim_rpp.value)}
+        if optim_wall_size_mode.value == _WS_LIST:
+            sizes_txt = optim_wall_sizes.value.strip()
+            if not sizes_txt:
+                raise ValueError("Wall size is 'Custom list' but the list is empty.")
+            wall['wall_size'] = [float(t) for t in sizes_txt.replace(';', ',').split(',') if t.strip()]
+        elif optim_wall_size_mode.value == _WS_FIXED:
+            wall['wall_size'] = float(optim_wall_size.value)
+        else:
+            wall['wall_size'] = "auto"
+        work['wall'] = wall
 
+    def _optim_ui_objective_sections(work, keep_out=None, keep_out_weight=1.0):
+        """Objective / constraints / driver / modes / VIO from the UI into ``work``."""
         work['objective'] = {
             'metric': optim_metric.value,
             'min_percentile': float(optim_min_pct.value),
@@ -10136,7 +10490,6 @@ def main():
             'min_avg_lux': float(optim_min_lux.value) or None,
             'lux_weight': float(optim_lux_w.value),
         }
-        keep_out = (spec or {}).get('constraints', {}).get('keep_out', [])
         work['constraints'] = {
             'max_leds': int(optim_max_leds.value) or None,
             'max_leds_weight': float(optim_max_leds_w.value),
@@ -10149,8 +10502,8 @@ def main():
             'min_beam_angle_deg': float(optim_min_beam_angle.value) or None,
             'beam_angle_weight': float(optim_beam_angle_w.value),
             'symmetry_weight': float(optim_symmetry_w.value),
-            'keep_out': keep_out,
-            'keep_out_weight': float((spec or {}).get('constraints', {}).get('keep_out_weight', 1.0)),
+            'keep_out': list(keep_out or []),
+            'keep_out_weight': float(keep_out_weight),
         }
         work['driver'] = {
             'voltage_v': float(optim_drv_voltage.value),
@@ -10178,15 +10531,44 @@ def main():
                           'min_avg_lux_dist': float(optim_flash_dist.value)})
         work['modes'] = modes if (optim_vio_enable.value or optim_flash_enable.value) else []
 
-        if not use_spec_vars:
-            work['variables'] = _optim_group_variables()
-            work['clear_base'] = False
+    def _optim_build():
+        """Assemble (Problem, OptimizerSpec) for the selected design mode."""
+        mode = optim_mode.value
+        spec_dir = None
+        base_cfg = None
+        if mode == _MODE_PRESET:
+            spec, spec_dir = _optim_current_spec()
+            if spec is None:
+                raise ValueError("Mode 3 needs a spec file — pick one in the '③ Preset spec' folder.")
+            work = copy.deepcopy(spec)
+            if optim_preset_use_scene.value:
+                base_cfg = get_current_config()
+                base_cfg['name'] = current_config_name[0] or 'scene'
+                work.pop('base_config', None)
+            if optim_preset_use_wall.value:
+                _optim_ui_wall_sections(work)
+            if optim_preset_use_obj.value:
+                con = spec.get('constraints', {})
+                _optim_ui_objective_sections(work, con.get('keep_out'), con.get('keep_out_weight', 1.0))
+        else:
+            work = {}
+            base_cfg = get_current_config()
+            base_cfg['name'] = current_config_name[0] or 'scene'
+            _optim_ui_wall_sections(work)
+            _optim_ui_objective_sections(work)
+            if mode == _MODE_DUCTS:
+                work['variables'] = _optim_duct_variables()
+                work['clear_base'] = True  # the ducts carry the whole rig
+            else:
+                work['variables'] = _optim_group_variables()
+                work['clear_base'] = False
 
         run_name = optim_name.value.strip()
         if run_name:
             work['name'] = run_name
         elif base_cfg is not None:
-            work['name'] = f"{str(base_cfg['name']).lower().replace(' ', '_')}_optim"
+            stem = str(base_cfg['name']).lower().replace(' ', '_')
+            work['name'] = stem if stem.endswith('_optim') else f"{stem}_optim"
 
         # Reproduce the live scene exactly: STL occluder and diffuser are UI-only state.
         extra = {}
@@ -10249,6 +10631,8 @@ def main():
         apply_config(cfg)
         save_name_input.value = cfg.get('name', '')
         optim_group_dropdown.options = _optim_group_labels()
+        # Show the same robust U0 the optimiser scored with.
+        uniformity_percentile_slider.value = float(_optim_state.get('min_percentile', uniformity_percentile_slider.value))
         if show_intensity_map.value:
             update_intensity_map()
         print(f"[optim] Loaded best configuration into the scene: {cfg.get('description', '')}")
@@ -10310,6 +10694,7 @@ def main():
         st['stop'].clear()
         st['budget'] = opt.max_evals
         st['best_cfg'] = None
+        st['min_percentile'] = float(problem.objective.min_percentile)
         st['report'] = None
         optim_report_btn.disabled = True
         st['evals'], st['scores'], st['bests'], st['last_ui'] = [], [], [], 0.0

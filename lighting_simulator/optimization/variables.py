@@ -21,6 +21,11 @@ from lighting_simulator.scene.builder import euler_applies
 from .electrical import DriverModel
 
 
+def arc_cm_to_deg(arc_cm, radius_cm):
+    """Angle subtended by ``arc_cm`` along the circumference of a duct of ``radius_cm``."""
+    return math.degrees(float(arc_cm) / max(1e-6, float(radius_cm)))
+
+
 def _pairs(values, n):
     """Broadcast a scalar / 2-list / list-of-2-lists to n (lo, hi) pairs."""
     arr = np.asarray(values, dtype=float)
@@ -52,17 +57,18 @@ class Duct:
         v = np.cross(a, u)
         return a, u, v
 
-    def led_pose(self, theta_deg, axial, tilt_axial_deg=0.0, tilt_tangential_deg=0.0, radial=0.0):
+    def led_pose(self, theta_deg, axial, tilt_axial_deg=0.0, tilt_tangential_deg=0.0, radial=0.0,
+                 center_offset=(0.0, 0.0, 0.0)):
         """(position, direction, row_direction) of an LED on the surface.
 
-        ``radial`` is an extra stand-off (cm) on top of ``mount_offset`` — the
-        mechanical tolerance around the duct."""
+        ``radial`` is an extra stand-off (cm) on top of ``mount_offset`` and
+        ``center_offset`` shifts the duct itself — the mechanical tolerances."""
         a, u, v = self.frame()
         th = math.radians(theta_deg)
         normal = math.cos(th) * u + math.sin(th) * v
         tangent = np.cross(a, normal)
-        position = (np.asarray(self.center, float) + (self.radius + self.mount_offset + radial) * normal
-                    + axial * a)
+        position = (np.asarray(self.center, float) + np.asarray(center_offset, float)
+                    + (self.radius + self.mount_offset + radial) * normal + axial * a)
         direction = normal
         if abs(tilt_axial_deg) > 1e-9:  # tilt toward +axis
             direction = rodrigues_rotation(tangent, -math.radians(tilt_axial_deg)) @ direction
@@ -113,6 +119,8 @@ class DuctRingLayout(VariableGroup):
     row_pitch_range: tuple = (0.8, 2.0)
     radial_range: tuple | None = None
     """Stand-off tolerance (cm) added to ``duct.mount_offset``, e.g. ``[-1, 1]`` for ±10 mm."""
+    center_delta: tuple | None = None
+    """± shift (cm) of the duct centre per axis; 0 freezes that axis."""
     tilt_axial_range: tuple | None = (-30.0, 30.0)
     tilt_tangential_range: tuple | None = None
     shared_tilt: bool = True
@@ -167,6 +175,12 @@ class DuctRingLayout(VariableGroup):
 
         if self.radial_range is not None:
             self._add("radial", *self.radial_range, x0=0.0)
+        self._center_axes = []
+        if self.center_delta is not None:
+            for axis, d in zip("xyz", self.center_delta):
+                if d > 0:
+                    self._center_axes.append("xyz".index(axis))
+                    self._add(f"dc{axis}", -float(d), float(d), x0=0.0)
         n_tilt = 1 if self.shared_tilt else self.n_leds
         if self.tilt_axial_range is not None:
             for i in range(n_tilt):
@@ -225,6 +239,9 @@ class DuctRingLayout(VariableGroup):
         n_out = len(thetas)  # ≤ self.n_leds when counts are variables
         it = iter(rest)
         radial = next(it) if self.radial_range is not None else 0.0
+        center_offset = np.zeros(3)
+        for ax in self._center_axes:
+            center_offset[ax] = next(it)
         n_tilt = 1 if self.shared_tilt else self.n_leds
         tilt_ax = [next(it) for _ in range(n_tilt)] if self.tilt_axial_range is not None else [0.0]
         tilt_tan = [next(it) for _ in range(n_tilt)] if self.tilt_tangential_range is not None else [0.0]
@@ -241,7 +258,7 @@ class DuctRingLayout(VariableGroup):
                 th, ax,
                 tilt_ax[i if len(tilt_ax) > 1 else 0],
                 tilt_tan[i if len(tilt_tan) > 1 else 0],
-                radial=radial,
+                radial=radial, center_offset=center_offset,
             )
             positions.append([float(v) for v in p])
             directions.append([float(v) for v in d])

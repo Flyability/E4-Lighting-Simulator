@@ -35,6 +35,9 @@ class OptimizerSpec:
     """Parallel objective evaluations (DE only; -1 = all cores)."""
     polish: bool = False
     """Finish DE with a local Nelder-Mead pass."""
+    confirm_best: bool = True
+    """Re-evaluate any new best with fresh rays and keep the mean, so a lucky Monte-Carlo
+    draw cannot be locked in by the optimiser's elitism."""
     log_every: int = 10
     x0: list | None = None
 
@@ -44,7 +47,8 @@ class OptimizationStopped(Exception):
 
 
 class RunLogger:
-    def __init__(self, problem: Problem, out_dir: Path, log_every=10, on_eval=None, stop_event=None):
+    def __init__(self, problem: Problem, out_dir: Path, log_every=10, on_eval=None, stop_event=None,
+                 confirm_best=True):
         """``on_eval(logger, evaluation, x)`` is called after every logged evaluation
         (from the optimiser thread); ``stop_event`` (threading.Event) aborts the run."""
         self.problem = problem
@@ -53,6 +57,8 @@ class RunLogger:
         self.log_every = log_every
         self.on_eval = on_eval
         self.stop_event = stop_event
+        self.confirm_best = confirm_best
+        self.n_confirmations = 0
         self.best: Evaluation | None = None
         self.best_x = None
         self.n = 0
@@ -68,6 +74,10 @@ class RunLogger:
 
     def __call__(self, x):
         ev = self.problem.evaluate(x)
+        if self.confirm_best and self.best is not None and ev.score < self.best.score:
+            # Candidate beats the best: confirm with an independent ray sample.
+            ev = ev.averaged_with(self.problem.evaluate(x))
+            self.n_confirmations += 1
         self.n += 1
         self._csv.writerow([self.n, f"{time.perf_counter() - self.t0:.2f}", f"{ev.score:.6f}",
                             f"{ev.uniformity_pct:.3f}", f"{ev.coverage:.4f}", f"{ev.e_avg:.2f}", ev.n_active,
@@ -99,6 +109,7 @@ class RunLogger:
         summary = {
             "name": self.problem.name,
             "evaluations": max(self.n, self.n_external),
+            "confirmations": self.n_confirmations,
             "elapsed_s": round(time.perf_counter() - self.t0, 2),
             "best_score": self.best.score if self.best else None,
             "best": {k: v for k, v in asdict(self.best).items() if k not in ("metrics", "grid", "vio_grid")} if self.best else None,
@@ -135,7 +146,8 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
         opt = OptimizerSpec(**{**asdict(opt), 'workers': 1})
 
     out_dir = Path(output_dir) / problem.name
-    logger = RunLogger(problem, out_dir, log_every=opt.log_every, on_eval=on_eval, stop_event=stop_event)
+    logger = RunLogger(problem, out_dir, log_every=opt.log_every, on_eval=on_eval, stop_event=stop_event,
+                       confirm_best=opt.confirm_best)
     bounds = problem.bounds
     lo = np.array([b[0] for b in bounds]); hi = np.array([b[1] for b in bounds])
     x0 = np.clip(np.asarray(opt.x0, float) if opt.x0 is not None else problem.x0, lo, hi)
@@ -158,7 +170,7 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
         try:
             from .report import write_report
             report_path = write_report(problem, logger.records, opt, out_dir, x0=x0, elapsed=elapsed,
-                                       stopped=stopped)
+                                       stopped=stopped, n_confirm=logger.n_confirmations)
             print(f"[optim] report: {report_path}")
         except Exception:  # a report failure must not lose the optimisation result
             import traceback

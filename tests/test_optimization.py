@@ -104,6 +104,38 @@ def test_run_methods_produce_outputs(tmp_path, method):
     assert len(build_scene_from_config(load_config(out / "best_config.json")).leds) > 0
 
 
+def test_duct_center_delta_shifts_all_leds():
+    cfg = load_config("configs/elios3.json")
+    var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=4, placement="arc",
+                         tilt_axial_range=None, center_delta=(2.0, 0.0, 1.0))
+    assert var.names[-2:] == ["d.dcx", "d.dcz"]
+    problem = Problem(cfg, [var], WALL, CAM, clear_base=True)
+    x = problem.x0.copy()
+    base = np.array(problem.decode(x)['custom_groups'][0]['led_positions'])
+    x[-2:] = [1.5, -0.5]
+    moved = np.array(problem.decode(x)['custom_groups'][0]['led_positions'])
+    np.testing.assert_allclose(moved - base, np.tile([1.5, 0.0, -0.5], (4, 1)), atol=1e-9)
+
+
+def test_wall_size_per_distance_and_auto_fit():
+    cfg = load_config("configs/elios3.json")
+    var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=2, placement="arc",
+                         tilt_axial_range=None)
+    p = Problem(cfg, [var], WALL, CAM, clear_base=True, wall_dists=[50, 100, 200], wall_sizes="auto")
+    sizes = [w.wall_size for w in p.walls]
+    assert sizes[0] < sizes[1] < sizes[2]
+    for w, m in zip(p.walls, p._fov_masks):
+        rows = np.where(m.any(axis=1))[0]
+        cols = np.where(m.any(axis=0))[0]
+        assert 0 < rows[0] and rows[-1] < w.grid_size - 1  # footprint inside the grid with a margin
+        assert 0 < cols[0] and cols[-1] < w.grid_size - 1
+        assert m.sum() > 0.3 * m.size  # ...but filling most of it (4:3 footprint in a square grid)
+    p2 = Problem(cfg, [var], WALL, CAM, clear_base=True, wall_dists=[50, 100], wall_sizes=[120, 240])
+    assert [w.wall_size for w in p2.walls] == [120.0, 240.0]
+    with pytest.raises(ValueError):
+        Problem(cfg, [var], WALL, CAM, clear_base=True, wall_dists=[50, 100], wall_sizes=[1, 2, 3])
+
+
 def test_requirements_spec_modes_drivers_and_report(tmp_path):
     spec, spec_dir = load_spec("optimization_specs/elios4_ducts_flash_vio.json")
     spec['wall'].update({"grid_size": 10, "rays_per_pixel": 1})

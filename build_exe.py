@@ -28,16 +28,9 @@ datas = [
 exports = os.path.join(script_dir, "exports")
 if os.path.isdir(exports):
     datas.append((exports, "exports"))
-
-# Also bundle _mesh_worker.py (used by ProcessPoolExecutor)
-mesh_worker = os.path.join(script_dir, "_mesh_worker.py")
-if os.path.isfile(mesh_worker):
-    datas.append((mesh_worker, "."))
-
-# CSV files
-for f in os.listdir(script_dir):
-    if f.endswith(".csv"):
-        datas.append((os.path.join(script_dir, f), "."))
+specs = os.path.join(script_dir, "optimization_specs")
+if os.path.isdir(specs):
+    datas.append((specs, "optimization_specs"))
 
 # Build --add-data arguments
 add_data_args = []

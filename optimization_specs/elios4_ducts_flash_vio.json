@@ -4,7 +4,7 @@
   "base_config": "configs/elios3.json",
   "clear_base": true,
 
-  "wall":     { "wall_dist": [50, 100, 200], "grid_size": 30, "wall_size": 300, "rays_per_pixel": 300 },
+  "wall":     { "wall_dist": [50, 100, 200], "grid_size": 60, "wall_size": "auto", "rays_per_pixel": 1500 },
   "emission": { "default_lumens": 168, "ray_uniformity": 0.0 },
   "camera":   { "pos_x": 10, "pos_y": -4, "pitch": 0, "fov_h": 75, "fov_v": 60 },
 

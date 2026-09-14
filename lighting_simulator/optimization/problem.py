@@ -44,6 +44,13 @@ class CameraSpec:
         trap = camera_fov_wall_trapezoid(wall_dist - self.pos_x, self.pitch, self.fov_h, self.fov_v)
         return (*trap, self.pos_y)
 
+    def fit_wall_size(self, wall_dist, margin=1.15, step=10.0):
+        """Smallest centred square wall (cm) containing the footprint at ``wall_dist`` × ``margin``."""
+        z_bot, z_top, w_bot, w_top, y_c = self.trapezoid(wall_dist)
+        extent = max(abs(z_bot), abs(z_top), abs(y_c) + max(w_bot, w_top))
+        size = 2.0 * extent * float(margin)
+        return float(max(step, np.ceil(size / step) * step))
+
 
 @dataclass
 class ObjectiveSpec:
@@ -172,15 +179,41 @@ class Evaluation:
             s += f" {name}[{' '.join(parts)}]"
         return s + (f" [{pen}]" if pen else "")
 
+    def averaged_with(self, other: "Evaluation") -> "Evaluation":
+        """Mean of two independent Monte-Carlo evaluations of the same design."""
+        keys = set(self.penalties) | set(other.penalties)
+        pen = {k: 0.5 * (self.penalties.get(k, 0.0) + other.penalties.get(k, 0.0)) for k in keys}
+        modes = {}
+        for name, m in self.modes.items():
+            o = other.modes.get(name, m)
+            modes[name] = {
+                'scale': m['scale'],
+                'e_avg': 0.5 * (m['e_avg'] + o['e_avg']),
+                'vio_fraction': (None if m.get('vio_fraction') is None
+                                 else 0.5 * (m['vio_fraction'] + (o.get('vio_fraction') or m['vio_fraction']))),
+            }
+        return Evaluation(
+            score=0.5 * (self.score + other.score),
+            uniformity_pct=0.5 * (self.uniformity_pct + other.uniformity_pct),
+            coverage=0.5 * (self.coverage + other.coverage),
+            e_avg=0.5 * (self.e_avg + other.e_avg),
+            n_active=self.n_active, penalties=pen, metrics=self.metrics, grid=self.grid,
+            vio_grid=self.vio_grid, n_drivers=self.n_drivers, total_current_a=self.total_current_a,
+            modes=modes,
+        )
+
 
 class Problem:
     def __init__(self, base_cfg, variables, wall: WallSettings, camera: CameraSpec,
                  emission: EmissionSettings | None = None, objective: ObjectiveSpec | None = None,
                  constraints: ConstraintSpec | None = None, clear_base=False, name="optim",
                  wall_dists=None, use_gpu=False, stl_mesh=None, diffuser=None,
-                 driver: DriverModel | None = None, vio: VioSpec | None = None, modes=None):
+                 driver: DriverModel | None = None, vio: VioSpec | None = None, modes=None,
+                 wall_sizes=None):
         """``wall_dists``: optional list of distances (cm); the score is averaged over them
         so a layout is optimised for a range instead of a single wall distance.
+        ``wall_sizes``: matching list of wall extents (cm), or ``"auto"`` to fit each wall
+        to the camera footprint (keeps the FOV at full grid resolution at every distance).
 
         ``use_gpu`` traces on the GPU backend (single process only). ``stl_mesh`` /
         ``diffuser`` are forwarded to ``build_scene_from_config`` so the UI scene is
@@ -206,8 +239,18 @@ class Problem:
         self.objective = objective or ObjectiveSpec()
         self.constraints = constraints or ConstraintSpec()
         dists = [float(d) for d in (wall_dists or [wall.wall_dist])]
-        self.walls = [WallSettings(wall_dist=d, grid_size=wall.grid_size, wall_size=wall.wall_size,
-                                   rays_per_pixel=wall.rays_per_pixel) for d in dists]
+        if isinstance(wall_sizes, str) and wall_sizes == "auto":
+            sizes = [camera.fit_wall_size(d) for d in dists]
+        elif wall_sizes is None:
+            sizes = [float(wall.wall_size)] * len(dists)
+        else:
+            sizes = [float(s) for s in wall_sizes]
+            if len(sizes) == 1:
+                sizes = sizes * len(dists)
+            if len(sizes) != len(dists):
+                raise ValueError(f"wall_sizes has {len(sizes)} entries for {len(dists)} wall distances")
+        self.walls = [WallSettings(wall_dist=d, grid_size=wall.grid_size, wall_size=s,
+                                   rays_per_pixel=wall.rays_per_pixel) for d, s in zip(dists, sizes)]
         self._fov_masks = [
             trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist))
             for w in self.walls
@@ -350,9 +393,13 @@ class Problem:
             if short > 0:
                 penalties[f'{mode.name}.lux'] = mode.lux_weight * short
         if mode.vio_min_lux and vio_lit is not None:
-            frac = float(np.count_nonzero(vio_lit * scale >= mode.vio_min_lux) / max(1, vio_lit.size))
+            lit = vio_lit * scale
+            frac = float(np.count_nonzero(lit >= mode.vio_min_lux) / max(1, lit.size))
             info['vio_fraction'] = frac
-            short = max(0.0, (mode.vio_min_fraction - frac) / max(1e-9, mode.vio_min_fraction))
+            # "≥ f of cells above L" ⇔ "(1−f) percentile ≥ L": penalise the lux shortfall of that
+            # percentile so the penalty keeps a gradient even when no cell reaches L yet.
+            e_req = float(np.percentile(lit, 100.0 * (1.0 - mode.vio_min_fraction))) if lit.size else 0.0
+            short = max(0.0, (mode.vio_min_lux - e_req) / mode.vio_min_lux)
             if short > 0:
                 penalties[f'{mode.name}.vio'] = mode.vio_weight * short
         return info
@@ -426,6 +473,13 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     dist = wall_spec.get('wall_dist', 100.0)
     wall_dists = [float(d) for d in dist] if isinstance(dist, (list, tuple)) else [float(dist)]
     wall_spec['wall_dist'] = wall_dists[0]
+    wall_sizes = wall_spec.get('wall_size')
+    if isinstance(wall_sizes, (list, tuple)):
+        wall_spec['wall_size'] = float(wall_sizes[0])
+    elif wall_sizes == "auto":
+        wall_spec.pop('wall_size')
+    else:
+        wall_sizes = None  # scalar: same size at every distance
     wall = WallSettings(**wall_spec)
     camera = CameraSpec(**spec.get('camera', {}))
     emission = EmissionSettings(**spec.get('emission', {}))
@@ -448,7 +502,8 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     problem_kwargs.setdefault('use_gpu', bool(spec.get('use_gpu', False)))
     return Problem(base_cfg, variables, wall, camera, emission, objective, constraints,
                    clear_base=clear_base, name=spec.get('name', default_name),
-                   wall_dists=wall_dists, driver=driver, vio=vio, modes=modes, **problem_kwargs)
+                   wall_dists=wall_dists, wall_sizes=wall_sizes, driver=driver, vio=vio, modes=modes,
+                   **problem_kwargs)
 
 
 def load_spec(path):

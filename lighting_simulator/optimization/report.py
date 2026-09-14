@@ -65,7 +65,7 @@ class _Writer:
 
     def math(self, latex, size=10.5, indent=0.03):
         tall = any(t in latex for t in (r"\frac", r"\sum", r"\#\{"))
-        step = 0.042 if tall else 0.028
+        step = 0.036 if tall else 0.024
         if self.y - step < 0.05:
             self._new_page()
         self.fig.text(MARGIN + indent, self.y - 0.004, f"${latex}$", fontsize=size, va="top")
@@ -128,20 +128,47 @@ def _fmt(v, nd=3):
 
 
 # --------------------------------------------------------------------------- selection
-def _select_designs(problem, records):
-    """Indices into ``records`` of best and best distinct-from-best (or None)."""
-    if not records:
-        return None, None
+VERIFY_TOP_K = 5
+VERIFY_RAY_FACTOR = 4
+
+
+def _distinct_top(problem, records, k):
+    """Indices of the ``k`` best records that are mutually distinct (see DISTINCT_TOL)."""
     order = sorted(range(len(records)), key=lambda i: records[i][1].score)
-    best = order[0]
     lo = np.array([b[0] for b in problem.bounds], float)
     hi = np.array([b[1] for b in problem.bounds], float)
     span = np.where(hi > lo, hi - lo, 1.0)
-    xb = records[best][2]
-    for i in order[1:]:
-        if np.max(np.abs(records[i][2] - xb) / span) > DISTINCT_TOL:
-            return best, i
-    return best, None
+    picked = []
+    for i in order:
+        if all(np.max(np.abs(records[i][2] - records[j][2]) / span) > DISTINCT_TOL for j in picked):
+            picked.append(i)
+            if len(picked) == k:
+                break
+    return picked
+
+
+def _verifier(problem, factor):
+    """Shallow copy of ``problem`` tracing ``factor``× more rays per pixel (fresh random rays)."""
+    import copy
+    from lighting_simulator.simulation.settings import WallSettings
+    p = copy.copy(problem)
+    p.walls = [WallSettings(wall_dist=w.wall_dist, grid_size=w.grid_size, wall_size=w.wall_size,
+                            rays_per_pixel=int(w.rays_per_pixel * factor)) for w in problem.walls]
+    if getattr(problem, "_needs_vio", False):
+        v = problem._vio_wall
+        p._vio_wall = WallSettings(wall_dist=v.wall_dist, grid_size=v.grid_size, wall_size=v.wall_size,
+                                   rays_per_pixel=int(v.rays_per_pixel * factor))
+    return p
+
+
+def _hard_min_u0(problem, ev):
+    """Per-wall U0 with the hard minimum (what the UI legend shows), from the kept grids."""
+    out = []
+    for grid, mask in zip(_as_grid_list(ev), problem._fov_masks):
+        lit = grid[mask]
+        lit = lit[lit > 0]
+        out.append(float(lit.min() / lit.mean() * 100) if lit.size else 0.0)
+    return out
 
 
 def _as_grid_list(ev):
@@ -151,26 +178,36 @@ def _as_grid_list(ev):
 
 
 # --------------------------------------------------------------------------- pages
-def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, out_dir):
+def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, out_dir, logged_scores,
+                  n_confirm=0):
     w.heading("Run")
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     w.line(f"Generated {now}   —   output folder: {out_dir}")
     w.line(f"Method: {opt.method}   budget: {opt.max_evals} evaluations   performed: {n_evals}   "
            f"elapsed: {elapsed:.0f} s   backend: {'GPU' if problem.use_gpu else 'CPU'}"
+           + (f"   new-best confirmations: {n_confirm}" if n_confirm else "")
            + ("   (stopped by user)" if stopped else ""))
-    w.line(f"Decision variables: {problem.dim}   wall distances: "
-           + ", ".join(f"{wl.wall_dist:g} cm" for wl in problem.walls)
-           + f"   eval grid: {problem.wall.grid_size}² over {problem.wall.wall_size:g} cm, "
-             f"{problem.wall.rays_per_pixel} rays/pixel")
+    w.line(f"Decision variables: {problem.dim}   walls: "
+           + ", ".join(f"{wl.wall_dist:g} cm ({wl.wall_size:g} cm wide)" for wl in problem.walls)
+           + f"   eval grid: {problem.wall.grid_size}² cells, {problem.wall.rays_per_pixel} rays/pixel")
+    w.line(f"Ray sampling is random: the {VERIFY_TOP_K} best distinct designs of the run were re-evaluated "
+           f"with {VERIFY_RAY_FACTOR}× the rays and ranked by that verified score; both scores are shown.",
+           size=8, color="#444")
 
     w.heading("Key results")
     labels = list(designs.keys())
     header = ["", *labels]
-    widths = [30] + [18] * len(labels)
+    widths = [36] + [16] * len(labels)
     evs = [designs[k][1] for k in labels]
+    pct = problem.objective.min_percentile
+    u0_label = f"U0 = P{pct:g}(E)/E_avg" if pct > 0 else "U0 = E_min/E_avg"
     rows = [
-        ["Score (lower is better)", *[f"{e.score:.4f}" for e in evs]],
-        [f"Uniformity U0 ({problem.objective.metric})", *[f"{e.uniformity_pct:.1f} %" for e in evs]],
+        [f"Score, verified {VERIFY_RAY_FACTOR}× rays", *[f"{e.score:.4f}" for e in evs]],
+        ["Score, logged during run", *[(f"{logged_scores[k]:.4f}" if logged_scores.get(k) is not None else "—")
+                                       for k in labels]],
+        [f"{u0_label}, mean of walls", *[f"{e.uniformity_pct:.1f} %" for e in evs]],
+        ["U0 hard-min per wall (UI legend)", *[" / ".join(f"{u:.0f}" for u in _hard_min_u0(problem, e)) + " %"
+                                              for e in evs]],
         ["FOV coverage", *[f"{e.coverage*100:.0f} %" for e in evs]],
         ["E_avg in FOV (mean over walls)", *[f"{e.e_avg:,.0f} lx" for e in evs]],
         ["Active LEDs", *[str(e.n_active) for e in evs]],
@@ -195,16 +232,27 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
         rows.append([f"penalty: {k}", *[f"{e.penalties.get(k, 0.0):.4f}" for e in evs]])
     w.table(header, rows, widths)
 
+    dead = [k for k in pen_keys
+            if len(evs) > 1 and max(e.penalties.get(k, 0.0) for e in evs) > 1e-6
+            and max(e.penalties.get(k, 0.0) for e in evs) - min(e.penalties.get(k, 0.0) for e in evs) < 1e-6]
+    for k in dead:
+        w.gap(0.004)
+        w.line(f"⚠ penalty '{k}' is identical for every design ({evs[0].penalties[k]:.3f}): this target does not "
+               "steer the search (unreachable or saturated). Relax it, add a variable that can act on it "
+               "(e.g. drive current), or drop it.", size=8.5, color="#b26a00")
+
     if len(evs) > 1 and evs[0].score > 0:
         gain = (evs[0].score - evs[1].score) / evs[0].score * 100
         w.gap()
-        w.line(f"Best design improves the score by {gain:.1f} % over the initial configuration "
+        w.line(f"Best design improves the verified score by {gain:.1f} % over the initial configuration "
                f"({evs[0].score:.4f} → {evs[1].score:.4f}).", weight="bold")
     w.gap()
     w.line("The 'initial' column is the optimiser's starting point x₀: the loaded scene when an existing "
            "design is refined, or the centre of the search box for a generated layout. The two best designs "
-           f"differ in at least one variable by more than {DISTINCT_TOL*100:.0f} % of its range.", size=8,
-           color="#444")
+           f"differ in at least one variable by more than {DISTINCT_TOL*100:.0f} % of its range. "
+           "'U0 hard-min' uses the single darkest FOV cell (as the Intensity Map legend does); it is "
+           "systematically lower and noisier than the percentile-based objective, especially on fine grids.",
+           size=8, color="#444")
 
 
 def _page_problem(w: _Writer, problem, designs):
@@ -324,19 +372,37 @@ def _page_method(w: _Writer, problem):
         if m.min_avg_lux:
             w.math(rf"P_{{{m.name},lux}} = {m.lux_weight:g}\,\max\!\left(0,\ \frac{{{m.min_avg_lux:g} - E^{{({m.name})}}_{{avg}}}}{{{m.min_avg_lux:g}}}\right)")
         if m.vio_min_lux:
-            w.math(rf"P_{{{m.name},vio}} = {m.vio_weight:g}\,\max\!\left(0,\ 1 - \frac{{f_{{vio}}}}{{{m.vio_min_fraction:g}}}\right),"
-                   rf"\quad f_{{vio}} = \frac{{\#\{{E^{{({m.name})}} \geq {m.vio_min_lux:g}\ \text{{on VIO FOV}}\}}}}{{\#\text{{VIO FOV cells}}}}")
+            w.math(rf"P_{{{m.name},vio}} = {m.vio_weight:g}\,\max\!\left(0,\ \frac{{{m.vio_min_lux:g} - E^{{({m.name})}}_{{P{100*(1-m.vio_min_fraction):g}}}}}{{{m.vio_min_lux:g}}}\right)")
+            w.line(f"E_P{100*(1-m.vio_min_fraction):g} is the {100*(1-m.vio_min_fraction):g}-th percentile of lux over the "
+                   f"VIO-visible cells: requiring it to reach {m.vio_min_lux:g} lx is the same as requiring "
+                   f"{m.vio_min_fraction*100:.0f} % of the VIO FOV above {m.vio_min_lux:g} lx, but the penalty keeps a "
+                   "gradient when the target is still far away.", size=8, color="#444", indent=0.03)
     if problem.modes:
         w.line("Modes share the geometry and differ only by drive current; since luminous flux is linear in "
                "current (Φ = I·V·η), the traced grid is rescaled per mode instead of re-traced. Ī is the mean "
                "design current implied by the LED flux in the decoded configuration.", size=8.5, color="#444",
                indent=0.03)
-    w.gap(0.006)
+    w.gap(0.004)
     w.line("Optimiser:", weight="bold")
-    w.line("Differential evolution (scipy) samples a population inside the bounds, recombines candidates and "
-           "keeps improvements; integer variables (on/off states, row/column counts) are rounded before "
-           "decoding. Nelder–Mead and random search are local/simple alternatives used for refinement. The "
-           "best design is exported after every improvement, so a stopped run is never lost.", size=8.5)
+    w.line("Differential evolution (scipy) evolves a population inside the bounds and keeps improvements; "
+           "integer variables (on/off, row/column counts) are rounded before decoding. Nelder–Mead / random "
+           "search are local alternatives. The best design is exported after every improvement.", size=8)
+    w.line("Rays are random, so scores carry Monte-Carlo noise. Safeguards: a candidate beating the current "
+           "best is re-evaluated with fresh rays and the mean is kept (a lucky draw must be lucky twice); for "
+           f"this report the best distinct designs are re-evaluated with {VERIFY_RAY_FACTOR}× the rays and ranked "
+           "by that verified score. Dashed trend lines on the convergence page are centred moving averages over "
+           "~5 % of the run.", size=8)
+
+
+def _trend(y, frac=0.05, min_win=5):
+    """Centred moving average over ~``frac`` of the run (same as the UI plot)."""
+    y = np.asarray(y, float)
+    win = max(min_win, int(len(y) * frac))
+    if len(y) < 2:
+        return y
+    win = min(win, len(y))
+    pad = np.pad(y, (win // 2, win - 1 - win // 2), mode="edge")
+    return np.convolve(pad, np.ones(win) / win, mode="valid")
 
 
 def _page_convergence(pdf, problem, records, designs):
@@ -350,6 +416,7 @@ def _page_convergence(pdf, problem, records, designs):
     eavg = np.array([r[1].e_avg for r in records])
     nled = np.array([r[1].n_active for r in records])
     ndrv = np.array([r[1].n_drivers for r in records])
+    trend_kw = dict(color="#ff9800", lw=2, ls="--", label="trend (moving avg)")
 
     fig = Figure(figsize=A4, dpi=110)
     fig.suptitle("Convergence", fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
@@ -358,18 +425,24 @@ def _page_convergence(pdf, problem, records, designs):
 
     ax = axs[0, 0]
     ax.plot(ev_no, score, ".", ms=2, color="#999", label="evaluated")
+    ax.plot(ev_no, _trend(score), **trend_kw)
     ax.plot(ev_no, best, color="#2e7d32", lw=2, label="best so far")
     ax.set_yscale("log")
     ax.set_title("Score"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
 
     ax = axs[0, 1]
-    ax.plot(ev_no, uni, ".", ms=2, color="#1565c0"); ax.set_title("Uniformity U0 (%)"); ax.set_xlabel("evaluation")
+    ax.plot(ev_no, uni, ".", ms=2, color="#1565c0"); ax.plot(ev_no, _trend(uni), **trend_kw)
+    ax.set_title("Uniformity U0 (%)"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
     ax = axs[1, 0]
-    ax.plot(ev_no, cov, ".", ms=2, color="#6a1b9a"); ax.set_title("FOV coverage (%)"); ax.set_xlabel("evaluation")
+    ax.plot(ev_no, cov, ".", ms=2, color="#6a1b9a"); ax.plot(ev_no, _trend(cov), **trend_kw)
+    ax.set_title("FOV coverage (%)"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
     ax = axs[1, 1]
-    ax.plot(ev_no, eavg, ".", ms=2, color="#ef6c00"); ax.set_title("E_avg in FOV (lx)"); ax.set_xlabel("evaluation")
+    ax.plot(ev_no, eavg, ".", ms=2, color="#ef6c00"); ax.plot(ev_no, _trend(eavg), color="#1565c0", lw=2, ls="--",
+                                                            label="trend (moving avg)")
+    ax.set_title("E_avg in FOV (lx)"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
     ax = axs[2, 0]
     ax.plot(ev_no, nled, ".", ms=2, color="#333", label="LEDs")
+    ax.plot(ev_no, _trend(nled), **trend_kw)
     if ndrv.any():
         ax.plot(ev_no, ndrv, ".", ms=2, color="#c62828", label="drivers")
     ax.set_title("Active LEDs / drivers"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
@@ -433,7 +506,13 @@ def _page_heatmaps(pdf, problem, designs):
                 ax.add_patch(_fov_polygon(problem, problem.walls[key].wall_dist))
                 fov = g[problem._fov_masks[key]]
                 lit = fov[fov > 0]
-                sub = f"U0 {lit.min()/lit.mean()*100:.0f} %  ·  {lit.mean():,.0f} lx" if lit.size else "unlit"
+                if lit.size:
+                    pct = problem.objective.min_percentile
+                    e_min = np.percentile(lit, pct) if pct > 0 else lit.min()
+                    sub = (f"U0 {e_min/lit.mean()*100:.0f} % (P{pct:g})  ·  hard-min {lit.min()/lit.mean()*100:.0f} %"
+                           f"  ·  {lit.mean():,.0f} lx")
+                else:
+                    sub = "unlit"
             else:
                 mask = problem._vio_mask
                 sub = f"{np.count_nonzero(mask)} VIO cells"
@@ -450,8 +529,9 @@ def _page_heatmaps(pdf, problem, designs):
         if im is not None:
             cb = fig.colorbar(im, ax=axs[:, j].tolist(), orientation="horizontal", fraction=0.025, pad=0.06)
             cb.ax.tick_params(labelsize=6); cb.set_label("lux", fontsize=7)
-    fig.text(MARGIN, 0.02, "Dashed white: main-camera FOV footprint (metrics are computed inside it). "
-             "Cyan: VIO camera footprint. Colour scale is shared per column.", fontsize=7.5, color="#444")
+    fig.text(MARGIN, 0.02, f"Dashed white: main-camera FOV footprint (metrics are computed inside it). "
+             f"Cyan: VIO camera footprint. Colour scale is shared per column. Images use {VERIFY_RAY_FACTOR}× the "
+             "run's rays per pixel.", fontsize=7.5, color="#444")
     pdf.savefig(fig)
 
 
@@ -579,33 +659,42 @@ def _lognorm(score):
 
 
 # --------------------------------------------------------------------------- entry point
-def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=False, path=None):
+def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=False, path=None, n_confirm=0):
     """Render ``<out_dir>/report.pdf`` and return its path.
 
     ``records`` is ``RunLogger.records``; ``x0`` the initial decision vector
-    (defaults to ``problem.x0``).
+    (defaults to ``problem.x0``). The best distinct designs are re-evaluated with
+    more rays and ranked by that verified score before being compared.
     """
     out_dir = Path(out_dir)
     path = Path(path) if path else out_dir / "report.pdf"
     if not records:
         raise ValueError("no evaluations to report")
-    i1, i2 = _select_designs(problem, records)
     x0 = np.asarray(problem.x0 if x0 is None else x0, float)
+    verifier = _verifier(problem, VERIFY_RAY_FACTOR)
+
+    candidates = _distinct_top(problem, records, VERIFY_TOP_K)
+    verified = []  # (verified Evaluation, x, logged score)
+    for i in candidates:
+        x = records[i][2]
+        verified.append((verifier.evaluate_config(problem.decode(x), keep_grid=True), x, records[i][1].score))
+    verified.sort(key=lambda t: t[0].score)
 
     designs = {}  # label -> (x, Evaluation with grids, cfg)
-    for label, x in (("initial", x0), ("best #1", records[i1][2]),
-                     ("best #2", records[i2][2] if i2 is not None else None)):
-        if x is None:
-            continue
-        cfg = problem.decode(x)
-        designs[label] = (np.asarray(x, float), problem.evaluate_config(cfg, keep_grid=True), cfg)
+    logged_scores = {}
+    designs["initial"] = (x0, verifier.evaluate_config(problem.decode(x0), keep_grid=True), problem.decode(x0))
+    logged_scores["initial"] = records[0][1].score if np.allclose(records[0][2], x0) else None
+    for label, (ev, x, logged) in zip(("best #1", "best #2"), verified[:2]):
+        designs[label] = (np.asarray(x, float), ev, problem.decode(x))
+        logged_scores[label] = logged
 
     import json
-    for label, fname in (("initial", "initial_config.json"), ("best #2", "best2_config.json")):
+    for label, fname in (("initial", "initial_config.json"), ("best #1", "best_config.json"),
+                         ("best #2", "best2_config.json")):
         if label in designs:
             cfg = dict(designs[label][2])
-            cfg['name'] = f"{problem.name}_{fname[:-12]}"
-            cfg['description'] = f"{label}: {designs[label][1].summary()}"
+            cfg['name'] = problem.name if label == "best #1" else f"{problem.name}_{fname[:-12]}"
+            cfg['description'] = f"{label} (verified {VERIFY_RAY_FACTOR}x rays): {designs[label][1].summary()}"
             with open(out_dir / fname, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
 
@@ -613,7 +702,7 @@ def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=F
     with PdfPages(path) as pdf:
         pdf.infodict().update({"Title": f"Optimisation report — {problem.name}", "Creator": "E4 Lighting Simulator"})
         w = _Writer(pdf, f"Optimisation report — {problem.name}")
-        _page_summary(w, problem, opt, designs, n_evals, elapsed, stopped, out_dir)
+        _page_summary(w, problem, opt, designs, n_evals, elapsed, stopped, out_dir, logged_scores, n_confirm)
         w.close()
         w = _Writer(pdf, "Problem definition")
         _page_problem(w, problem, designs)
@@ -627,7 +716,7 @@ def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=F
         _page_variable_bounds(pdf, problem, designs)
         _page_variable_history(pdf, problem, records, designs)
         w = _Writer(pdf, "Files")
-        w.line("best_config.json — best design, loadable in the UI (Project → Load) or via --evaluate")
+        w.line("best_config.json — best design after verification, loadable in the UI (Project → Load) or via --evaluate")
         w.line("best2_config.json / initial_config.json — the other two designs compared in this report")
         w.line("history.csv — every logged evaluation with score, metrics and all variable values")
         w.line("summary.json — run metadata, best evaluation and best decision vector")
