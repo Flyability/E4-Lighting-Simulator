@@ -536,6 +536,10 @@ def main():
             "Robust Eₘᵢₙ percentile (%)", min=0.0, max=10.0, step=0.5, initial_value=2.0,
             hint="Adds U0 = P(E)/Eavg to the legend (the optimiser's metric); 0 hides it. Legend updates instantly.",
         )
+        vio_occupancy_lux = server.gui.add_number(
+            "VIO occupancy min lux", initial_value=0, min=0, max=100000, step=10,
+            hint="VIO FOV Lighting Occupancy counts cells at or above this lux (0 = any light). Legend updates instantly.",
+        )
         cell_area_html = server.gui.add_html(
             "<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
             "Cell area: calculating..."
@@ -543,7 +547,7 @@ def main():
         )
         cell_readout_chk = server.gui.add_checkbox(
             "Cell readout on click", initial_value=False,
-            hint="Click a cell of the wall intensity map in the 3-D view to show its lux value here.",
+            hint="Click a cell of the wall or room intensity map in the 3-D view to show its lux value here.",
         )
         cell_readout_html = server.gui.add_html("")
         legend_html = server.gui.add_html(
@@ -1031,7 +1035,7 @@ def main():
         show_room_walls = server.gui.add_checkbox("Show Room Walls", initial_value=True)
         show_room_intensity = server.gui.add_checkbox("Show Room Intensity", initial_value=False)
         room_front_dist = server.gui.add_slider(
-            "Front wall distance (cm)", min=20, max=200, step=10, initial_value=200
+            "Front wall distance (cm)", min=20, max=300, step=10, initial_value=200
         )
         room_side_dist = server.gui.add_slider(
             "Side walls distance (cm)", min=20, max=300, step=10, initial_value=200
@@ -1041,7 +1045,7 @@ def main():
         )
         show_back_wall = server.gui.add_checkbox("Show Back Wall", initial_value=False)
         room_back_dist = server.gui.add_slider(
-            "Back wall distance (cm)", min=10, max=100, step=5, initial_value=50
+            "Back wall distance (cm)", min=20, max=300, step=10, initial_value=50
         )
         room_grid_size = server.gui.add_slider(
             "Room walls grid resolution", min=10, max=50, step=5, initial_value=20
@@ -1775,6 +1779,7 @@ def main():
         vio_cam2_yaw=vio_cam2_yaw,
         vio_landscape=vio_landscape,
         vio_long_fov=vio_long_fov,
+        vio_occupancy_lux=vio_occupancy_lux,
         vio_pos_x=vio_pos_x,
         vio_pos_y=vio_pos_y,
         vio_pos_z=vio_pos_z,
@@ -2127,6 +2132,7 @@ def main():
         vio_fov_handles=vio_fov_handles,
         vio_landscape=vio_landscape,
         vio_long_fov=vio_long_fov,
+        vio_occupancy_lux=vio_occupancy_lux,
         vio_pos_x=vio_pos_x,
         vio_pos_y=vio_pos_y,
         vio_pos_z=vio_pos_z,

@@ -20,6 +20,7 @@ from lighting_simulator.scene.stl import global_z_rotation_4x4, stl_mesh_data as
 from lighting_simulator.simulation import (
     EmissionSettings, RoomSettings, WallSettings, room_wall_cell_centers, wall_grid_cell_centers_cm,
 )
+from lighting_simulator.simulation.room_geometry import wall_cell_areas_m2, wall_grid_indices
 from lighting_simulator.simulation import wall as _wall_engine
 from lighting_simulator.simulation import room as _room_engine
 from lighting_simulator.ui.mesh_lighting import _build_stl_transform
@@ -98,6 +99,7 @@ def build(ctx):
     stl_rot_z = ctx.stl_rot_z
     stl_scale = ctx.stl_scale
     uniformity_percentile_slider = ctx.uniformity_percentile_slider
+    vio_occupancy_lux = ctx.vio_occupancy_lux
     viewing_angle_slider = ctx.viewing_angle_slider
     vio_cam1_pitch = ctx.vio_cam1_pitch
     vio_cam1_yaw = ctx.vio_cam1_yaw
@@ -291,18 +293,18 @@ def build(ctx):
         return pts.reshape(-1, 3), np.asarray(cache['grid']).reshape(-1)
 
     def _compute_vio_occupancy_html():
-        """% of VIO-FOV wall cells whose lux is above the black threshold."""
+        """% of VIO-FOV wall cells whose lux is at or above the VIO occupancy threshold."""
         pts, lux = _collect_active_cell_samples()
         if pts is None or pts.size == 0:
             return ""
-        threshold = float(intensity_threshold_slider.value)
+        threshold = float(vio_occupancy_lux.value)
         cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
         hfov, vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
         mask1 = points_in_fisheye_fov(
             cam_pos, vio_cam1_pitch.value, vio_cam1_yaw.value, hfov, vfov, pts)
         mask2 = points_in_fisheye_fov(
             cam_pos, vio_cam2_pitch.value, vio_cam2_yaw.value, hfov, vfov, pts)
-        good = lux > threshold
+        good = lux >= threshold if threshold > 0 else lux > 0
 
         def _row(mask):
             n = int(np.count_nonzero(mask))
@@ -321,7 +323,7 @@ def build(ctx):
             "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
             "<div style='font-weight:600;margin-bottom:4px;'>VIO FOV Lighting Occupancy</div>"
             f"<div style='color:#888;font-size:10px;margin-bottom:6px;'>"
-            f"Share of FOV wall cells brighter than {threshold:.0f} lx"
+            f"Share of FOV wall cells {'at or above' if threshold > 0 else 'brighter than'} {threshold:.0f} lx"
             f"{' (any light)' if threshold <= 0 else ''}</div>"
             "<table style='font-size:11px;color:#ccc;border-collapse:collapse;width:100%;'>"
             f"<tr><td style='padding:1px 6px 1px 0;color:#ff00ff;'>Cam 1 (up)</td><td>{s1}</td></tr>"
@@ -681,14 +683,62 @@ def build(ctx):
     def _(_):
         cell_readout_html.content = _READOUT_HINT if cell_readout_chk.value else ""
 
-    def read_cell_at_ray(ray_origin, ray_direction):
-        """Show the lux of the displayed wall cell hit by a click ray. Returns True if a cell was hit."""
-        grid = _last_intensity_cache['grid']
-        if not cell_readout_chk.value or grid is None or not intensity_handles:
+    def _readout_html(lux, area_m2, where):
+        return (
+            "<div style='font-family:sans-serif;font-size:12px;padding:6px 8px;margin:-4px 0 8px;"
+            "border:1px solid #ccc;border-radius:4px;background:#f7f7f7;'>"
+            f"<b>{lux:,.0f} lux</b> &nbsp;({lux * area_m2:.3f} lm/cell)<br>"
+            f"<span style='color:#666;'>{where}</span></div>"
+        )
+
+    def _read_room_cell_at_ray(o, d):
+        cache = _last_room_cache
+        grids, specs = cache['grids'], cache['wall_specs']
+        if not grids or not specs:
             return False
-        wall_cm = float(_last_intensity_cache['wall_size_cm'])
+        front, side, tb, back = cache['front_dist'], cache['side_dist'], cache['top_bottom_dist'], cache['back_dist']
+        # (plane axis, plane value cm, coord1 axis, coord2 axis) per wall; only walls facing the ray
+        planes = {'front': (0, front, 1, 2), 'left': (1, -side, 0, 2), 'right': (1, side, 0, 2),
+                  'top': (2, tb, 0, 1), 'bottom': (2, -tb, 0, 1)}
+        if back is not None:
+            planes['back'] = (0, -float(back), 1, 2)
+        areas = wall_cell_areas_m2(specs)
+        best = None
+        for name, (ax, plane_cm, a1, a2) in planes.items():
+            grid = grids.get(name)
+            spec = specs.get(name)
+            if grid is None or spec is None or abs(d[ax]) < 1e-9:
+                continue
+            t = (plane_cm / 100.0 - o[ax]) / d[ax]
+            if t <= 0 or (best is not None and t >= best[0]):
+                continue
+            hit = (o + t * d) * 100.0
+            row, col = wall_grid_indices(name, spec, hit[a1], hit[a2])
+            row, col = int(np.floor(row)), int(np.floor(col))
+            if 0 <= row < grid.shape[0] and 0 <= col < grid.shape[1]:
+                best = (t, name, row, col, hit)
+        if best is None:
+            return False
+        _, name, row, col, hit = best
+        cell_readout_html.content = _readout_html(
+            float(grids[name][row, col]), float(areas[name]),
+            f"{name} wall &nbsp;·&nbsp; row {row}, col {col} &nbsp;·&nbsp; "
+            f"x = {hit[0]:+.0f}, y = {hit[1]:+.0f}, z = {hit[2]:+.0f} cm",
+        )
+        return True
+
+    def read_cell_at_ray(ray_origin, ray_direction):
+        """Show the lux of the displayed wall/room cell hit by a click ray. Returns True if a cell was hit."""
+        if not cell_readout_chk.value:
+            return False
         o = np.asarray(ray_origin, dtype=float)
         d = np.asarray(ray_direction, dtype=float)
+        if room_mode_enable.value:
+            return _read_room_cell_at_ray(o, d)
+        grid = _last_intensity_cache['grid']
+        if grid is None or not intensity_handles:
+            return False
+        wall_cm = float(_last_intensity_cache['wall_size_cm'])
         if abs(d[0]) < 1e-9:
             return False
         t = (float(_last_intensity_cache['wall_dist']) / 100.0 - o[0]) / d[0]
@@ -701,13 +751,9 @@ def build(ctx):
         gz = int((z_cm + wall_cm / 2) // cell_cm)
         if not (0 <= gy < n and 0 <= gz < n):
             return False
-        lux = float(grid[gz, gy])
-        cell_readout_html.content = (
-            "<div style='font-family:sans-serif;font-size:12px;padding:6px 8px;margin:-4px 0 8px;"
-            "border:1px solid #ccc;border-radius:4px;background:#f7f7f7;'>"
-            f"<b>{lux:,.0f} lux</b> &nbsp;({lux * float(_last_intensity_cache['cell_area_m2']):.3f} lm/cell)<br>"
-            f"<span style='color:#666;'>row {gz}, col {gy} &nbsp;·&nbsp; y = {y_cm:+.1f} cm, z = {z_cm:+.1f} cm</span>"
-            "</div>"
+        cell_readout_html.content = _readout_html(
+            float(grid[gz, gy]), float(_last_intensity_cache['cell_area_m2']),
+            f"row {gz}, col {gy} &nbsp;·&nbsp; y = {y_cm:+.1f} cm, z = {z_cm:+.1f} cm",
         )
         return True
 

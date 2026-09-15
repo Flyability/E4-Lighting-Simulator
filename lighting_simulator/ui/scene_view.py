@@ -196,6 +196,7 @@ def build(ctx):
     vio_fov_handles = ctx.vio_fov_handles
     vio_landscape = ctx.vio_landscape
     vio_long_fov = ctx.vio_long_fov
+    vio_occupancy_lux = ctx.vio_occupancy_lux
     vio_pos_x = ctx.vio_pos_x
     vio_pos_y = ctx.vio_pos_y
     vio_pos_z = ctx.vio_pos_z
@@ -2331,6 +2332,7 @@ def build(ctx):
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_threshold_slider.on_update(lambda _: _refresh_uniformity())
     uniformity_percentile_slider.on_update(lambda _: _refresh_uniformity())
+    vio_occupancy_lux.on_update(lambda _: _refresh_uniformity())
     intensity_grid_size.on_update(lambda _: update_cell_area_info())  # Update cell area when resolution changes
     wall_view_size.on_update(lambda _: update_cell_area_info())  # Update cell area when wall size changes
     
