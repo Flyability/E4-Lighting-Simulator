@@ -13,26 +13,30 @@ from pathlib import Path
 
 APP = Path("lighting_simulator/ui/app.py")
 
-# name, [(lo, hi), ...], docstring, extra imports, lists rebound with `x = []` -> `x.clear()`
+# name, [(lo, hi), ...], docstring, extra imports, lists rebound with `x = []` -> `x.clear()`, marker
+# The build(ctx) call replaces the FIRST range in place (marker=None) or is inserted before the
+# first line containing `marker`; every input must be bound before the call.
+OPTIM_MARKER = "# --- Optimize tab (see ui/optimize_tab.py) ---"
 BLOCKS = [
-    ("config_io", [(255, 1537)],
-     "Saved-configuration I/O: read the GUI into a config dict, apply a config dict to the GUI, new project, templates.",
-     ["import json", "import os", "import time", "import numpy as np",
-      "from lighting_simulator.domain.guides import (",
-      "    bake_and_disable_guide, enable_circular_guide, guide_is_enabled as _guide_is_enabled,",
-      "    restore_group_guide, serialize_guide,",
-      ")"],
-     []),
-    ("panels", [(1557, 2220), (3146, 3442), (3640, 4370), (4430, 4632), (4636, 4748)],
-     "Panel system: custom groups, individual LEDs, template loading, panel slots and XZ mirroring helpers.",
-     ["import json", "import os", "import time", "import numpy as np",
+    ("scene_view", [(1549, 3846)],
+     "3-D scene: update_scene, wall/grid, selected-panel inspector, Panel Designer, and the scene-level GUI wiring.",
+     ["import json", "import os", "import time", "import numpy as np", "import trimesh",
+      "from lighting_simulator.camera.fov import (",
+      "    camera_fov_wall_trapezoid as _camera_fov_wall_trapezoid, fov_plane_mask_to_quads_and_contour,",
+      "    rasterize_fisheye_fov_on_plane, vio_hfov_vfov_deg, vio_optical_axis,",
+      ")",
       "from lighting_simulator.domain.geometry import as_vec3 as _as_vec3",
       "from lighting_simulator.domain.guides import (",
-      "    bake_and_disable_guide, enable_circular_guide, guide_is_enabled as _guide_is_enabled,",
-      "    restore_group_guide, serialize_guide,",
+      "    bake_and_disable_guide, circle_line_segments_m as _circle_line_segments_m,",
+      "    dynamic_group_world_geometry as _dynamic_group_world_geometry, enable_circular_guide,",
+      "    guide_is_enabled as _guide_is_enabled,",
       ")",
-      "from lighting_simulator.domain.mirroring import expand_mirror_configs"],
-     []),
+      "from lighting_simulator.domain.led_factory import create_leds",
+      "from lighting_simulator.domain.optics import effective_lambertian_exponent as _get_effective_n",
+      "from lighting_simulator.raytracing.mesh import ray_mesh_intersection as _ray_mesh_intersection",
+      "from lighting_simulator.ui.mesh_lighting import _build_stl_transform"],
+     ["led_handles", "ray_handles", "absorber_handles", "camera_fov_handles", "vio_fov_handles", "guide_handles"],
+     OPTIM_MARKER),
 ]
 
 src_lines = APP.read_text().splitlines(keepends=True)
@@ -97,7 +101,9 @@ def in_block(stmt, ranges):
     return any(lo <= stmt.lineno <= hi for lo, hi in ranges)
 
 
-LOOP_TEMPS = {"f", "i", "_h", "k", "j", "g", "h", "v", "n", "x", "y", "z", "c", "p", "d", "a", "b", "m", "s", "t"}
+LOOP_TEMPS = {"f", "i", "_h", "k", "j", "g", "h", "v", "n", "x", "y", "z", "c", "p", "d", "a", "b", "m", "s", "t",
+              "group_idx", "row_idx", "led_idx", "led_in_row_idx", "led_btn", "row_btn", "btn", "color_hex",
+              "html_content"}
 
 
 def free_names(text):
@@ -121,7 +127,7 @@ def free_names(text):
     return out
 
 
-def analyse(ranges):
+def analyse(ranges, call_line):
     block = [s for s in main.body if in_block(s, ranges)]
     rest = [s for s in main.body if not in_block(s, ranges)]
     bb, ob = scope_stores(block), scope_stores(rest)
@@ -132,7 +138,19 @@ def analyse(ranges):
     nl_rest = nonlocal_stores(rest)
     rebound_outside = {n: ob[n] + nl_rest.get(n, []) for n in inputs if len(ob[n]) > 1 or n in nl_rest}
     rebound_inside = {n: ls for n, ls in nonlocal_stores(block).items() if n in inputs or n in outputs}
-    return inputs, outputs, rebound_outside, rebound_inside
+    late_inputs = {n: ob[n] for n in inputs if min(ob[n]) > call_line}
+    early_uses = {}
+    def direct(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in outputs \
+                and node.lineno < call_line:
+            early_uses.setdefault(node.id, []).append(node.lineno)
+        for ch in ast.iter_child_nodes(node):
+            direct(ch)
+    for s in rest:
+        direct(s)
+    return inputs, outputs, rebound_outside, rebound_inside, late_inputs, early_uses
 
 
 def block_text(ranges, inplace):
@@ -165,15 +183,20 @@ def undefined_names(text):
 def main_():
     write = "--write" in sys.argv
     edits, out_files, all_outputs = [], {}, []
-    for mod, ranges, doc, imports, inplace in BLOCKS:
-        inputs, outputs, reb_out, reb_in = analyse(ranges)
-        print(f"\n[{mod}] {ranges}: {len(inputs)} inputs, {len(outputs)} outputs")
+    for mod, ranges, doc, imports, inplace, marker in BLOCKS:
+        call_line = (next(i + 1 for i, l in enumerate(src_lines) if marker in l) if marker else ranges[0][0])
+        inputs, outputs, reb_out, reb_in, late, early = analyse(ranges, call_line)
+        print(f"\n[{mod}] {ranges} -> call @{call_line}: {len(inputs)} inputs, {len(outputs)} outputs")
         print("  inputs :", ", ".join(inputs))
         print("  outputs:", ", ".join(outputs))
         if reb_out:
             print("  !! inputs REBOUND by main() elsewhere (ctx snapshot would go stale):", reb_out)
         if reb_in:
             print("  !! names rebound INSIDE block via nonlocal (main would go stale):", reb_in)
+        if late:
+            print("  !! inputs bound AFTER the call site (move the block or pass a late-bound holder):", late)
+        if early:
+            print("  !! outputs used directly by main() BEFORE the call site:", early)
         text = block_text(ranges, inplace)
         header = (f'"""{doc}\n\nExtracted verbatim from ``ui.app.main``; ``build(ctx)`` receives the GUI handles and\n'
                   f'callbacks it needs and returns the closures main() keeps using.\n"""\n'
@@ -189,17 +212,41 @@ def main_():
                 f"    _{mod}_ns = _{mod}.build(_SimpleNamespace(\n"
                 + "".join(f"        {n}={n},\n" for n in inputs) + "    ))\n"
                 + "".join(f"    {n} = _{mod}_ns.{n}\n" for n in outputs))
-        edits.append((mod, ranges, call))
+        stubs = ""
+        if marker and early:
+            # main() hands these to earlier build(ctx) calls: forward to the real closures once built
+            stubs = (f"    _{mod}_late = _SimpleNamespace()  # filled after ui.{mod}.build()\n"
+                     + "".join(f"\n    def {n}(*a, **k):\n        return _{mod}_late.{n}(*a, **k)\n" for n in sorted(early))
+                     + "\n")
+            call += "".join(f"    _{mod}_late.{n} = _{mod}_ns.{n}\n" for n in sorted(early))
+            print("  -> forwarding stubs emitted for:", sorted(early))
+        edits.append((mod, ranges, call, marker, stubs))
     if not write:
-        print("\n(dry run — pass --write to apply; call sites are inserted at the BUILD_MARKER comment)")
+        print("\n(dry run — pass --write to apply)")
         return
     lines = list(src_lines)
-    marker = next(i for i, l in enumerate(lines) if "# --- Optimize tab (see ui/optimize_tab.py) ---" in l)
-    calls = "".join(c for _, _, c in edits)
-    lines[marker:marker] = [calls]
-    # delete ranges bottom-up
-    for lo, hi in sorted((r for _, ranges, _ in edits for r in ranges), reverse=True):
-        del lines[lo - 1:hi]
+    # in-place blocks replace their first range; marker blocks are inserted before the marker (in
+    # BLOCKS order) and all their ranges deleted. Everything bottom-up so line numbers stay valid.
+    ops = []
+    marker_inserts = {}
+    for _, ranges, call, marker, stubs in edits:
+        if marker:
+            mline = next(i + 1 for i, l in enumerate(lines) if marker in l)
+            marker_inserts.setdefault(mline, []).append(call)
+            first, *others = sorted(ranges)
+            ops.append((first[0], first[1], stubs))
+            ops += [(lo, hi, "") for lo, hi in others]
+        else:
+            first, *others = sorted(ranges)
+            ops.append((first[0], first[1], call))
+            ops += [(lo, hi, "") for lo, hi in others]
+    for mline, calls in marker_inserts.items():
+        ops.append((mline, mline - 1, "".join(calls)))  # zero-length range = pure insert
+    for lo, hi, repl in sorted(ops, key=lambda t: -t[0]):
+        if hi < lo:  # pure insert before line lo
+            lines[lo - 1:lo - 1] = [repl]
+        else:
+            lines[lo - 1:hi] = [repl] if repl else []
     text = "".join(lines)
     imp = "from types import SimpleNamespace as _SimpleNamespace\n"
     text = text.replace(imp, imp + "".join(f"from lighting_simulator.ui import {m} as _{m}\n" for m, *_ in BLOCKS), 1)

@@ -73,6 +73,10 @@ from lighting_simulator.ui import optimize_tab as _optimize_tab
 from lighting_simulator.ui import room_mode as _room_mode
 from lighting_simulator.ui.mesh_lighting import _build_stl_transform, calculate_mesh_lighting
 from types import SimpleNamespace as _SimpleNamespace
+from lighting_simulator.ui import scene_view as _scene_view
+from lighting_simulator.ui import intensity_map as _intensity_map
+from lighting_simulator.ui import fov_capture as _fov_capture
+from lighting_simulator.ui import exports as _exports
 from lighting_simulator.ui import config_io as _config_io
 from lighting_simulator.ui import panels as _panels
 from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
@@ -1466,418 +1470,6 @@ def main():
     with tab_panels:
         individual_leds_folder = server.gui.add_folder("Individual LEDs")
     
-    def export_individual_leds_simple():
-        """Export all individual LEDs to a simple JSON format (preserves exact coordinates)."""
-        if len(individual_leds) == 0:
-            print("⚠️ No individual LEDs to export")
-            return
-        
-        # Export directory
-        export_dir = "exports"
-        if not os.path.exists(export_dir):
-            os.makedirs(export_dir)
-        
-        # Collect current LED data (exact coordinates, no transformations)
-        leds_export = []
-        for led_data in individual_leds:
-            led_export = {
-                "id": led_data['id'],
-                "enabled": led_data['enable'].value,
-                "led_on": led_data['led_on'],
-                "position": {
-                    "x": float(led_data['pos_x'].value),
-                    "y": float(led_data['pos_y'].value),
-                    "z": float(led_data['pos_z'].value)
-                },
-                "rotation": {
-                    "x": float(led_data['rot_x'].value),
-                    "y": float(led_data['rot_y'].value),
-                    "z": float(led_data['rot_z'].value)
-                },
-                "size": float(led_data['size'].value),
-                "viewing_angle": float(led_data['viewing_angle'].value),
-                "square_roll": float(led_data['square_roll'].value),
-                "beam_tilt": float(led_data['beam_tilt'].value)
-            }
-            
-            # Add metadata if present (template source info)
-            if 'template_source' in led_data:
-                led_export['template_source'] = led_data['template_source']
-            if 'group_index' in led_data:
-                led_export['group_index'] = led_data['group_index']
-            
-            leds_export.append(led_export)
-        
-        # Generate filename with timestamp
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"individual_leds_{timestamp}.json"
-        filepath = os.path.join(export_dir, filename)
-        
-        # Save to file
-        export_data = {
-            "format_version": "1.0",
-            "description": "Individual LEDs export - exact coordinates (no transformations)",
-            "export_date": timestamp,
-            "num_leds": len(leds_export),
-            "leds": leds_export
-        }
-        
-        with open(filepath, "w") as f:
-            json.dump(export_data, f, indent=2)
-        
-        print(f"✓ Exported {len(leds_export)} individual LED(s) to: {filename}")
-        return filepath
-    
-    def export_leds_to_stl():
-        """Export each LED as an editable planar surface in STEP format.
-        
-        One face per LED (rectangle with filleted corners). The output is a
-        true B-Rep STEP file with planar faces, fully editable in SolidWorks
-        (selectable as reference plane, extrudable, etc.).
-        """
-        if len(current_leds) == 0:
-            print("⚠️ No LEDs in the scene. Update the scene first.")
-            return None
-        
-        try:
-            import cadquery as cq
-        except ImportError:
-            print("⚠️ 'cadquery' library required for STEP export.  pip install cadquery")
-            return None
-        try:
-            from shapely.geometry import Polygon
-        except ImportError:
-            print("⚠️ 'shapely' library required.  pip install shapely")
-            return None
-        
-        active_leds = [led for led in current_leds
-                       if not (hasattr(led, 'enabled') and not led.enabled)]
-        if not active_leds:
-            print("⚠️ No active LEDs to export.")
-            return None
-        
-        # ── Parameters (cm) ──
-        margin   = 0.05   # 0.5 mm border around each LED
-        fillet_r = 0.04   # 0.4 mm fillet on outer corners
-        faces    = []
-        
-        def _normal(led):
-            n = np.array(getattr(led, 'mesh_normal', led.direction), dtype=float)
-            nm = np.linalg.norm(n)
-            return n / nm if nm > 1e-10 else np.array([1., 0., 0.])
-        
-        for led in active_leds:
-            pos = np.array(led.position, dtype=float)
-            nrm = _normal(led)
-            hw  = led.width / 2.0
-            
-            # Local 2-D frame on the LED's plane
-            if abs(nrm[2]) < 0.9:
-                lx = np.cross(nrm, [0, 0, 1])
-            else:
-                lx = np.cross(nrm, [0, 1, 0])
-            lx /= np.linalg.norm(lx)
-            ly = np.cross(nrm, lx)
-            ly /= np.linalg.norm(ly)
-            
-            # Use row_direction for consistent orientation
-            row_d = getattr(led, 'row_direction', None)
-            if row_d is not None:
-                row_d = np.array(row_d, dtype=float)
-                r2x = np.dot(row_d, lx)
-                r2y = np.dot(row_d, ly)
-                n2  = np.hypot(r2x, r2y)
-                if n2 > 0.01:
-                    r_hat = np.array([r2x, r2y]) / n2
-                else:
-                    r_hat = np.array([1., 0.])
-            else:
-                r_hat = np.array([1., 0.])
-            p_hat = np.array([-r_hat[1], r_hat[0]])
-            
-            # ── Outer panel outline (LED square + margin) with filleted corners ──
-            m = hw + margin
-            outer_corners = [(r_hat[0]*sx*m + p_hat[0]*sy*m,
-                              r_hat[1]*sx*m + p_hat[1]*sy*m)
-                             for sx, sy in [(-1,-1),(1,-1),(1,1),(-1,1)]]
-            outer = Polygon(outer_corners)
-            try:
-                sm = outer.buffer(-fillet_r, resolution=8).buffer(fillet_r, resolution=8)
-                if sm.is_valid and not sm.is_empty and sm.area > outer.area * 0.5:
-                    outer = sm
-            except Exception:
-                pass
-            
-            if outer.is_empty:
-                continue
-            
-            polys = (list(outer.geoms)
-                     if outer.geom_type == 'MultiPolygon'
-                     else [outer])
-            
-            # Build a CadQuery Workplane on the LED's local plane.
-            # Units: cadquery uses mm; our scene is in cm → multiply by 10.
-            plane = cq.Plane(
-                origin=cq.Vector(float(pos[0])*10, float(pos[1])*10, float(pos[2])*10),
-                xDir=cq.Vector(float(lx[0]), float(lx[1]), float(lx[2])),
-                normal=cq.Vector(float(nrm[0]), float(nrm[1]), float(nrm[2])),
-            )
-            
-            for poly in polys:
-                try:
-                    coords = list(poly.exterior.coords)
-                    if len(coords) > 1 and coords[0] == coords[-1]:
-                        coords = coords[:-1]
-                    pts_mm = [(float(x)*10, float(y)*10) for (x, y) in coords]
-                    wire = (
-                        cq.Workplane(plane)
-                        .polyline(pts_mm)
-                        .close()
-                        .val()
-                    )
-                    face = cq.Face.makeFromWires(wire)
-                    faces.append(face)
-                except Exception as e:
-                    print(f"   [skip face] {e}")
-        
-        if not faces:
-            print("⚠️ No faces generated.")
-            return None
-        
-        compound = cq.Compound.makeCompound(faces)
-        
-        export_dir = "exports"
-        os.makedirs(export_dir, exist_ok=True)
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"led_panel_{ts}.step"
-        filepath = os.path.join(export_dir, filename)
-        cq.exporters.export(compound, filepath, exportType='STEP')
-        
-        print(f"✓ Exported STEP: {filename}")
-        print(f"  Planar faces: {len(faces)} (editable in SolidWorks)")
-        print(f"  Margin: {margin*10:.1f} mm  Fillet: {fillet_r*10:.1f} mm  Units: mm")
-        print(f"  Path: {os.path.abspath(filepath)}")
-        return filepath
-    
-    def export_custom_group_dxf():
-        """Export a 2D DXF file for CNC cutting of the custom group LEDs.
-        
-        Projects all custom-group LEDs onto their unfolded flat plane,
-        groups them into rows by Y-coordinate clustering, then places
-        horizontal living-hinge slot patterns between rows whose normals
-        differ so the flat panel can be bent into the 3-D shape.
-        
-        Units in the DXF are millimetres.
-        
-        Layers:
-          PANEL_OUTLINE  – outer contour (white)
-          LED_HOLES      – square LED apertures (red)
-          FLEX_CUTS      – living-hinge slots between rows (green)
-        """
-        try:
-            import ezdxf
-        except ImportError:
-            print("⚠️ 'ezdxf' library required.  pip install ezdxf")
-            return None
-        
-        # Gather custom-group LEDs that are active
-        custom_leds = [
-            led for led in current_leds
-            if getattr(led, 'is_custom', False)
-            and not (hasattr(led, 'enabled') and not led.enabled)
-        ]
-        if not custom_leds:
-            print("⚠️ No active custom-group LEDs in the scene.")
-            return None
-        
-        # --- Helper: normalised normal vector ---
-        def _led_normal(led):
-            n = np.array(getattr(led, 'mesh_normal', led.direction), dtype=float)
-            nm = np.linalg.norm(n)
-            return n / nm if nm > 1e-10 else np.array([1., 0., 0.])
-        
-        # --- Compute local 2-D frame from the average LED normal ---
-        positions_3d = np.array([led.position for led in custom_leds])
-        normals_3d = np.array([_led_normal(led) for led in custom_leds])
-        
-        avg_normal = normals_3d.mean(axis=0)
-        n_len = np.linalg.norm(avg_normal)
-        avg_normal = avg_normal / n_len if n_len > 1e-10 else np.array([1., 0., 0.])
-        
-        centroid = positions_3d.mean(axis=0)
-        
-        # Orthonormal frame on the projection plane
-        if abs(avg_normal[2]) < 0.9:
-            x_local = np.cross(avg_normal, [0, 0, 1])
-        else:
-            x_local = np.cross(avg_normal, [0, 1, 0])
-        x_local /= np.linalg.norm(x_local)
-        y_local = np.cross(avg_normal, x_local)
-        y_local /= np.linalg.norm(y_local)
-        
-        # --- Project each LED onto the 2-D plane (cm → mm) ---
-        margin_mm      = 1.5   # margin around each LED hole
-        panel_border_mm = 3.0  # extra border around the panel edges
-        
-        led_data = []  # [(cx_mm, cy_mm, hw_mm, normal_3d), ...]
-        for idx, led in enumerate(custom_leds):
-            delta = np.array(led.position) - centroid
-            cx = np.dot(delta, x_local) * 10.0  # cm → mm
-            cy = np.dot(delta, y_local) * 10.0
-            hw = (led.width / 2.0) * 10.0
-            led_data.append((cx, cy, hw, normals_3d[idx]))
-        
-        # --- Outer panel bounding rectangle ---
-        all_x  = [d[0] for d in led_data]
-        all_y  = [d[1] for d in led_data]
-        max_hw = max(d[2] for d in led_data)
-        border = max_hw + margin_mm + panel_border_mm
-        
-        x_min = min(all_x) - border
-        x_max = max(all_x) + border
-        y_min = min(all_y) - border
-        y_max = max(all_y) + border
-        
-        # ================================================================
-        #  Cluster LEDs into rows by Y coordinate, then add flex cuts
-        #  between adjacent rows whose average normals differ
-        # ================================================================
-        # Sort LEDs by Y coordinate
-        sorted_indices = sorted(range(len(led_data)), key=lambda i: led_data[i][1])
-        
-        # Cluster into rows: LEDs within cluster_tol mm of each other in Y
-        cluster_tol = max_hw * 1.5  # LEDs in same row are close in Y
-        rows = []  # list of lists of led_data indices
-        current_row = [sorted_indices[0]]
-        for k in range(1, len(sorted_indices)):
-            prev_y = led_data[sorted_indices[k - 1]][1]
-            curr_y = led_data[sorted_indices[k]][1]
-            if abs(curr_y - prev_y) < cluster_tol:
-                current_row.append(sorted_indices[k])
-            else:
-                rows.append(current_row)
-                current_row = [sorted_indices[k]]
-        rows.append(current_row)
-        
-        # Compute per-row average Y and average normal
-        row_info = []  # (avg_y, avg_normal_3d, min_x, max_x)
-        for row in rows:
-            avg_y = np.mean([led_data[i][1] for i in row])
-            avg_n = np.mean([led_data[i][3] for i in row], axis=0)
-            nm = np.linalg.norm(avg_n)
-            avg_n = avg_n / nm if nm > 1e-10 else np.array([1., 0., 0.])
-            r_min_x = min(led_data[i][0] - led_data[i][2] for i in row)
-            r_max_x = max(led_data[i][0] + led_data[i][2] for i in row)
-            row_info.append((avg_y, avg_n, r_min_x, r_max_x))
-        
-        # --- Generate flex cuts between adjacent rows ---
-        flex_angle_threshold_deg = 2.0
-        slot_length_mm  = 4.0   # length of each slot segment
-        slot_gap_mm     = 1.5   # gap between consecutive slots in a line
-        n_slot_lines    = 3     # parallel lines of slots
-        slot_line_gap   = 1.0   # spacing between parallel lines
-        
-        flex_cuts = []  # ((x1,y1),(x2,y2))
-        
-        for r in range(len(rows) - 1):
-            # Angle between adjacent row normals
-            dot = np.clip(np.dot(row_info[r][1], row_info[r + 1][1]), -1.0, 1.0)
-            angle_deg = np.degrees(np.arccos(abs(dot)))
-            if angle_deg < flex_angle_threshold_deg:
-                continue
-            
-            # Y zone: between the bottom of upper row and top of lower row
-            # (rows sorted bottom to top, i.e. ascending Y)
-            row_top_leds    = rows[r]
-            row_bottom_leds = rows[r + 1]
-            
-            y_top_of_lower = max(led_data[i][1] + led_data[i][2] + margin_mm for i in row_top_leds)
-            y_bot_of_upper = min(led_data[i][1] - led_data[i][2] - margin_mm for i in row_bottom_leds)
-            
-            zone_y_center = (y_top_of_lower + y_bot_of_upper) / 2.0
-            zone_y_height = y_bot_of_upper - y_top_of_lower
-            
-            if zone_y_height < 1.5:
-                # Not enough vertical space for flex cuts; place them anyway at midpoint
-                zone_y_center = (row_info[r][0] + row_info[r + 1][0]) / 2.0
-                zone_y_height = abs(row_info[r + 1][0] - row_info[r][0]) * 0.3
-                if zone_y_height < 1.0:
-                    continue
-            
-            # X extent of the flex zone = full panel width minus a small inset
-            inset = panel_border_mm * 0.5
-            zone_x_min = x_min + inset
-            zone_x_max = x_max - inset
-            zone_width = zone_x_max - zone_x_min
-            if zone_width < slot_length_mm:
-                continue
-            
-            # Place n_slot_lines parallel horizontal lines of staggered slots
-            total_lines_span = (n_slot_lines - 1) * slot_line_gap
-            
-            for line_k in range(n_slot_lines):
-                line_y = zone_y_center - total_lines_span / 2.0 + line_k * slot_line_gap
-                
-                # Stagger odd lines by half a stride
-                stride = slot_length_mm + slot_gap_mm
-                stagger = (stride / 2.0) if (line_k % 2 == 1) else 0.0
-                
-                x_pos = zone_x_min + stagger
-                while x_pos + slot_length_mm <= zone_x_max:
-                    x1 = x_pos
-                    x2 = x_pos + slot_length_mm
-                    flex_cuts.append(((x1, line_y), (x2, line_y)))
-                    x_pos += stride
-        
-        # --- Build DXF ---
-        doc = ezdxf.new(dxfversion='R2010')
-        doc.units = ezdxf.units.MM
-        msp = doc.modelspace()
-        
-        # Outer panel contour
-        msp.add_lwpolyline(
-            [(x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)],
-            close=True,
-            dxfattribs={'layer': 'PANEL_OUTLINE', 'color': 7}
-        )
-        
-        # LED holes (square)
-        for cx, cy, hw, _ in led_data:
-            msp.add_lwpolyline(
-                [(cx - hw, cy - hw), (cx + hw, cy - hw),
-                 (cx + hw, cy + hw), (cx - hw, cy + hw)],
-                close=True,
-                dxfattribs={'layer': 'LED_HOLES', 'color': 1}
-            )
-        
-        # Flex cuts (horizontal living-hinge slots)
-        for (x1, y1), (x2, y2) in flex_cuts:
-            msp.add_line(
-                (x1, y1), (x2, y2),
-                dxfattribs={'layer': 'FLEX_CUTS', 'color': 3}
-            )
-        
-        # --- Save ---
-        export_dir = "exports"
-        os.makedirs(export_dir, exist_ok=True)
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"cnc_panel_{ts}.dxf"
-        filepath = os.path.join(export_dir, filename)
-        doc.saveas(filepath)
-        
-        panel_w = x_max - x_min
-        panel_h = y_max - y_min
-        print(f"✓ Exported CNC DXF: {filename}")
-        print(f"  Custom LEDs: {len(custom_leds)}  Rows detected: {len(rows)}")
-        print(f"  Panel size: {panel_w:.1f} x {panel_h:.1f} mm")
-        print(f"  Flex zones: {max(0, len(rows)-1)}  Slots: {len(flex_cuts)}")
-        print(f"  Layers: PANEL_OUTLINE, LED_HOLES, FLEX_CUTS")
-        print(f"  Path: {os.path.abspath(filepath)}")
-        return filepath
-    
     with individual_leds_folder:
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Add New Individual LED</div>")
         server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Add single LEDs with custom position, rotation, and size</div>")
@@ -1955,3427 +1547,10 @@ def main():
                         led_buttons[led_global_idx] = led_btn
 
 
-    def _emission_settings():
-        """Engine emission parameters from the GUI.
+    _scene_view_late = _SimpleNamespace()  # filled after ui.scene_view.build()
 
-        Per-LED flux already carries the diffuser transmission (applied in
-        _build_current_leds_and_absorbers), so only the fallback flux is scaled here.
-        """
-        default_lumens = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
-        if diffuser_enable_chk.value:
-            default_lumens *= float(diffuser_transmission_slider.value) / 100.0
-        return EmissionSettings(
-            default_lumens=default_lumens,
-            ray_uniformity=float(ray_uniformity_slider.value),
-        )
-
-    def compute_wall_intensity(
-        leds, wall_dist, num_rays_per_led, grid_size=50, wall_size=80, absorbers=None, stl_mesh_data=None
-    ):
-        """Trace rays onto the wall. Returns (lux grid, wall_size)."""
-        settings = WallSettings(
-            wall_dist=float(wall_dist), grid_size=int(grid_size),
-            wall_size=float(wall_size), rays_per_pixel=int(num_rays_per_led),
-        )
-        grid = _wall_engine.compute_wall_intensity(
-            leds, settings, _emission_settings(),
-            absorbers=absorbers, stl_mesh_data=stl_mesh_data,
-        )
-        return grid, wall_size
-
-    def compute_room_intensity(
-        leds, front_dist, side_dist, top_bottom_dist, num_rays_per_led, grid_size=20, back_dist=None, absorbers=None, stl_mesh_data=None
-    ):
-        """Trace rays inside the room. Returns (per-wall lux grids, wall_specs)."""
-        reflections_on = bool(reflections_enable.value)
-        settings = RoomSettings(
-            front_dist=float(front_dist), side_dist=float(side_dist),
-            top_bottom_dist=float(top_bottom_dist), back_dist=back_dist,
-            grid_size=int(grid_size), rays_per_pixel=int(num_rays_per_led),
-            led_x_center=float(circle_center_slider.value),
-            max_bounces=int(max_bounces_slider_room.value) if reflections_on else 0,
-            wall_reflectance=float(custom_reflectance_slider.value) if reflections_on else 0.0,
-        )
-        return _room_engine.compute_room_intensity(
-            leds, settings, _emission_settings(),
-            absorbers=absorbers, stl_mesh_data=stl_mesh_data,
-        )
-
-    def capture_camera_fov_image():
-        """Capture intensity image within camera FOV at 1cm resolution."""
-        from datetime import datetime
-        from PIL import Image
-        
-        # Get current camera and wall settings
-        # Use correct wall distance based on mode
-        if room_mode_enable.value:
-            wall_dist = room_front_dist.value
-        else:
-            wall_dist = wall_dist_slider.value
-        
-        cam_x = camera_pos_x.value
-        cam_y = camera_pos_y.value
-        fov_h_deg = camera_fov_h.value
-        fov_v_deg = camera_fov_v.value
-        pitch_deg = camera_pitch.value
-
-        # FOV footprint on the wall (trapezoid when the camera is pitched)
-        fov_z_bot, fov_z_top, fov_w_bot, fov_w_top = _camera_fov_wall_trapezoid(
-            wall_dist - cam_x, pitch_deg, fov_h_deg, fov_v_deg
-        )
-        fov_half_w_max = max(fov_w_bot, fov_w_top)
-        fov_width_cm = 2.0 * fov_half_w_max   # bounding-box width on wall
-        fov_height_cm = fov_z_top - fov_z_bot  # bounding-box height on wall
-        
-        # Cell resolution: 1cm × 1cm (10mm²)
-        cell_size_cm = 1.0
-        grid_width = int(np.ceil(fov_width_cm / cell_size_cm))
-        grid_height = int(np.ceil(fov_height_cm / cell_size_cm))
-        
-        # Create grid for FOV region
-        fov_grid = np.zeros((grid_height, grid_width))
-        
-        # Get LEDs configuration (fixed angles: front=0°, side=90°)
-        front_angle = 0.0  # Fixed front angle
-        side_angle = 90.0  # Fixed side angle
-        viewing_angle = viewing_angle_slider.value
-        radius = radius_slider.value
-        circle_center_x = circle_center_slider.value
-        
-        rotations = [
-            rot_front_pos.value,
-            rot_front_neg.value,
-            rot_side_pos.value,
-            rot_side_neg.value,
-        ]
-        
-        rotations_y = [
-            rot_y_front_pos.value,
-            rot_y_front_neg.value,
-            rot_y_side_pos.value,
-            rot_y_side_neg.value,
-        ]
-        
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
-        
-        # Build custom groups configs list
-        custom_groups_configs = []
-        for group in custom_groups:
-            config = {
-                'enabled': group['enable'].value,
-                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
-                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
-                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                'led_states': group['led_states'],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            }
-            # Add dynamic group info if present
-            if group.get('is_dynamic', False):
-                config['num_leds'] = group.get('num_leds', 0)
-                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
-                config['led_positions'] = translated_positions
-                config['led_rotations'] = rotated_directions
-                config['led_sizes'] = group.get('led_sizes', [])
-                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                if rotated_row_dirs:
-                    config['led_row_directions'] = rotated_row_dirs
-            # Pass lumens override for custom group
-            if group.get('lumens_override') and group['lumens_override'].value:
-                config['lumens_override'] = float(group['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            if group.get('panel_slot') is not None:
-                config['owner'] = ('slot', group['panel_slot'])
-            else:
-                config['owner'] = ('custom_group', group['id'])
-            custom_groups_configs.append(config)
-        
-        # Build individual LEDs configs list
-        individual_leds_configs = []
-        for led in individual_leds:
-            config = {
-                'enabled': led['enable'].value,
-                'led_on': led.get('led_on', True),
-                'pos_x': led['pos_x'].value,
-                'pos_y': led['pos_y'].value,
-                'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value,
-                'rot_y': led['rot_y'].value,
-                'rot_z': led['rot_z'].value,
-                'size': led['size'].value,
-                'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value,
-                'beam_tilt': led['beam_tilt'].value,
-            }
-            # Pass lumens override for individual LED
-            if led.get('lumens_override') and led['lumens_override'].value:
-                config['lumens_override'] = float(led['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            # Pass external lens settings
-            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
-                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
-                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
-            for _si, _pdata in enumerate(_panel_slot_data):
-                if _pdata and led in _pdata.get('individual_leds', []):
-                    config['owner'] = ('slot', _si)
-                    break
-            if 'owner' not in config and led.get('panel_slot') is not None:
-                config['owner'] = ('slot', led['panel_slot'])
-            individual_leds_configs.append(config)
-        
-        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
-        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
-
-        leds = create_leds(
-            front_angle,
-            side_angle,
-            viewing_angle,
-            radius,
-            circle_center_x,
-            default_lumens=float(led_lumens_slider.value),
-            group_rotations=rotations,
-            group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states,
-            group_offsets=offsets,
-            custom_groups_configs=custom_groups_configs,
-            individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
-        )
-        
-        # ── Apply diffuser lens effect (FOV camera) ──
-        if diffuser_enable_chk.value:
-            _diff_angle = float(diffuser_angle_slider.value)
-            _diff_trans = float(diffuser_transmission_slider.value) / 100.0
-            for led in leds:
-                led.viewing_angle = max(led.viewing_angle, _diff_angle)
-                if led.lumens is not None:
-                    led.lumens = led.lumens * _diff_trans
-
-        # Build absorbers
-        absorbers = []
-        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
-        for i, angle_deg in enumerate(angles_deg):
-            if i not in (0, 1):
-                continue
-            angle_rad = np.radians(angle_deg)
-            gx = circle_center_x + radius * np.cos(angle_rad)
-            gy = radius * np.sin(angle_rad)
-            y_offset = 6.5 if i == 0 else -6.5
-            gy = gy + y_offset
-            
-            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
-            if np.linalg.norm(radial) == 0:
-                radial_unit = np.array((1.0, 0.0, 0.0))
-            else:
-                radial_unit = radial / np.linalg.norm(radial)
-            
-            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
-            y_base_offset = -4.2 if i == 0 else 4.2
-            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
-            base_abs_cz = 0.0
-            
-            if not absorbers_enable.value:
-                continue
-            if i == 0:
-                abs_cx = base_abs_cx + abs0_off_x.value
-                abs_cy = base_abs_cy + abs0_off_y.value
-                abs_cz = base_abs_cz + abs0_off_z.value
-            else:
-                abs_cx = base_abs_cx + abs1_off_x.value
-                abs_cy = base_abs_cy + abs1_off_y.value
-                abs_cz = base_abs_cz + abs1_off_z.value
-            
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': None,
-            })
-        
-        # Add abs2 and abs3 at origin with offsets (if absorbers enabled)
-        if absorbers_enable.value:
-            # Abs2 with rotation
-            abs_cx = 0.0 + abs2_off_x.value
-            abs_cy = 0.0 + abs2_off_y.value
-            abs_cz = 0.0 + abs2_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs2_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-            
-            # Abs3 with rotation
-            abs_cx = 0.0 + abs3_off_x.value
-            abs_cy = 0.0 + abs3_off_y.value
-            abs_cz = 0.0 + abs3_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs3_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-        
-        # Ray tracing for FOV region
-        lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
-        # Apply diffuser transmission loss
-        if diffuser_enable_chk.value:
-            lumens_per_led *= float(diffuser_transmission_slider.value) / 100.0
-        rays_per_pixel = int(intensity_rays_slider.value)
-        
-        # Count active LEDs
-        num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
-        if num_active_leds == 0:
-            print("No active LEDs")
-            return
-        
-        # Calculate rays per LED to achieve target rays per pixel
-        total_pixels = grid_width * grid_height
-        num_rays_per_led = max(1, int((total_pixels * rays_per_pixel) / num_active_leds))
-        
-        print(f"Capturing FOV image: {grid_width}x{grid_height} pixels ({total_pixels} total)...")
-        print(f"Active LEDs: {num_active_leds}, Rays per LED: {num_rays_per_led}, Total rays: {num_active_leds * num_rays_per_led}")
-        print(f"Target: {rays_per_pixel} rays/pixel, Actual: {(num_active_leds * num_rays_per_led) / total_pixels:.2f} rays/pixel")
-        
-        # Pre-build STL mesh accelerator ONCE (outside LED loop)
-        fov_stl_accel = None
-        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
-            mesh_obj = stl_mesh_data[0]
-            transform = np.eye(4)
-            scale = float(stl_scale.value)
-            if np.isfinite(scale) and scale > 0:
-                transform[:3, :3] *= scale
-            rot_x_v = float(stl_rot_x.value) if np.isfinite(float(stl_rot_x.value)) else 0.0
-            rot_y_v = float(stl_rot_y.value) if np.isfinite(float(stl_rot_y.value)) else 0.0
-            rot_z_v = float(stl_rot_z.value) if np.isfinite(float(stl_rot_z.value)) else 0.0
-            if rot_x_v != 0:
-                transform = _rot4_x(np.radians(rot_x_v)) @ transform
-            if rot_y_v != 0:
-                transform = _rot4_y(np.radians(rot_y_v)) @ transform
-            if rot_z_v != 0:
-                transform = _rot4_z(np.radians(rot_z_v)) @ transform
-            pos_xv = float(stl_pos_x.value) if np.isfinite(float(stl_pos_x.value)) else 0.0
-            pos_yv = float(stl_pos_y.value) if np.isfinite(float(stl_pos_y.value)) else 0.0
-            pos_zv = float(stl_pos_z.value) if np.isfinite(float(stl_pos_z.value)) else 0.0
-            transform[:3, 3] = [pos_xv, pos_yv, pos_zv]
-            fov_mesh_data = {
-                'vertices': mesh_obj.vertices,
-                'faces': mesh_obj.faces,
-                'transform': transform,
-            }
-            fov_stl_accel = _prepare_mesh_ray_accelerator(fov_mesh_data)
-            print(f"STL mesh absorber active ({len(mesh_obj.faces)} triangles)")
-        
-        led_total_lumens_emitted = 0.0
-        
-        for led_idx, led in enumerate(leds):
-            if hasattr(led, 'enabled') and not led.enabled:
-                continue
-            
-            idx = getattr(led, 'led_index', led_idx)
-            np.random.seed((42 + idx) % (2**32))
-            
-            z_axis = led.direction
-            if abs(z_axis[2]) < 0.9:
-                x_axis = np.cross(z_axis, [0, 0, 1])
-            else:
-                x_axis = np.cross(z_axis, [0, 1, 0])
-            x_axis = x_axis / np.linalg.norm(x_axis)
-            y_axis = np.cross(z_axis, x_axis)
-            
-            uniformity = float(ray_uniformity_slider.value)
-            n = _get_effective_n(led, uniformity)
-            max_theta = np.radians(led.viewing_angle / 2.0)
-            cos_max = np.cos(max_theta)
-            
-            # --- Generate ALL rays for this LED at once ---
-            u = np.random.uniform(0, 1, (num_rays_per_led, 2))
-            cos_theta = 1.0 - u[:, 0] * (1.0 - cos_max)
-            cos_theta = np.clip(cos_theta, -1.0, 1.0)
-            theta = np.arccos(cos_theta)
-            phi = 2 * np.pi * u[:, 1]
-            
-            sin_theta = np.sin(theta)
-            local_dirs = np.column_stack([
-                sin_theta * np.cos(phi),
-                sin_theta * np.sin(phi),
-                cos_theta,
-            ])
-            
-            world_dirs = (local_dirs[:, 0:1] * x_axis +
-                          local_dirs[:, 1:2] * y_axis +
-                          local_dirs[:, 2:3] * z_axis)
-            norms_wd = np.linalg.norm(world_dirs, axis=1, keepdims=True)
-            world_dirs = world_dirs / norms_wd
-            
-            # Calculate lumens per ray with cone normalization and lens efficiency
-            cos_max_n1 = cos_max ** (n + 1.0)
-            denom = 1.0 - cos_max_n1
-            norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
-            cos_theta_clamped = np.clip(cos_theta, 0.0, 1.0)
-            intensity_coefficients = np.power(cos_theta_clamped, n)
-            fov_led_lumens = float(getattr(led, 'lumens', None) or lumens_per_led)
-            lumens_per_ray_arr = (fov_led_lumens / max(1, num_rays_per_led)) * intensity_coefficients * norm_factor
-            led_total_lumens_emitted += np.sum(lumens_per_ray_arr)
-            
-            # --- Check box absorber intersection (vectorized) ---
-            hit_absorbed = np.zeros(num_rays_per_led, dtype=bool)
-            if absorbers:
-                ray_origins = np.broadcast_to(led.position, (num_rays_per_led, 3)).copy().astype(np.float32)
-                hit_absorbed = _ray_box_intersection_batch_np(ray_origins, world_dirs.astype(np.float32), absorbers)
-            
-            # --- Batch STL mesh intersection ---
-            if fov_stl_accel is not None:
-                not_abs = np.where(~hit_absorbed)[0]
-                if len(not_abs) > 0:
-                    origins = np.tile(led.position, (len(not_abs), 1)).astype(np.float64)
-                    mesh_hits = _batch_ray_mesh_intersection(origins, world_dirs[not_abs], fov_stl_accel)
-                    hit_absorbed[not_abs[mesh_hits]] = True
-            
-            # --- Wall hits ---
-            alive = ~hit_absorbed
-            towards_wall = world_dirs[:, 0] > 0
-            valid = alive & towards_wall
-            vi = np.where(valid)[0]
-            
-            if len(vi) > 0:
-                t = (wall_dist - led.position[0]) / world_dirs[vi, 0]
-                pos_t = t > 0
-                vi2 = vi[pos_t]
-                t2 = t[pos_t]
-                
-                hit_y = led.position[1] + world_dirs[vi2, 1] * t2
-                hit_z = led.position[2] + world_dirs[vi2, 2] * t2
-                
-                # Keep only hits inside the (possibly pitched) FOV trapezoid,
-                # centred at the camera's Y position
-                z_span = max(fov_z_top - fov_z_bot, 1e-9)
-                frac_z = np.clip((hit_z - fov_z_bot) / z_span, 0.0, 1.0)
-                half_w_at_z = fov_w_bot + (fov_w_top - fov_w_bot) * frac_z
-                in_fov = (
-                    (hit_z >= fov_z_bot) & (hit_z <= fov_z_top)
-                    & (np.abs(hit_y - cam_y) <= half_w_at_z)
-                )
-                fi = np.where(in_fov)[0]
-                
-                grid_x = ((hit_y[fi] - cam_y + fov_half_w_max) / cell_size_cm).astype(int)
-                grid_y = ((hit_z[fi] - fov_z_bot) / cell_size_cm).astype(int)
-                
-                in_bounds = (grid_x >= 0) & (grid_x < grid_width) & (grid_y >= 0) & (grid_y < grid_height)
-                bi = np.where(in_bounds)[0]
-                
-                lux_values = lumens_per_ray_arr[vi2[fi[bi]]]
-                np.add.at(fov_grid, (grid_y[bi], grid_x[bi]), lux_values)
-        
-        # Diagnostic: print first LED's flux conservation
-        print(f"FOV Capture: First LED emitted {led_total_lumens_emitted:.2f} lm total (target: {lumens_per_led:.2f} lm)")
-        
-        # Convert to lux: Lux = Lumen / Area_m²
-        cell_area_m2 = (cell_size_cm / 100.0) ** 2
-        lux_grid = fov_grid / cell_area_m2
-        
-        # Clean up any NaN or Inf values
-        fov_grid = np.nan_to_num(fov_grid, nan=0.0, posinf=0.0, neginf=0.0)
-        lux_grid = np.nan_to_num(lux_grid, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Get max lux for color mapping
-        max_lux = lux_grid.max()
-        
-        # Create image using same colormap as render (intensity_to_color)
-        img_rgb = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
-        for i in range(grid_height):
-            for j in range(grid_width):
-                lux_val = lux_grid[i, j]
-                color = intensity_to_color(lux_val, max_lux)
-                img_rgb[i, j] = [int(c * 255) for c in color]
-        
-        # Add legend to the right (50 pixels wide)
-        legend_width = 50
-        legend_steps = 100
-        full_width = grid_width + legend_width + 10  # 10px padding
-        img_with_legend = np.ones((grid_height, full_width, 3), dtype=np.uint8) * 255  # White background
-        
-        # Copy main image
-        img_with_legend[:, :grid_width, :] = img_rgb
-        
-        # Draw legend bar
-        legend_x_start = grid_width + 5
-        legend_x_end = legend_x_start + 30
-        
-        for i in range(legend_steps):
-            # Map i to grid_height
-            y_start = int(i * grid_height / legend_steps)
-            y_end = int((i + 1) * grid_height / legend_steps)
-            
-            # Intensity from top (max) to bottom (min)
-            intensity_fraction = 1.0 - (i / legend_steps)
-            lux_val = intensity_fraction * max_lux
-            color = intensity_to_color(lux_val, max_lux)
-            rgb = [int(c * 255) for c in color]
-            
-            img_with_legend[y_start:y_end, legend_x_start:legend_x_end, :] = rgb
-        
-        # Use PIL to add text labels
-        from PIL import ImageDraw, ImageFont
-        img_pil = Image.fromarray(img_with_legend, 'RGB')
-        draw = ImageDraw.Draw(img_pil)
-        
-        # Try to use a default font, fallback to PIL default
-        try:
-            font = ImageFont.truetype("arial.ttf", 10)
-        except:
-            font = ImageFont.load_default()
-        
-        # Add text labels at key points
-        num_labels = 6
-        for i in range(num_labels):
-            fraction = i / (num_labels - 1)
-            y_pos = int((1.0 - fraction) * grid_height)
-            lux_val = fraction * max_lux
-            
-            # Draw tick mark
-            draw.line([(legend_x_end, y_pos), (legend_x_end + 3, y_pos)], fill=(0, 0, 0), width=1)
-            
-            # Draw text
-            text = f"{lux_val:.0f}"
-            draw.text((legend_x_end + 5, y_pos - 5), text, fill=(0, 0, 0), font=font)
-        
-        # Add "lux" label
-        draw.text((legend_x_start, 5), "lux", fill=(0, 0, 0), font=font)
-        
-        # Save image
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"fov_intensity_{timestamp}.png"
-        img_pil.save(filename)
-        
-        print(f"FOV image saved to {filename}")
-        print(f"Image size: {grid_width} x {grid_height} pixels (1 pixel = 1cm²)")
-        print(f"FOV dimensions: {fov_width_cm:.2f} x {fov_height_cm:.2f} cm")
-        print(f"Total lumens in FOV: {fov_grid.sum():.2f} lm")
-        print(f"Max illuminance: {max_lux:.2f} lux")
-
-    FIXED_LEGEND_MAX = 3500.0  # Default fixed absolute legend cap (overridden by GUI)
-
-    def intensity_to_color(value, max_val):
-        """Convert intensity to colormap (inferno-like or black-to-white)."""
-        # Handle invalid values
-        if max_val == 0 or not np.isfinite(value) or not np.isfinite(max_val):
-            return (0.0, 0.0, 0.0)
-        
-        # Below-threshold cells are rendered pitch black (threshold in lux, 0 = off)
-        if value < float(intensity_threshold_slider.value):
-            return (0.0, 0.0, 0.0)
-        
-        t = np.clip(value / max_val, 0.0, 1.0)
-        
-        # Black-to-white grayscale mode
-        if bw_scale_chk.value:
-            return (t, t, t)
-        
-        # Simple inferno-like gradient: black -> purple -> red -> orange -> yellow
-        if t < 0.25:
-            r, g, b = t * 4 * 0.5, 0, t * 4 * 0.5
-        elif t < 0.5:
-            r, g, b = 0.5 + (t - 0.25) * 4 * 0.5, 0, 0.5 - (t - 0.25) * 4 * 0.5
-        elif t < 0.75:
-            r, g, b = 1.0, (t - 0.5) * 4 * 0.5, 0
-        else:
-            r, g, b = 1.0, 0.5 + (t - 0.75) * 4 * 0.5, (t - 0.75) * 4
-        return (r, g, b)
-
-    # Cache for last computed intensity grid so uniformity can be recalculated
-    # when FOV changes without re-running ray tracing
-    _last_intensity_cache = {'grid': None, 'wall_size_cm': None, 'wall_dist': None,
-                             'cell_area_m2': None, 'max_lux': None, 'color_scale_max': None}
-    _last_room_cache = {
-        'grids': None, 'wall_specs': None,
-        'front_dist': None, 'side_dist': None, 'top_bottom_dist': None, 'back_dist': None,
-        'max_lux': None, 'color_scale_max': None, 'avg_cell_area_m2': None,
-    }
-    # Guard programmatic checkbox writes in on_room_mode_toggle so we don't
-    # retrigger update_intensity_map / update_room_intensity_map.
-    _mode_toggle_syncing = [False]
-
-    def _build_lux_legend_html(max_lux, color_scale_max, cell_area_m2, cell_caption="lm/cell"):
-        """Intensity-scale HTML used by both wall and room legend panels."""
-        _legend_cap = float(legend_max_input.value)
-        if color_scale_max <= _legend_cap:
-            _step = max(1, _legend_cap / 8)
-            legend_vals_lux = np.arange(0, _legend_cap + 1, _step)
-        else:
-            legend_vals_lux = np.linspace(0, color_scale_max, 9)
-        scale_label = f"(scale 0\u2013{int(color_scale_max)} lx" + (
-            ", FIXED)" if color_scale_max <= _legend_cap else ", AUTO)")
-        html_lines = [
-            "<div style='font-family: sans-serif;'>",
-            "<div style='font-weight:600;margin-bottom:2px;'>Intensity legend (lux)</div>",
-            f"<div style='color:#888;font-size:10px;margin-bottom:4px;'>{scale_label} \u2014 peak {max_lux:.0f} lx</div>",
-        ]
-        for lux_val in reversed(legend_vals_lux):
-            color = intensity_to_color(lux_val, color_scale_max)
-            hex_color = "#%02x%02x%02x" % tuple(int(255 * c) for c in color)
-            lumen_val = lux_val * cell_area_m2
-            html_lines.append(
-                f"<div style='display:flex;align-items:center;margin:2px 0;'>"
-                f"<div style='width:18px;height:12px;background:{hex_color};margin-right:8px;border:1px solid #222;'></div>"
-                f"<div style='min-width:70px;'>{lux_val:.0f} lx</div>"
-                f"<div style='color:#888;font-size:11px;'>({lumen_val:.4f} {cell_caption})</div></div>"
-            )
-        html_lines.append("</div>")
-        return "".join(html_lines)
-
-    def _empty_fov_html():
-        return (
-            "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
-            "<div style='font-weight:600;margin-bottom:4px;'>Pattern Uniformity</div>"
-            "<div style='color:#888;font-size:12px;'>No intensity data inside camera FOV</div></div>"
-        )
-
-    def _wall_grid_cell_centers_cm(grid, wall_size_cm, wall_dist):
-        return wall_grid_cell_centers_cm(grid.shape, wall_size_cm, wall_dist)
-
-    def _collect_room_fov_lux(cache):
-        """Lux values of room-wall cells that fall inside the main-camera FOV."""
-        grids = cache.get('grids')
-        specs = cache.get('wall_specs')
-        if not grids or not specs:
-            return np.array([])
-        cam_pos = np.array([camera_pos_x.value, camera_pos_y.value, 0.0], dtype=float)
-        parts = []
-        for name, grid in grids.items():
-            spec = specs.get(name)
-            if spec is None:
-                continue
-            pts = room_wall_cell_centers(
-                name, spec,
-                cache['front_dist'], cache['side_dist'],
-                cache['top_bottom_dist'], cache['back_dist'],
-            )
-            mask = points_in_pinhole_fov(
-                cam_pos, camera_pitch.value,
-                camera_fov_h.value, camera_fov_v.value, pts,
-            )
-            if np.any(mask):
-                parts.append(grid[mask])
-        if not parts:
-            return np.array([])
-        return np.concatenate(parts)
-
-    def _collect_active_cell_samples():
-        """(points_cm Nx3, lux N) for the active intensity mode, or (None, None)."""
-        if room_mode_enable.value:
-            cache = _last_room_cache
-            if cache['grids'] is None:
-                return None, None
-            pts_list, lux_list = [], []
-            for name, grid in cache['grids'].items():
-                spec = cache['wall_specs'].get(name)
-                if spec is None:
-                    continue
-                pts = room_wall_cell_centers(
-                    name, spec,
-                    cache['front_dist'], cache['side_dist'],
-                    cache['top_bottom_dist'], cache['back_dist'],
-                )
-                pts_list.append(pts.reshape(-1, 3))
-                lux_list.append(np.asarray(grid).reshape(-1))
-            if not pts_list:
-                return None, None
-            return np.concatenate(pts_list, axis=0), np.concatenate(lux_list)
-        cache = _last_intensity_cache
-        if cache['grid'] is None:
-            return None, None
-        pts = _wall_grid_cell_centers_cm(cache['grid'], cache['wall_size_cm'], cache['wall_dist'])
-        return pts.reshape(-1, 3), np.asarray(cache['grid']).reshape(-1)
-
-    def _compute_vio_occupancy_html():
-        """% of VIO-FOV wall cells whose lux is above the black threshold."""
-        pts, lux = _collect_active_cell_samples()
-        if pts is None or pts.size == 0:
-            return ""
-        threshold = float(intensity_threshold_slider.value)
-        cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
-        hfov, vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
-        mask1 = points_in_fisheye_fov(
-            cam_pos, vio_cam1_pitch.value, vio_cam1_yaw.value, hfov, vfov, pts)
-        mask2 = points_in_fisheye_fov(
-            cam_pos, vio_cam2_pitch.value, vio_cam2_yaw.value, hfov, vfov, pts)
-        good = lux > threshold
-
-        def _row(mask):
-            n = int(np.count_nonzero(mask))
-            if n == 0:
-                return None, "\u2014"
-            pct = 100.0 * float(np.count_nonzero(mask & good)) / n
-            return pct, f"{pct:.1f}%"
-
-        _, s1 = _row(mask1)
-        _, s2 = _row(mask2)
-        union_pct, s_u = _row(mask1 | mask2)
-        union_color = "#4CAF50" if (union_pct is not None and union_pct >= 50.0) else "#FF9800"
-        if union_pct is None:
-            union_color = "#888"
-        return (
-            "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
-            "<div style='font-weight:600;margin-bottom:4px;'>VIO FOV Lighting Occupancy</div>"
-            f"<div style='color:#888;font-size:10px;margin-bottom:6px;'>"
-            f"Share of FOV wall cells brighter than {threshold:.0f} lx"
-            f"{' (any light)' if threshold <= 0 else ''}</div>"
-            "<table style='font-size:11px;color:#ccc;border-collapse:collapse;width:100%;'>"
-            f"<tr><td style='padding:1px 6px 1px 0;color:#ff00ff;'>Cam 1 (up)</td><td>{s1}</td></tr>"
-            f"<tr><td style='padding:1px 6px 1px 0;color:#00ffff;'>Cam 2 (down)</td><td>{s2}</td></tr>"
-            f"<tr><td style='padding:1px 6px 1px 0;'>Union (Cam 1 \u222a Cam 2)</td>"
-            f"<td style='color:{union_color};font-weight:700;'>{s_u}</td></tr>"
-            "</table>"
-            "<div style='font-size:10px;color:#888;margin-top:6px;'>"
-            "Denominator is FOV-covered wall cells, not empty space.</div></div>"
-        )
-
-    def _wall_metrics_html(grid, wall_size_cm, wall_dist):
-        _trap = _camera_fov_wall_trapezoid(
-            wall_dist - camera_pos_x.value, camera_pitch.value,
-            camera_fov_h.value, camera_fov_v.value,
-        )
-        html = _compute_uniformity_html(
-            grid,
-            fov_trapezoid=(*_trap, camera_pos_y.value),
-            wall_size_cm=wall_size_cm,
-            min_percentile=float(uniformity_percentile_slider.value),
-        )
-        if not html:
-            html = _empty_fov_html()
-        return html + _compute_vio_occupancy_html()
-
-    def _room_metrics_html():
-        fov_lux = _collect_room_fov_lux(_last_room_cache)
-        if fov_lux.size == 0:
-            html = _empty_fov_html()
-        else:
-            html = (_compute_uniformity_html(fov_lux.reshape(1, -1),
-                                             min_percentile=float(uniformity_percentile_slider.value))
-                    or _empty_fov_html())
-        return html + _compute_vio_occupancy_html()
-
-    def _refresh_uniformity():
-        """Recalculate FOV-only uniformity (and VIO occupancy) from cache (cheap)."""
-        if room_mode_enable.value:
-            cache = _last_room_cache
-            if cache['grids'] is None:
-                return
-            legend = _build_lux_legend_html(
-                cache['max_lux'], cache['color_scale_max'],
-                cache['avg_cell_area_m2'], cell_caption="lm/cell avg",
-            )
-            legend_html.content = legend + _room_metrics_html()
-            return
-        cache = _last_intensity_cache
-        if cache['grid'] is None:
-            return
-        legend = _build_lux_legend_html(
-            cache['max_lux'], cache['color_scale_max'],
-            cache['cell_area_m2'], cell_caption="lm/cell",
-        )
-        legend_html.content = legend + _wall_metrics_html(
-            cache['grid'], cache['wall_size_cm'], cache['wall_dist'],
-        )
-
-    def _build_current_leds_and_absorbers():
-        """Build LEDs and absorbers from current GUI state."""
-        front_angle = 0.0
-        side_angle = 90.0
-        viewing_angle = viewing_angle_slider.value
-        radius = radius_slider.value
-        circle_center_x = circle_center_slider.value
-
-        rotations = [
-            rot_front_pos.value, rot_front_neg.value,
-            rot_side_pos.value, rot_side_neg.value,
-        ]
-        rotations_y = [
-            rot_y_front_pos.value, rot_y_front_neg.value,
-            rot_y_side_pos.value, rot_y_side_neg.value,
-        ]
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
-
-        custom_groups_configs = []
-        for group in custom_groups:
-            config = {
-                'enabled': group['enable'].value,
-                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
-                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
-                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                'led_states': group['led_states'],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            }
-            if group.get('is_dynamic', False):
-                config['num_leds'] = group.get('num_leds', 0)
-                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
-                config['led_positions'] = translated_positions
-                config['led_rotations'] = rotated_directions
-                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                config['led_beam_tilts'] = group.get('led_beam_tilts', [])
-                if rotated_row_dirs:
-                    config['led_row_directions'] = rotated_row_dirs
-            if group.get('lumens_override') and group['lumens_override'].value:
-                config['lumens_override'] = float(group['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            if group.get('panel_slot') is not None:
-                config['owner'] = ('slot', group['panel_slot'])
-            else:
-                config['owner'] = ('custom_group', group['id'])
-            custom_groups_configs.append(config)
-
-        individual_leds_configs = []
-        for led in individual_leds:
-            config = {
-                'enabled': led['enable'].value,
-                'led_on': led.get('led_on', True),
-                'pos_x': led['pos_x'].value, 'pos_y': led['pos_y'].value, 'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value, 'rot_y': led['rot_y'].value, 'rot_z': led['rot_z'].value,
-                'size': led['size'].value, 'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value, 'beam_tilt': led['beam_tilt'].value,
-            }
-            if led.get('lumens_override') and led['lumens_override'].value:
-                config['lumens_override'] = float(led['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            # Pass external lens settings
-            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
-                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
-                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
-            for _si, _pdata in enumerate(_panel_slot_data):
-                if _pdata and led in _pdata.get('individual_leds', []):
-                    config['owner'] = ('slot', _si)
-                    break
-            if 'owner' not in config and led.get('panel_slot') is not None:
-                config['owner'] = ('slot', led['panel_slot'])
-            individual_leds_configs.append(config)
-
-        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
-        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
-
-        leds = create_leds(
-            front_angle, side_angle, viewing_angle, radius, circle_center_x,
-            default_lumens=float(led_lumens_slider.value),
-            group_rotations=rotations, group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states, group_offsets=offsets,
-            custom_groups_configs=custom_groups_configs,
-            individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
-        )
-
-        _g_rot_z_deg = float(global_rotation_z_slider.value)
-        apply_global_transform(
-            leds, _g_rot_z_deg,
-            (global_pos_x_slider.value, global_pos_y_slider.value, global_pos_z_slider.value),
-        )
-
-        if diffuser_enable_chk.value:
-            apply_diffuser(leds, diffuser_angle_slider.value,
-                           float(diffuser_transmission_slider.value) / 100.0)
-
-        absorbers = build_elios_absorbers(
-            _absorber_config(), radius, circle_center_x, front_angle,
-        )
-        rotate_absorbers_z(absorbers, _g_rot_z_deg)
-
-        stl_mesh_for_raytracing = None
-        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
-            transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
-            if abs(_g_rot_z_deg) > 0.01:
-                transform = global_z_rotation_4x4(_g_rot_z_deg) @ transform
-            stl_mesh_for_raytracing = stl_mesh_data_payload(stl_mesh_data[0], transform)
-
-        return leds, absorbers, stl_mesh_for_raytracing
-
-    def update_intensity_map():
-        """Update only the intensity map on the wall (expensive operation)."""
-        nonlocal intensity_handles, legend_html
-
-        if room_mode_enable.value:
-            legend_html.content = (
-                "<div style='font-family: sans-serif;'>"
-                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-                "<div style='color:#888;font-size:12px;'>Room Mode is active — use 'Update Room Intensity' in Advanced → Room Mode.</div>"
-                "</div>"
-            )
-            return
-        
-        import time as _time
-        t_total_start = _time.perf_counter()
-        
-        # Clear previous intensity handles
-        for handle in intensity_handles:
-            try:
-                handle.remove()
-            except KeyError:
-                pass
-        intensity_handles = []
-        
-        if not show_intensity_map.value:
-            legend_html.content = (
-                "<div style='font-family: sans-serif;'>"
-                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-                "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click 'Update Intensity Map' to see the legend</div>"
-                "</div>"
-            )
-            return
-        
-        # Get current values
-        wall_dist = wall_dist_slider.value
-        grid_size = int(intensity_grid_size.value)
-        wall_size = max(int(wall_view_size.value), 80)  # min 80cm to always cover +-40cm export range
-        
-        leds, absorbers, stl_mesh_for_raytracing = _build_current_leds_and_absorbers()
-        
-        # Compute intensity with rays_per_pixel from slider
-        t_raytrace_start = _time.perf_counter()
-        rays_per_pixel = int(intensity_rays_slider.value)
-        intensity_grid, actual_wall_size = compute_wall_intensity(
-            leds, wall_dist, rays_per_pixel, grid_size, wall_size, absorbers=absorbers, stl_mesh_data=stl_mesh_for_raytracing
-        )
-        t_raytrace_end = _time.perf_counter()
-        print(f"  [TIMING] Ray tracing: {t_raytrace_end - t_raytrace_start:.2f}s")
-        # Clean up any NaN or Inf values in the grid
-        intensity_grid = np.nan_to_num(intensity_grid, nan=0.0, posinf=0.0, neginf=0.0)
-        max_lux = intensity_grid.max()  # Grid now contains lux (lm/m²)
-        # Use fixed scale; fall back to actual max if it exceeds the cap
-        _legend_cap = float(legend_max_input.value)
-        color_scale_max = _legend_cap if max_lux <= _legend_cap else max_lux
-        
-        # Calculate cell area for lux to lumen conversion
-        cell_size_cm = actual_wall_size / grid_size
-        cell_area_cm2 = cell_size_cm * cell_size_cm
-        cell_area_m2 = cell_area_cm2 / 10000.0  # Convert cm² to m²
-        
-        # === DIAGNOSTIC OUTPUT FOR FLUX CONSERVATION ===
-        num_active_leds = sum(1 for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
-        lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
-        # Apply diffuser transmission loss
-        if diffuser_enable_chk.value:
-            lumens_per_led *= float(diffuser_transmission_slider.value) / 100.0
-        total_emitted_lumens = sum(float(getattr(led, 'lumens', None) or lumens_per_led) for led in leds if not (hasattr(led, 'enabled') and not led.enabled))
-        # Convert lux to lumen: multiply each cell by its area and sum
-        total_wall_lumens = np.sum(intensity_grid * cell_area_m2)
-        conservation_ratio = (total_wall_lumens / total_emitted_lumens * 100) if total_emitted_lumens > 0 else 0
-        
-        # Calculate 7mm² sensor reading at center
-        # Grid contains lux (lm/m²), convert to lumens for sensor area
-        sensor_area_cm2 = 0.07  # 7mm² = 0.07cm²
-        sensor_area_m2 = sensor_area_cm2 / 10000.0
-        
-        # Grid now stores lux (lm/m²), convert to lumens for sensor
-        center_idx = grid_size // 2
-        center_cell_lux = intensity_grid[center_idx, center_idx]
-        
-        # Convert sensor area to m²
-        sensor_area_m2 = sensor_area_cm2 / 10000.0
-        
-        # Calculate lumens on sensor: Lumen = Lux × Area
-        sensor_lumens_from_center_cell = center_cell_lux * sensor_area_m2
-        
-        print(f"\n=== FLUX CONSERVATION CHECK ===")
-        print(f"Active LEDs: {num_active_leds}")
-        print(f"Lumens per LED: {lumens_per_led:.1f} lm")
-        print(f"Total emitted: {total_emitted_lumens:.1f} lm")
-        print(f"Total on wall: {total_wall_lumens:.1f} lm")
-        print(f"Conservation: {conservation_ratio:.1f}%")
-        print(f"Wall distance: {wall_dist:.1f} cm")
-        print(f"7mm² sensor at center: {sensor_lumens_from_center_cell:.4f} lm")
-        print(f"================================\n")
-        
-        cell_size_cm = actual_wall_size / grid_size
-        cell_size_m = cell_size_cm / 100.0
-        half_size = actual_wall_size / 2
-        
-        t_viz_start = _time.perf_counter()
-        
-        # Build a single colored mesh for the entire intensity grid (much faster than per-cell boxes)
-        # Each cell = 2 triangles (quad), with vertex colors for smooth rendering
-        vertices_list = []
-        faces_list = []
-        colors_list = []
-        
-        x_pos = wall_dist / 100.0 - 0.008  # slightly in front of the wall
-        vert_idx = 0
-        gap = 0.025  # Small gap between cells (2.5% of cell)
-        
-        for gz in range(grid_size):
-            for gy in range(grid_size):
-                intensity = intensity_grid[gz, gy]
-                if intensity > 0:
-                    color = intensity_to_color(intensity, color_scale_max)
-                    color_uint8 = [int(c * 255) for c in color] + [255]
-                    
-                    y_center = (-half_size + gy * cell_size_cm + cell_size_cm / 2) / 100.0
-                    z_center = (-half_size + gz * cell_size_cm + cell_size_cm / 2) / 100.0
-                    half_cell = cell_size_m * 0.5 * (1.0 - gap)
-                    
-                    # 4 corners of the quad
-                    v0 = [x_pos, y_center - half_cell, z_center - half_cell]
-                    v1 = [x_pos, y_center + half_cell, z_center - half_cell]
-                    v2 = [x_pos, y_center + half_cell, z_center + half_cell]
-                    v3 = [x_pos, y_center - half_cell, z_center + half_cell]
-                    
-                    vertices_list.extend([v0, v1, v2, v3])
-                    # Double-sided: both winding orders so visible from any angle
-                    faces_list.append([vert_idx, vert_idx + 1, vert_idx + 2])
-                    faces_list.append([vert_idx, vert_idx + 2, vert_idx + 3])
-                    faces_list.append([vert_idx, vert_idx + 2, vert_idx + 1])
-                    faces_list.append([vert_idx, vert_idx + 3, vert_idx + 2])
-                    colors_list.extend([color_uint8] * 4)
-                    vert_idx += 4
-        
-        if len(vertices_list) > 0:
-            vertices_np = np.array(vertices_list, dtype=np.float32)
-            faces_np = np.array(faces_list, dtype=np.uint32)
-            colors_np = np.array(colors_list, dtype=np.uint8)
-            
-            intensity_mesh = trimesh.Trimesh(
-                vertices=vertices_np,
-                faces=faces_np,
-                process=False
-            )
-            from trimesh.visual import ColorVisuals
-            intensity_mesh.visual = ColorVisuals(mesh=intensity_mesh, vertex_colors=colors_np)
-            
-            handle = server.scene.add_mesh_trimesh(
-                name="/intensity_map",
-                mesh=intensity_mesh,
-                visible=True,
-            )
-            intensity_handles.append(handle)
-        
-        t_viz_end = _time.perf_counter()
-        print(f"  [TIMING] Visualization: {t_viz_end - t_viz_start:.2f}s ({vert_idx // 4} cells)")
-        print(f"  [TIMING] Total update_intensity_map: {t_viz_end - t_total_start:.2f}s")
-        
-        # Update legend (grid now stores lux = lm/m²)
-        legend = _build_lux_legend_html(max_lux, color_scale_max, cell_area_m2, cell_caption="lm/cell")
-
-        # Cache grid so FOV / VIO / threshold changes can recalculate metrics cheaply
-        _last_intensity_cache['grid'] = intensity_grid
-        _last_intensity_cache['wall_size_cm'] = actual_wall_size
-        _last_intensity_cache['wall_dist'] = wall_dist
-        _last_intensity_cache['cell_area_m2'] = cell_area_m2
-        _last_intensity_cache['max_lux'] = max_lux
-        _last_intensity_cache['color_scale_max'] = color_scale_max
-
-        legend_html.content = legend + _wall_metrics_html(
-            intensity_grid, actual_wall_size, wall_dist,
-        )
-
-    # ── CSV Pattern Import logic ──────────────────────────────────────────
-    # --- CSV pattern import (benchmark / FOV captures), lux-matrix export and the multi-distance benchmark. (see ui/csv_overlay.py) ---
-    _csv_overlay_ns = _csv_overlay.build(_SimpleNamespace(
-        _build_current_leds_and_absorbers=_build_current_leds_and_absorbers,
-        _last_intensity_cache=_last_intensity_cache,
-        compute_wall_intensity=compute_wall_intensity,
-        csv_diff_html=csv_diff_html,
-        csv_import_path=csv_import_path,
-        csv_import_status=csv_import_status,
-        csv_legend_html=csv_legend_html,
-        csv_legend_max_input=csv_legend_max_input,
-        imported_csv_handles=imported_csv_handles,
-        intensity_grid_size=intensity_grid_size,
-        intensity_rays_slider=intensity_rays_slider,
-        intensity_to_color=intensity_to_color,
-        room_front_dist=room_front_dist,
-        room_mode_enable=room_mode_enable,
-        server=server,
-        wall_dist_slider=wall_dist_slider,
-        wall_view_size=wall_view_size,
-    ))
-    clear_csv_pattern = _csv_overlay_ns.clear_csv_pattern
-    export_lux_matrix = _csv_overlay_ns.export_lux_matrix
-    import_csv_pattern = _csv_overlay_ns.import_csv_pattern
-    run_benchmark = _csv_overlay_ns.run_benchmark
-    # --- Room mode (see ui/room_mode.py) ---
-    _room_mode_ns = _room_mode.build(_SimpleNamespace(
-        _build_lux_legend_html=_build_lux_legend_html,
-        _build_stl_transform=_build_stl_transform,
-        _last_room_cache=_last_room_cache,
-        _room_metrics_html=_room_metrics_html,
-        abs0_off_x=abs0_off_x,
-        abs0_off_y=abs0_off_y,
-        abs0_off_z=abs0_off_z,
-        abs1_off_x=abs1_off_x,
-        abs1_off_y=abs1_off_y,
-        abs1_off_z=abs1_off_z,
-        abs2_off_x=abs2_off_x,
-        abs2_off_y=abs2_off_y,
-        abs2_off_z=abs2_off_z,
-        abs2_rot_z=abs2_rot_z,
-        abs3_off_x=abs3_off_x,
-        abs3_off_y=abs3_off_y,
-        abs3_off_z=abs3_off_z,
-        abs3_rot_z=abs3_rot_z,
-        absorbers_enable=absorbers_enable,
-        circle_center_slider=circle_center_slider,
-        compute_room_intensity=compute_room_intensity,
-        current_leds=current_leds,
-        global_rotation_z_slider=global_rotation_z_slider,
-        intensity_rays_slider=intensity_rays_slider,
-        intensity_to_color=intensity_to_color,
-        legend_html=legend_html,
-        legend_max_input=legend_max_input,
-        radius_slider=radius_slider,
-        room_back_dist=room_back_dist,
-        room_front_dist=room_front_dist,
-        room_grid_size=room_grid_size,
-        room_intensity_handles=room_intensity_handles,
-        room_mode_enable=room_mode_enable,
-        room_side_dist=room_side_dist,
-        room_top_bottom_dist=room_top_bottom_dist,
-        room_wall_handles=room_wall_handles,
-        server=server,
-        show_back_wall=show_back_wall,
-        show_room_intensity=show_room_intensity,
-        show_room_walls=show_room_walls,
-        stl_absorber_enable=stl_absorber_enable,
-        stl_mesh_data=stl_mesh_data,
-        stl_pos_x=stl_pos_x,
-        stl_pos_y=stl_pos_y,
-        stl_pos_z=stl_pos_z,
-        stl_rot_x=stl_rot_x,
-        stl_rot_y=stl_rot_y,
-        stl_rot_z=stl_rot_z,
-        stl_scale=stl_scale,
-    ))
-    draw_room_walls = _room_mode_ns.draw_room_walls
-    update_room_intensity_map = _room_mode_ns.update_room_intensity_map
-    def _clear_inspector():
-        for h in _inspector_handles:
-            try:
-                h.remove()
-            except Exception:
-                pass
-        _inspector_handles.clear()
-
-    def _inspector_add(handle):
-        _inspector_handles.append(handle)
-        return handle
-
-    def _mirror_slider(label, src, minv, maxv, step):
-        sl = server.gui.add_slider(label, min=minv, max=maxv, step=step, initial_value=src.value)
-        _inspector_add(sl)
-
-        def _on(_):
-            if _inspector_syncing[0]:
-                return
-            _inspector_syncing[0] = True
-            try:
-                src.value = sl.value
-            finally:
-                _inspector_syncing[0] = False
-
-        sl.on_update(_on)
-        return sl
-
-    def _mirror_checkbox(label, src):
-        chk = server.gui.add_checkbox(label, initial_value=bool(src.value))
-        _inspector_add(chk)
-
-        def _on(_):
-            if _inspector_syncing[0]:
-                return
-            _inspector_syncing[0] = True
-            try:
-                src.value = chk.value
-            finally:
-                _inspector_syncing[0] = False
-
-        chk.on_update(_on)
-        return chk
-
-    def _inspector_led_matrix(group):
-        """ALL / Row / LED on-off buttons that write into group['led_states']."""
-        led_states_g = group['led_states']
-        led_rows = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
-        num_leds = group.get('num_leds', len(led_states_g))
-
-        def _refresh_hidden_colors():
-            if callable(group.get('update_button_colors')):
-                group['update_button_colors']()
-            for _si, _pdata in enumerate(_panel_slot_data):
-                if _pdata and group in _pdata.get('groups', []):
-                    uf = _pdata.get('update_btn_colors')
-                    if callable(uf):
-                        uf()
-
-        _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
-        all_btn = _inspector_add(server.gui.add_button(
-            "ALL LEDs", color="#FF00FF" if any(led_states_g) else "#666666"
-        ))
-
-        def _on_all(_):
-            new_state = not all(led_states_g)
-            for i in range(len(led_states_g)):
-                led_states_g[i] = new_state
-            _refresh_hidden_colors()
-            update_scene()
-            populate_inspector(selected_owner[0])
-
-        all_btn.on_click(_on_all)
-
-        for row_idx, led_indices in enumerate(led_rows):
-            any_on = any(led_states_g[i] for i in led_indices if i < len(led_states_g))
-            row_btn = _inspector_add(server.gui.add_button(
-                f"Row {row_idx + 1}", color="#FF00FF" if any_on else "#666666"
-            ))
-
-            def _make_row(indices):
-                def _on(_):
-                    new_state = not all(led_states_g[i] for i in indices if i < len(led_states_g))
-                    for i in indices:
-                        if i < len(led_states_g):
-                            led_states_g[i] = new_state
-                    _refresh_hidden_colors()
-                    update_scene()
-                    populate_inspector(selected_owner[0])
-                return _on
-
-            row_btn.on_click(_make_row(list(led_indices)))
-
-        for led_idx in range(num_leds):
-            if led_idx >= len(led_states_g):
-                break
-            color = "#FF00FF" if led_states_g[led_idx] else "#444444"
-            led_btn = _inspector_add(server.gui.add_button(f"L{led_idx + 1}", color=color))
-
-            def _make_led(idx):
-                def _on(_):
-                    led_states_g[idx] = not led_states_g[idx]
-                    _refresh_hidden_colors()
-                    update_scene()
-                    populate_inspector(selected_owner[0])
-                return _on
-
-            led_btn.on_click(_make_led(led_idx))
-
-    def _inspector_mirror_checkbox(owner):
-        """Checkbox making `owner` the mirror primary (XZ reflection).
-
-        Enabling it disables the panel on the opposite side and renders a live
-        mirrored copy of this panel there instead."""
-        is_primary = _mirror_primary[0] == owner
-        chk = _inspector_add(server.gui.add_checkbox(
-            "Mirror to other side (XZ)", initial_value=is_primary
-        ))
-        if is_primary:
-            cp_name = _mirror_counterpart_name[0]
-            note = (
-                f"Mirroring active — **{cp_name}** is disabled."
-                if cp_name else
-                "Mirroring active — no opposite-side panel found to disable."
-            )
-            _inspector_add(server.gui.add_markdown(f"*{note}*"))
-
-        @chk.on_update
-        def _(_):
-            if loading_in_progress[0]:
-                return
-            if chk.value:
-                _enable_mirror_for(owner)
-            elif _mirror_primary[0] == owner:
-                _clear_mirror_state()
-            update_scene()
-            if selected_owner[0] == owner:
-                populate_inspector(owner)
-
-    def _inspector_group_pose_sliders(group):
-        """Free XYZ/Euler sliders; hidden while the circular guide is anchoring the panel."""
-        if _guide_is_enabled(group):
-            return
-        _mirror_slider("Position X (cm)", group['pos_x'], -100, 100, 0.1)
-        _mirror_slider("Position Y (cm)", group['pos_y'], -50, 50, 0.1)
-        _mirror_slider("Position Z (cm)", group['pos_z'], -50, 50, 0.1)
-        if group.get('rot_tilt_lr') is not None:
-            _mirror_slider("Tilt Left/Right (°)", group['rot_tilt_lr'], -180, 180, 1)
-        if group.get('rot_tilt_ud') is not None:
-            _mirror_slider("Tilt Up/Down (°)", group['rot_tilt_ud'], -180, 180, 1)
-        if group.get('rot_roll') is not None:
-            _mirror_slider("Rotate on axis (°)", group['rot_roll'], -180, 180, 1)
-
-    def _inspector_guide_controls(group):
-        """Checkbox to fit/anchor a circular guide and the slide slider while on."""
-        enabled = _guide_is_enabled(group)
-        chk = _inspector_add(server.gui.add_checkbox(
-            "Anchor to circular guide", initial_value=enabled
-        ))
-        if group.get('guide_error'):
-            _inspector_add(server.gui.add_markdown(f"**Guide:** {group['guide_error']}"))
-        if enabled:
-            guide = group.get('guide') or {}
-            if guide.get('warning'):
-                _inspector_add(server.gui.add_markdown(f"*{guide['warning']}*"))
-            n_circ = len(guide.get('circles') or [])
-            _inspector_add(server.gui.add_markdown(
-                f"Pose locked — {n_circ} construction circle(s). "
-                "Uncheck to restore free XYZ/Euler."
-            ))
-            sl = _inspector_add(server.gui.add_slider(
-                "Slide along guide (°)",
-                min=-180, max=180, step=0.5,
-                initial_value=float(guide.get('theta_deg', 0.0)),
-            ))
-
-            @sl.on_update
-            def _(_):
-                if loading_in_progress[0] or _inspector_syncing[0]:
-                    return
-                if not isinstance(group.get('guide'), dict):
-                    return
-                group['guide']['theta_deg'] = float(sl.value)
-                update_scene()
-
-        @chk.on_update
-        def _(_):
-            if loading_in_progress[0] or _inspector_syncing[0]:
-                return
-            if chk.value:
-                ok, err = enable_circular_guide(group)
-                if not ok:
-                    group['guide'] = None
-                    group['guide_error'] = err or "Could not fit a circular guide."
-                else:
-                    group['guide_error'] = None
-            else:
-                bake_and_disable_guide(group)
-            update_scene()
-            if selected_owner[0] is not None:
-                populate_inspector(selected_owner[0])
-
-    def _designer_rotation_matrix(rx_deg, ry_deg, rz_deg):
-        """LED-local Euler convention used by the designer: Rx @ Ry @ Rz."""
-        rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
-        cx, sx = np.cos(rx), np.sin(rx)
-        cy, sy = np.cos(ry), np.sin(ry)
-        cz, sz = np.cos(rz), np.sin(rz)
-        Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-        Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-        Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-        return Rx @ Ry @ Rz
-
-    def _designer_euler_from_axes(direction, row_direction=None):
-        """Recover designer Euler values from an LED forward and row axis."""
-        forward = np.asarray(direction, dtype=float)
-        norm = np.linalg.norm(forward)
-        forward = forward / norm if norm > 1e-9 else np.array([1.0, 0.0, 0.0])
-        if row_direction is None:
-            row = np.array([0.0, 1.0, 0.0])
-        else:
-            row = np.asarray(row_direction, dtype=float)
-            row -= forward * np.dot(row, forward)
-            if np.linalg.norm(row) < 1e-9:
-                row = np.array([0.0, 1.0, 0.0])
-        row /= np.linalg.norm(row)
-        third = np.cross(forward, row)
-        R = np.column_stack([forward, row, third])
-        ry = np.arcsin(np.clip(R[0, 2], -1.0, 1.0))
-        if abs(np.cos(ry)) > 1e-6:
-            rx = np.arctan2(-R[1, 2], R[2, 2])
-            rz = np.arctan2(-R[0, 1], R[0, 0])
-        else:
-            rx, rz = np.arctan2(R[2, 1], R[1, 1]), 0.0
-        return tuple(float(v) for v in np.degrees([rx, ry, rz]))
-
-    def _designer_quaternion(R):
-        """Return a wxyz quaternion for an orthonormal 3x3 rotation matrix."""
-        trace = np.trace(R)
-        if trace > 0:
-            s = 0.5 / np.sqrt(trace + 1.0)
-            return (0.25 / s, (R[2, 1] - R[1, 2]) * s,
-                    (R[0, 2] - R[2, 0]) * s, (R[1, 0] - R[0, 1]) * s)
-        i = int(np.argmax(np.diag(R)))
-        if i == 0:
-            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-            return ((R[2, 1] - R[1, 2]) / s, 0.25 * s,
-                    (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s)
-        if i == 1:
-            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-            return ((R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
-                    0.25 * s, (R[1, 2] + R[2, 1]) / s)
-        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-        return ((R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
-                (R[1, 2] + R[2, 1]) / s, 0.25 * s)
-
-    def _designer_matrix_from_wxyz(wxyz):
-        """Convert a wxyz quaternion to a 3x3 rotation matrix."""
-        w, x, y, z = [float(v) for v in wxyz]
-        return np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-        ], dtype=float)
-
-    def _clear_designer_gizmo():
-        if designer_gizmo[0] is not None:
-            try:
-                designer_gizmo[0].remove()
-            except (KeyError, AttributeError):
-                pass
-            designer_gizmo[0] = None
-
-    def _clear_designer_scene():
-        _clear_designer_gizmo()
-        for nodes in designer_led_nodes:
-            for key in ('box', 'frame'):
-                try:
-                    nodes[key].remove()
-                except (KeyError, AttributeError):
-                    pass
-        designer_led_nodes.clear()
-        for handle in designer_scene_handles:
-            try:
-                handle.remove()
-            except (KeyError, AttributeError):
-                pass
-        designer_scene_handles.clear()
-
-    def _designer_led_pose(led):
-        """Return (position_m, wxyz) for an LED in designer state."""
-        R = _designer_rotation_matrix(led['rx'], led['ry'], led['rz'])
-        pos = (led['x'] / 100.0, led['y'] / 100.0, led['z'] / 100.0)
-        return pos, _designer_quaternion(R)
-
-    def _update_designer_led_pose(index):
-        """In-place pose update for one LED box + frame (no recreate)."""
-        if index is None or index < 0 or index >= len(designer_led_nodes):
-            return
-        led = designer_state[0]['leds'][index]
-        pos, wxyz = _designer_led_pose(led)
-        nodes = designer_led_nodes[index]
-        nodes['box'].position = pos
-        nodes['box'].wxyz = wxyz
-        nodes['frame'].position = pos
-        nodes['frame'].wxyz = wxyz
-
-    def _update_designer_selection_colors():
-        selected = designer_state[0]['selected_led']
-        for index, nodes in enumerate(designer_led_nodes):
-            try:
-                # Viser expects 0-255 when assigning .color (floats stay near-black).
-                nodes['box'].color = (38, 255, 255) if index == selected else (255, 255, 255)
-            except Exception:
-                pass
-
-    def _sync_widgets_from_led(led):
-        """Push LED state into slider/number widgets without feedback loops."""
-        refs = designer_widget_refs[0]
-        if not refs:
-            return
-        designer_syncing[0] = True
-        try:
-            for key, pair in refs.items():
-                if key not in led:
-                    continue
-                slider, number = pair
-                val = led[key]
-                try:
-                    slider.value = val
-                except Exception:
-                    pass
-                try:
-                    number.value = val
-                except Exception:
-                    pass
-        finally:
-            designer_syncing[0] = False
-
-    def _place_gizmo():
-        """Create/move the transform gizmo onto the selected LED (LED-local axes)."""
-        index = designer_state[0]['selected_led']
-        leds = designer_state[0]['leds']
-        if index is None or index < 0 or index >= len(leds):
-            _clear_designer_gizmo()
-            return
-        led = leds[index]
-        pos, wxyz = _designer_led_pose(led)
-        if designer_gizmo[0] is None:
-            gizmo = server.scene.add_transform_controls(
-                "/panel_designer/gizmo",
-                scale=0.08,
-                depth_test=False,
-                position=pos,
-                wxyz=wxyz,
-            )
-
-            @gizmo.on_update
-            def _on_gizmo_update(_):
-                if designer_syncing[0] or not designer_mode[0]:
-                    return
-                i = designer_state[0]['selected_led']
-                if i is None or i >= len(designer_state[0]['leds']):
-                    return
-                cur = designer_state[0]['leds'][i]
-                gx, gy, gz = designer_gizmo[0].position
-                cur['x'], cur['y'], cur['z'] = gx * 100.0, gy * 100.0, gz * 100.0
-                Rm = _designer_matrix_from_wxyz(designer_gizmo[0].wxyz)
-                rx, ry, rz = _designer_euler_from_axes(Rm @ np.array([1.0, 0.0, 0.0]),
-                                                      Rm @ np.array([0.0, 1.0, 0.0]))
-                cur['rx'], cur['ry'], cur['rz'] = rx, ry, rz
-                _update_designer_led_pose(i)
-                _sync_widgets_from_led(cur)
-
-            @gizmo.on_drag_end
-            def _on_gizmo_drag_end(_):
-                if not designer_mode[0]:
-                    return
-                i = designer_state[0]['selected_led']
-                if i is None or i >= len(designer_state[0]['leds']):
-                    return
-                cur = designer_state[0]['leds'][i]
-                # Snap to the same steps as the UI controls.
-                cur['x'] = round(cur['x'] / 0.05) * 0.05
-                cur['y'] = round(cur['y'] / 0.05) * 0.05
-                cur['z'] = round(cur['z'] / 0.05) * 0.05
-                cur['rx'] = round(cur['rx'] / 0.5) * 0.5
-                cur['ry'] = round(cur['ry'] / 0.5) * 0.5
-                cur['rz'] = round(cur['rz'] / 0.5) * 0.5
-                _update_designer_led_pose(i)
-                _sync_widgets_from_led(cur)
-                designer_syncing[0] = True
-                try:
-                    pos2, wxyz2 = _designer_led_pose(cur)
-                    designer_gizmo[0].position = pos2
-                    designer_gizmo[0].wxyz = wxyz2
-                finally:
-                    designer_syncing[0] = False
-
-            designer_gizmo[0] = gizmo
-        else:
-            designer_syncing[0] = True
-            try:
-                designer_gizmo[0].position = pos
-                designer_gizmo[0].wxyz = wxyz
-            finally:
-                designer_syncing[0] = False
-
-    def _select_designer_led_index(index, rebuild_ui=True):
-        """Select an LED for editing; move gizmo and refresh inspector."""
-        _just_clicked_mesh[0] = True
-        designer_state[0]['selected_led'] = index
-        _update_designer_selection_colors()
-        _place_gizmo()
-        if rebuild_ui:
-            _build_designer_ui()
-
-    def update_designer_scene(full_rebuild=True):
-        """Render the isolated panel. full_rebuild recreates LED meshes + gizmo."""
-        if not designer_mode[0]:
-            _clear_designer_scene()
-            return
-        leds = designer_state[0]['leds']
-        if full_rebuild:
-            _clear_designer_scene()
-            extent_cm = max(10.0, max(
-                (max(abs(led[a]) for a in ('x', 'y', 'z')) + led['size']
-                 for led in leds), default=5.0
-            ))
-            designer_scene_handles.append(server.scene.add_grid(
-                "/panel_designer/grid", width=extent_cm * 2 / 100.0,
-                height=extent_cm * 2 / 100.0, plane="yz", cell_size=0.01,
-            ))
-            designer_scene_handles.append(server.scene.add_frame(
-                "/panel_designer/panel_reference_frame", axes_length=0.05,
-                axes_radius=0.002, origin_radius=0.004,
-            ))
-            for index, led in enumerate(leds):
-                pos, wxyz = _designer_led_pose(led)
-                selected = index == designer_state[0]['selected_led']
-                # Sibling paths (not child of the box) so poses are not double-applied.
-                box = server.scene.add_box(
-                    f"/panel_designer/led_{index}",
-                    dimensions=(0.0005, led['size'] / 100.0, led['size'] / 100.0),
-                    color=(38, 255, 255) if selected else (255, 255, 255),
-                    position=pos,
-                    wxyz=wxyz,
-                )
-                frame = server.scene.add_frame(
-                    f"/panel_designer/frame_{index}",
-                    axes_length=max(0.01, led['size'] / 150.0), axes_radius=0.001,
-                    origin_radius=0.002,
-                    position=pos,
-                    wxyz=wxyz,
-                )
-
-                def _on_led_click(_event, selected_index=index):
-                    _select_designer_led_index(selected_index)
-
-                box.on_click(_on_led_click)
-                designer_led_nodes.append({'box': box, 'frame': frame})
-            _place_gizmo()
-        else:
-            for index in range(len(leds)):
-                _update_designer_led_pose(index)
-            _update_designer_selection_colors()
-            _place_gizmo()
-
-    def _designer_set_camera(view):
-        """Place every connected client on an orthographic-style panel view."""
-        leds = designer_state[0]['leds']
-        extent = max(0.3, max(
-            (max(abs(led[a]) for a in ('x', 'y', 'z')) / 100.0 + led['size'] / 100.0
-             for led in leds), default=0.1
-        ) * 3)
-        views = {
-            'XY': ((0, 0, extent), (0, 1, 0)),
-            '-XY': ((0, 0, -extent), (0, 1, 0)),
-            'XZ': ((0, extent, 0), (0, 0, 1)),
-            '-XZ': ((0, -extent, 0), (0, 0, 1)),
-            'YZ': ((extent, 0, 0), (0, 0, 1)),
-            '-YZ': ((-extent, 0, 0), (0, 0, 1)),
-        }
-        position, up = views[view]
-        for client in server.get_clients().values():
-            client.camera.position = position
-            client.camera.look_at = (0, 0, 0)
-            client.camera.up_direction = up
-
-    def _designer_apply_to_group(group, leds):
-        """Replace one dynamic group's local LED arrays from designer LEDs."""
-        group['is_dynamic'] = True
-        group['num_leds'] = len(leds)
-        group['led_positions'] = [(led['x'], led['y'], led['z']) for led in leds]
-        group['original_led_positions'] = list(group['led_positions'])
-        rotations = []
-        rows = []
-        for led in leds:
-            R = _designer_rotation_matrix(led['rx'], led['ry'], led['rz'])
-            rotations.append(tuple(R @ np.array([1.0, 0.0, 0.0])))
-            rows.append(tuple(R @ np.array([0.0, 1.0, 0.0])))
-        group['led_rotations'] = rotations
-        group['original_led_rotations'] = list(rotations)
-        group['led_row_directions'] = rows
-        group['original_led_row_directions'] = list(rows)
-        group['led_euler_angles'] = [(led['rx'], led['ry'], led['rz']) for led in leds]
-        group['led_sizes'] = [led['size'] for led in leds]
-        group['led_viewing_angles'] = [led['view_angle'] for led in leds]
-        group['led_lumens'] = [led['lumens'] if led['custom_lumens'] else None for led in leds]
-        group['led_states'] = [True] * len(leds)
-        group['led_rows'] = [list(range(len(leds)))] if leds else []
-
-    def _designer_template_group():
-        """Return a serializable dynamic group for Save As Template."""
-        leds = designer_state[0]['leds']
-        temp = {'is_dynamic': True, 'position': [0, 0, 0],
-                'rotation_x': 0, 'rotation_y': 0, 'rotation_z': 0,
-                'enabled': True}
-        _designer_apply_to_group(temp, leds)
-        return temp
-
-    def _save_designer_template(_event=None):
-        name = designer_state[0]['name'].strip() or 'Untitled Panel'
-        save_custom_group_template(name, [_designer_template_group()], [])
-        fresh = get_available_templates()
-        template_dropdown.options = ["Empty"] + fresh
-        for dropdown in _panel_dropdowns:
-            current = dropdown.value
-            dropdown.options = ["-- Nessuno --"] + fresh
-            dropdown.value = current if current in dropdown.options else "-- Nessuno --"
-        print(f"✓ Panel Designer template saved: {name}")
-
-    def _save_designer(_event=None):
-        state = designer_state[0]
-        by_group = {}
-        for led in state['leds']:
-            group = led.get('_group')
-            if group is not None:
-                by_group.setdefault(id(group), [group, []])[1].append(led)
-            elif led.get('_individual') is not None:
-                item = led['_individual']
-                item['pos_x'].value, item['pos_y'].value, item['pos_z'].value = led['x'], led['y'], led['z']
-                item['rot_x'].value, item['rot_y'].value, item['rot_z'].value = led['rx'], led['ry'], led['rz']
-                item['size'].value, item['viewing_angle'].value = led['size'], led['view_angle']
-                item['lumens_override'].value = led['custom_lumens']
-                item['lumens_value'].value = led['lumens']
-        if state['editing_owner'] is None:
-            group = create_custom_group(skip_update_scene=True, num_leds=max(1, len(state['leds'])),
-                                        led_rows=[list(range(len(state['leds'])))] if state['leds'] else [[0]],
-                                        group_name=state['name'])
-            _designer_apply_to_group(group, state['leds'])
-            group['template_name'] = state['name']
-            selected_owner[0] = ('custom_group', group['id'])
-        else:
-            for group, group_leds in by_group.values():
-                _designer_apply_to_group(group, group_leds)
-        _exit_designer()
-
-    def _collect_normal_scene_visibility_targets():
-        """Handles that should be hidden while the panel designer is open."""
-        targets = list(static_scene_handles)
-        try:
-            targets.append(wall_handle)
-        except Exception:
-            pass
-        if stl_mesh_handle[0] is not None:
-            targets.append(stl_mesh_handle[0])
-        targets.extend(room_wall_handles)
-        targets.extend(intensity_handles)
-        targets.extend(room_intensity_handles)
-        targets.extend(imported_csv_handles)
-        return targets
-
-    def _set_normal_scene_visible(visible):
-        for handle in _collect_normal_scene_visibility_targets():
-            try:
-                handle.visible = visible
-            except Exception:
-                pass
-
-    def _clear_normal_dynamic_scene():
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, guide_handles
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles + guide_handles:
-            try:
-                handle.remove()
-            except (KeyError, AttributeError):
-                pass
-        led_handles = []
-        ray_handles = []
-        absorber_handles = []
-        camera_fov_handles = []
-        vio_fov_handles = []
-        guide_handles = []
-
-    def _exit_designer(_event=None):
-        designer_mode[0] = False
-        designer_widget_refs[0] = {}
-        _clear_designer_scene()
-        for handle in designer_ui_handles:
-            try:
-                handle.remove()
-            except (KeyError, AttributeError):
-                pass
-        designer_ui_handles.clear()
-        _clear_inspector()
-        _set_normal_scene_visible(True)
-        update_scene()
-        populate_inspector(selected_owner[0])
-
-    def _build_designer_ui():
-        """Rebuild designer controls inside the floating Selected inspector."""
-        _clear_inspector()
-        for handle in designer_ui_handles:
-            try:
-                handle.remove()
-            except (KeyError, AttributeError):
-                pass
-        designer_ui_handles.clear()
-        designer_widget_refs[0] = {}
-        state = designer_state[0]
-        with inspector_tab:
-            _inspector_add(server.gui.add_markdown("**Panel Designer**"))
-            exit_btn = _inspector_add(server.gui.add_button("Exit Designer", color="red"))
-            exit_btn.on_click(_exit_designer)
-
-            name_input = _inspector_add(server.gui.add_text("Panel name", initial_value=state['name']))
-            name_input.on_update(lambda _: state.__setitem__('name', name_input.value))
-
-            _inspector_add(server.gui.add_markdown("**View plane**"))
-            for view in ('XY', 'XZ', 'YZ', '-XY', '-XZ', '-YZ'):
-                button = _inspector_add(server.gui.add_button(view))
-                button.on_click(lambda _, v=view: _designer_set_camera(v))
-
-            _inspector_add(server.gui.add_markdown("**LEDs** — click a mesh or button; drag the gizmo arrows/rings"))
-            for index, _led in enumerate(state['leds']):
-                if index == state['selected_led']:
-                    button = _inspector_add(server.gui.add_button(f"LED {index + 1}", color="#00CCCC"))
-                else:
-                    button = _inspector_add(server.gui.add_button(f"LED {index + 1}"))
-
-                def _choose(_event, selected_index=index):
-                    _select_designer_led_index(selected_index)
-
-                button.on_click(_choose)
-
-            add_btn = _inspector_add(server.gui.add_button("Add LED", color="green"))
-            duplicate_btn = _inspector_add(server.gui.add_button("Duplicate LED"))
-            remove_btn = _inspector_add(server.gui.add_button("Remove LED", color="red"))
-
-            def _add(_):
-                state['leds'].append({
-                    'x': 0.0, 'y': 0.0, 'z': 0.0, 'rx': 0.0, 'ry': 0.0, 'rz': 0.0,
-                    'size': 0.5, 'view_angle': 120.0, 'custom_lumens': False,
-                    'lumens': 100.0, '_group': state.get('target_group'),
-                })
-                state['selected_led'] = len(state['leds']) - 1
-                update_designer_scene(full_rebuild=True)
-                _build_designer_ui()
-
-            add_btn.on_click(_add)
-
-            def _duplicate(_):
-                i = state['selected_led']
-                if i is None:
-                    return
-                new_led = dict(state['leds'][i])
-                new_led['y'] += 0.5
-                state['leds'].append(new_led)
-                state['selected_led'] = len(state['leds']) - 1
-                update_designer_scene(full_rebuild=True)
-                _build_designer_ui()
-
-            duplicate_btn.on_click(_duplicate)
-
-            def _remove(_):
-                i = state['selected_led']
-                if i is None:
-                    return
-                state['leds'].pop(i)
-                state['selected_led'] = min(i, len(state['leds']) - 1) if state['leds'] else None
-                update_designer_scene(full_rebuild=True)
-                _build_designer_ui()
-
-            remove_btn.on_click(_remove)
-
-            i = state['selected_led']
-            if i is not None and i < len(state['leds']):
-                led = state['leds'][i]
-                _inspector_add(server.gui.add_markdown(
-                    f"**LED {i + 1}** — drag gizmo (LED-local axes) or edit values"
-                ))
-                for label, key, low, high, step in (
-                    ('Position X (cm)', 'x', -30, 30, 0.05),
-                    ('Position Y (cm)', 'y', -30, 30, 0.05),
-                    ('Position Z (cm)', 'z', -30, 30, 0.05),
-                    ('Rotation X (°)', 'rx', -180, 180, 0.5),
-                    ('Rotation Y (°)', 'ry', -180, 180, 0.5),
-                    ('Rotation Z (°)', 'rz', -180, 180, 0.5),
-                    ('Square side (cm)', 'size', 0.1, 10, 0.05),
-                    ('Viewing angle (°)', 'view_angle', 1, 180, 1),
-                ):
-                    slider = _inspector_add(server.gui.add_slider(
-                        label, min=low, max=high, step=step, initial_value=led[key]
-                    ))
-                    number = _inspector_add(server.gui.add_number(
-                        f"{label} value", initial_value=led[key], step=step
-                    ))
-                    designer_widget_refs[0][key] = (slider, number)
-
-                    def _bind(source, other, field, needs_rebuild):
-                        def _update(_):
-                            if designer_syncing[0]:
-                                return
-                            designer_syncing[0] = True
-                            try:
-                                led[field] = float(source.value)
-                                other.value = source.value
-                            finally:
-                                designer_syncing[0] = False
-                            if needs_rebuild:
-                                update_designer_scene(full_rebuild=True)
-                            else:
-                                _update_designer_led_pose(state['selected_led'])
-                                _place_gizmo()
-                        source.on_update(_update)
-
-                    needs_rebuild = key in ('size', 'view_angle')
-                    _bind(slider, number, key, needs_rebuild)
-                    _bind(number, slider, key, needs_rebuild)
-
-                lumens_check = _inspector_add(server.gui.add_checkbox(
-                    "Custom lumens", initial_value=led['custom_lumens']
-                ))
-                lumens_value = _inspector_add(server.gui.add_number(
-                    "Lumens value", initial_value=led['lumens'], min=1, step=1
-                ))
-                lumens_check.on_update(lambda _: led.__setitem__('custom_lumens', lumens_check.value))
-                lumens_value.on_update(lambda _: led.__setitem__('lumens', float(lumens_value.value)))
-
-            _inspector_add(server.gui.add_html("<hr style='margin:8px 0;'>"))
-            save_btn = _inspector_add(server.gui.add_button("Save", color="green"))
-            template_btn = _inspector_add(server.gui.add_button("Save As Template"))
-            cancel_btn = _inspector_add(server.gui.add_button("Cancel", color="red"))
-            save_btn.on_click(_save_designer)
-            template_btn.on_click(_save_designer_template)
-            cancel_btn.on_click(_exit_designer)
-
-    def _enter_panel_designer(owner=None):
-        """Open an empty designer or extract a selected panel's local LEDs."""
-        state = {'name': 'Untitled Panel', 'editing_owner': owner, 'leds': [],
-                 'selected_led': None, 'target_group': None}
-        groups = _owner_groups(owner) if owner is not None else []
-        for group in groups:
-            if not group.get('is_dynamic', False):
-                continue
-            state['name'] = group.get('template_name') or _owner_display_name(owner)
-            positions = group.get('original_led_positions', group.get('led_positions', []))
-            eulers = group.get('led_euler_angles', [])
-            directions = group.get('original_led_rotations', group.get('led_rotations', []))
-            rows = group.get('original_led_row_directions', group.get('led_row_directions', []))
-            sizes = group.get('led_sizes', [])
-            view_angles = group.get('led_viewing_angles', [])
-            lumens_list = group.get('led_lumens', [])
-            for i, pos in enumerate(positions):
-                euler = eulers[i] if i < len(eulers) else _designer_euler_from_axes(
-                    directions[i] if i < len(directions) else (1, 0, 0),
-                    rows[i] if i < len(rows) else None,
-                )
-                state['leds'].append({
-                    'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2]),
-                    'rx': float(euler[0]), 'ry': float(euler[1]), 'rz': float(euler[2]),
-                    'size': float(sizes[i]) if i < len(sizes) else 0.5,
-                    'view_angle': float(view_angles[i]) if i < len(view_angles) else 120.0,
-                    'custom_lumens': i < len(lumens_list) and lumens_list[i] is not None,
-                    'lumens': float(lumens_list[i]) if i < len(lumens_list) and lumens_list[i] is not None else 100.0,
-                    '_group': group,
-                })
-            state['target_group'] = state['target_group'] or group
-        for item in _owner_individual_leds(owner):
-            state['name'] = _owner_display_name(owner)
-            state['leds'].append({
-                'x': item['pos_x'].value, 'y': item['pos_y'].value, 'z': item['pos_z'].value,
-                'rx': item['rot_x'].value, 'ry': item['rot_y'].value, 'rz': item['rot_z'].value,
-                'size': item['size'].value, 'view_angle': item['viewing_angle'].value,
-                'custom_lumens': item['lumens_override'].value,
-                'lumens': item['lumens_value'].value, '_individual': item,
-            })
-        if owner is not None and not state['leds']:
-            print("Panel Designer requires a dynamic panel or individual LEDs.")
-            return
-        if state['leds']:
-            state['selected_led'] = 0
-        designer_state[0] = state
-        designer_mode[0] = True
-        # Isolate the view without destroying static nodes (wall/grid/axes/STL).
-        _clear_normal_dynamic_scene()
-        _set_normal_scene_visible(False)
-        _build_designer_ui()
-        update_designer_scene(full_rebuild=True)
-        _designer_set_camera('YZ')
-
-    open_panel_designer_btn.on_click(lambda _: _enter_panel_designer())
-
-    def populate_inspector(owner):
-        """Rebuild the floating inspector for the given owner (or empty state)."""
-        if designer_mode[0]:
-            # Designer owns the Selected tab while active.
-            return
-        _clear_inspector()
-        with inspector_tab:
-            if owner is None:
-                _inspector_add(server.gui.add_markdown(
-                    "Click a panel or LED group in the 3D view to edit it."
-                ))
-                return
-
-            kind, key = owner
-            deselect_btn = _inspector_add(server.gui.add_button("Deselect"))
-
-            @deselect_btn.on_click
-            def _(_):
-                select_panel(None)
-
-            if kind == 'slot':
-                data = _panel_slot_data[key] if 0 <= key < len(_panel_slot_data) else None
-                slot_groups = [g for g in custom_groups if g.get('panel_slot') == key]
-                if data is None and not slot_groups:
-                    _inspector_add(server.gui.add_markdown("This slot is empty."))
-                    return
-                if data is None:
-                    # Panel restored from a saved configuration (no slot UI):
-                    # expose its group controls directly so it stays editable.
-                    slot_name = _ELIOS3_SLOTS[key]['name']
-                    _inspector_add(server.gui.add_markdown(f"**Slot {slot_name}**"))
-                    _inspector_mirror_checkbox(owner)
-                    for g_idx, group in enumerate(slot_groups):
-                        if len(slot_groups) > 1:
-                            _inspector_add(server.gui.add_html(
-                                f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
-                            ))
-                        _mirror_checkbox("Enable", group['enable'])
-                        _inspector_guide_controls(group)
-                        _inspector_group_pose_sliders(group)
-                        if group.get('lumens_override') is not None:
-                            _mirror_checkbox("Enable custom lumens", group['lumens_override'])
-                            _mirror_slider("Lumens per LED (lm)", group['lumens_value'], 1, 900000, 1)
-                        _inspector_led_matrix(group)
-                    return
-                slot_name = data.get('slot_label', _ELIOS3_SLOTS[key]['name'])
-                tmpl = data.get('template_display', data.get('template_name', ''))
-                _inspector_add(server.gui.add_markdown(
-                    f"**Slot {slot_name}**  \n{tmpl}"
-                    + ("  \n*Loaded as individual LEDs*" if data.get('as_individual') else "")
-                ))
-                edit_designer_btn = _inspector_add(server.gui.add_button("Edit in Panel Designer"))
-                edit_designer_btn.on_click(lambda _, o=owner: _enter_panel_designer(o))
-                _inspector_mirror_checkbox(owner)
-                ctrl = data.get('controls') or {}
-                slot_groups_live = data.get('groups') or slot_groups
-                slot_anchored = any(_guide_is_enabled(g) for g in slot_groups_live)
-                if ctrl.get('enable') is not None:
-                    _mirror_checkbox("Enable Slot", ctrl['enable'])
-                    if slot_anchored:
-                        _inspector_add(server.gui.add_markdown(
-                            "Slot offset/rotation locked while a group is anchored to a circular guide."
-                        ))
-                    else:
-                        _mirror_slider("Offset X (cm)", ctrl['pos_x'], -50, 50, 0.1)
-                        _mirror_slider("Offset Y (cm)", ctrl['pos_y'], -50, 50, 0.1)
-                        _mirror_slider("Offset Z (cm)", ctrl['pos_z'], -50, 50, 0.1)
-                        _mirror_slider("Rotate on axis (°)", ctrl['rot_x'], -180, 180, 1)
-                        _mirror_slider("Tilt Up/Down (°)", ctrl['rot_y'], -180, 180, 1)
-                        _mirror_slider("Tilt Left/Right (°)", ctrl['rot_z'], -180, 180, 1)
-                    _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
-                    _mirror_checkbox("Enable custom lumens", ctrl['lumens_chk'])
-                    _mirror_slider("Lumens per LED (lm)", ctrl['lumens_slider'], 1, 900000, 1)
-                if data.get('as_individual'):
-                    _inspector_add(server.gui.add_markdown(
-                        "Per-LED edits are in the **Individual LEDs** folder."
-                    ))
-                else:
-                    for g_idx, group in enumerate(slot_groups_live):
-                        _inspector_add(server.gui.add_html(
-                            f"<hr style='margin:8px 0;'><b>Group {g_idx + 1}</b>"
-                        ))
-                        _inspector_guide_controls(group)
-                        _inspector_led_matrix(group)
-                remove_btn = _inspector_add(server.gui.add_button("Remove Slot", color="red"))
-
-                @remove_btn.on_click
-                def _(_):
-                    _clear_panel_slot(key)
-                    if key < len(_panel_dropdowns):
-                        _panel_dropdowns[key].value = "-- Nessuno --"
-                    update_scene()
-
-            elif kind == 'custom_group':
-                group = next((g for g in custom_groups if g.get('id') == key), None)
-                if group is None:
-                    _inspector_add(server.gui.add_markdown("This group no longer exists."))
-                    return
-                title = group.get('template_name') or f"Custom Group {key}"
-                _inspector_add(server.gui.add_markdown(f"**{title}**"))
-                edit_designer_btn = _inspector_add(server.gui.add_button("Edit in Panel Designer"))
-                edit_designer_btn.on_click(lambda _, o=owner: _enter_panel_designer(o))
-                _inspector_mirror_checkbox(owner)
-                _mirror_checkbox("Enable", group['enable'])
-                _inspector_guide_controls(group)
-                _inspector_group_pose_sliders(group)
-                if group.get('lumens_override') is not None:
-                    _inspector_add(server.gui.add_html("<hr style='margin:4px 0;'><b>Lumens Override:</b>"))
-                    _mirror_checkbox("Enable custom lumens", group['lumens_override'])
-                    _mirror_slider("Lumens per LED (lm)", group['lumens_value'], 1, 900000, 1)
-                _inspector_led_matrix(group)
-                remove_btn = _inspector_add(server.gui.add_button("Remove Group", color="red"))
-
-                @remove_btn.on_click
-                def _(_):
-                    if group in custom_groups:
-                        custom_groups.remove(group)
-                    try:
-                        group['folder'].remove()
-                    except Exception:
-                        pass
-                    select_panel(None)
-
-            elif kind == 'base_group':
-                names = ["Front+", "Front-", "Side+", "Side-"]
-                rot_z = [rot_front_pos, rot_front_neg, rot_side_pos, rot_side_neg]
-                rot_y = [rot_y_front_pos, rot_y_front_neg, rot_y_side_pos, rot_y_side_neg]
-                off_x = [offset_front_pos_x, offset_front_neg_x, offset_side_pos_x, offset_side_neg_x]
-                off_y = [offset_front_pos_y, offset_front_neg_y, offset_side_pos_y, offset_side_neg_y]
-                off_z = [offset_front_pos_z, offset_front_neg_z, offset_side_pos_z, offset_side_neg_z]
-                if key < 0 or key > 3:
-                    _inspector_add(server.gui.add_markdown("Unknown base group."))
-                    return
-                _inspector_add(server.gui.add_markdown(f"**Base group: {names[key]}**"))
-                _mirror_slider(f"Rotate {names[key]} Z (°)", rot_z[key], -180, 180, 1)
-                _mirror_slider(f"Rotate {names[key]} local Y (tilt °)", rot_y[key], -180, 180, 1)
-                ymin, ymax = ((-40, 40) if key == 2 else (-40, 50) if key == 3 else (-30, 30))
-                _mirror_slider("Offset X (cm)", off_x[key], -30, 30, 0.1)
-                _mirror_slider("Offset Y (cm)", off_y[key], ymin, ymax, 0.1)
-                _mirror_slider("Offset Z (cm)", off_z[key], -30, 30, 0.1)
-                _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
-                color_hex = group_colors_hex[key]
-                start = key * 12
-                any_on = any(led_states[start:start + 12])
-                all_btn = _inspector_add(server.gui.add_button("ALL", color=color_hex if any_on else "#444444"))
-
-                def _on_all(_):
-                    new_state = not all(led_states[start:start + 12])
-                    for i in range(start, start + 12):
-                        led_states[i] = new_state
-                    update_all_led_buttons()
-                    update_scene()
-                    update_ui_visibility()
-                    populate_inspector(selected_owner[0])
-
-                all_btn.on_click(_on_all)
-                for row_idx in range(4):
-                    r0 = start + row_idx * 3
-                    any_row = any(led_states[r0:r0 + 3])
-                    row_btn = _inspector_add(server.gui.add_button(
-                        f"Row {row_idx + 1}", color=color_hex if any_row else "#666666"
-                    ))
-
-                    def _make_row(s):
-                        def _on(_):
-                            new_state = not all(led_states[s:s + 3])
-                            for i in range(s, s + 3):
-                                led_states[i] = new_state
-                            update_all_led_buttons()
-                            update_scene()
-                            update_ui_visibility()
-                            populate_inspector(selected_owner[0])
-                        return _on
-
-                    row_btn.on_click(_make_row(r0))
-                for li in range(12):
-                    gi = start + li
-                    on = led_states[gi]
-                    led_btn = _inspector_add(server.gui.add_button(
-                        f"L{li + 1}", color=color_hex if on else "#444444"
-                    ))
-
-                    def _make_led(idx):
-                        def _on(_):
-                            led_states[idx] = not led_states[idx]
-                            update_all_led_buttons()
-                            update_scene()
-                            update_ui_visibility()
-                            populate_inspector(selected_owner[0])
-                        return _on
-
-                    led_btn.on_click(_make_led(gi))
-
-            else:
-                _inspector_add(server.gui.add_markdown(f"Unknown selection: `{kind}`"))
-
-    def _select_panel_real(owner):
-        if designer_mode[0]:
-            return
-        if selected_owner[0] == owner:
-            return
-        selected_owner[0] = owner
-        populate_inspector(owner)
-        update_scene()
-
-    _select_panel_impl[0] = _select_panel_real
-    populate_inspector(None)
-    
-    def update_scene():
-        """Redraw the scene based on current slider values (without intensity map)."""
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, guide_handles
-        if designer_mode[0]:
-            # Designer owns the 3D view; do not rebuild (would destroy the gizmo).
-            return
-
-        # Ray-box intersection helper for update_scene (positions in cm)
-        def ray_box_intersection(pos, direction, box):
-            center = np.array(box['center'], dtype=float)
-            half = np.array(box['half_sizes'], dtype=float)
-            rotation = box.get('rotation', None)
-            
-            # If box has rotation, transform ray to box's local space
-            if rotation is not None:
-                qw, qx, qy, qz = rotation
-                # Convert quaternion to rotation matrix
-                R = np.array([
-                    [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
-                    [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
-                    [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
-                ])
-                # Transform ray to local space (inverse rotation)
-                R_inv = R.T
-                local_pos = R_inv @ (pos - center)
-                local_dir = R_inv @ direction
-                pos = local_pos
-                direction = local_dir
-                center = np.array([0.0, 0.0, 0.0])
-            
-            tmin = -np.inf
-            tmax = np.inf
-            for k in range(3):
-                if abs(direction[k]) < 1e-12:
-                    if pos[k] < center[k] - half[k] or pos[k] > center[k] + half[k]:
-                        return None
-                else:
-                    t1 = (center[k] - half[k] - pos[k]) / direction[k]
-                    t2 = (center[k] + half[k] - pos[k]) / direction[k]
-                    t_near = min(t1, t2)
-                    t_far = max(t1, t2)
-                    tmin = max(tmin, t_near)
-                    tmax = min(tmax, t_far)
-                    if tmin > tmax:
-                       return None
-            if tmax < 0:
-                return None
-            return tmin if tmin > 0 else (tmax if tmax > 0 else None)
-
-        # Clear previous objects (safely ignore already-removed handles)
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles + guide_handles:
-            try:
-                handle.remove()
-            except KeyError:
-                pass  # Handle already removed by server
-        led_handles = []
-        ray_handles = []
-        absorber_handles = []
-        camera_fov_handles = []
-        vio_fov_handles = []
-        guide_handles = []
-
-        # Get current values (fixed angles: front=0°, side=90°)
-        front_angle = 0.0  # Fixed front angle
-        side_angle = 90.0  # Fixed side angle
-        viewing_angle = viewing_angle_slider.value
-        radius = radius_slider.value
-        wall_dist = wall_dist_slider.value
-        circle_center_x = circle_center_slider.value
-        ray_length = ray_length_slider.value
-
-        # Create LEDs
-        # Read per-group rotation slider values
-        rotations = [
-            rot_front_pos.value,
-            rot_front_neg.value,
-            rot_side_pos.value,
-            rot_side_neg.value,
-        ]
-        
-        rotations_y = [
-            rot_y_front_pos.value,
-            rot_y_front_neg.value,
-            rot_y_side_pos.value,
-            rot_y_side_neg.value,
-        ]
-        
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
-
-        # Build custom groups configs list
-        custom_groups_configs = []
-        for group in custom_groups:
-            config = {
-                'enabled': group['enable'].value,
-                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
-                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
-                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                'led_states': group['led_states'],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            }
-            # Add dynamic group info if present
-            if group.get('is_dynamic', False):
-                config['num_leds'] = group.get('num_leds', 0)
-                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
-                config['led_positions'] = translated_positions
-                config['led_rotations'] = rotated_directions
-                config['led_sizes'] = group.get('led_sizes', [])
-                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                config['led_lumens'] = group.get('led_lumens', [])
-                if rotated_row_dirs:
-                    config['led_row_directions'] = rotated_row_dirs
-            # Pass lumens override for custom group
-            if group.get('lumens_override') and group['lumens_override'].value:
-                config['lumens_override'] = float(group['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            if group.get('panel_slot') is not None:
-                config['owner'] = ('slot', group['panel_slot'])
-            else:
-                config['owner'] = ('custom_group', group['id'])
-            custom_groups_configs.append(config)
-        
-        # Build individual LEDs configs list
-        individual_leds_configs = []
-        for led in individual_leds:
-            config = {
-                'enabled': led['enable'].value,
-                'led_on': led.get('led_on', True),  # Default to True if not set
-                'pos_x': led['pos_x'].value,
-                'pos_y': led['pos_y'].value,
-                'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value,
-                'rot_y': led['rot_y'].value,
-                'rot_z': led['rot_z'].value,
-                'size': led['size'].value,
-                'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value,
-                'beam_tilt': led['beam_tilt'].value,
-            }
-            # Pass lumens override for individual LED
-            if led.get('lumens_override') and led['lumens_override'].value:
-                config['lumens_override'] = float(led['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            # Pass external lens settings
-            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
-                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
-                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
-            for _si, _pdata in enumerate(_panel_slot_data):
-                if _pdata and led in _pdata.get('individual_leds', []):
-                    config['owner'] = ('slot', _si)
-                    break
-            if 'owner' not in config and led.get('panel_slot') is not None:
-                config['owner'] = ('slot', led['panel_slot'])
-            individual_leds_configs.append(config)
-        
-        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
-        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
-
-        leds = create_leds(
-            front_angle,
-            side_angle,
-            viewing_angle,
-            radius,
-            circle_center_x,
-            default_lumens=float(led_lumens_slider.value),
-            group_rotations=rotations,
-            group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states,
-            group_offsets=offsets,
-            custom_groups_configs=custom_groups_configs,
-            individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
-        )
-        
-        # ── Apply global Z rotation to all LEDs ──
-        global_rot_z_deg = global_rotation_z_slider.value
-        if abs(global_rot_z_deg) > 0.01:
-            g_rad = np.radians(global_rot_z_deg)
-            cg, sg = np.cos(g_rad), np.sin(g_rad)
-            Rg = np.array([[cg, -sg, 0],
-                           [sg,  cg, 0],
-                           [0,   0,  1]], dtype=float)
-            for led in leds:
-                led.position = Rg @ led.position
-                led.direction = Rg @ led.direction
-                if hasattr(led, 'row_direction') and led.row_direction is not None:
-                    led.row_direction = Rg @ np.asarray(led.row_direction)
-                if hasattr(led, 'square_normal') and led.square_normal is not None:
-                    led.square_normal = Rg @ np.asarray(led.square_normal)
-
-        # ── Apply global position offset to all LEDs ──
-        _gp_x = global_pos_x_slider.value
-        _gp_y = global_pos_y_slider.value
-        _gp_z = global_pos_z_slider.value
-        if abs(_gp_x) > 0.001 or abs(_gp_y) > 0.001 or abs(_gp_z) > 0.001:
-            _gp_offset = np.array([_gp_x, _gp_y, _gp_z], dtype=float)
-            for led in leds:
-                led.position = led.position + _gp_offset
-
-        # ── Apply diffuser lens effect ──
-        # A diffuser lens scatters light, widening the viewing angle toward
-        # a near-Lambertian distribution.  The transmission loss is applied
-        # separately in the simulation functions (lumens_per_led *= transmission).
-        if diffuser_enable_chk.value:
-            diff_angle = float(diffuser_angle_slider.value)
-            for led in leds:
-                # Widen to diffuser output angle (only if wider than native)
-                led.viewing_angle = max(led.viewing_angle, diff_angle)
-
-        # Save LEDs for reuse in room intensity calculation (in place: ui.room_mode holds a reference)
-        current_leds[:] = leds
-
-        # Rest-pose construction circles + axis for the selected anchored panel
-        def _globalize_cm(p):
-            v = np.asarray(p, dtype=float).reshape(3)
-            if abs(global_rot_z_deg) > 0.01:
-                g_rad = np.radians(global_rot_z_deg)
-                cg, sg = np.cos(g_rad), np.sin(g_rad)
-                v = np.array([cg * v[0] - sg * v[1], sg * v[0] + cg * v[1], v[2]])
-            v = v + np.array([_gp_x, _gp_y, _gp_z], dtype=float)
-            return v
-
-        def _globalize_dir(d):
-            v = np.asarray(d, dtype=float).reshape(3)
-            if abs(global_rot_z_deg) > 0.01:
-                g_rad = np.radians(global_rot_z_deg)
-                cg, sg = np.cos(g_rad), np.sin(g_rad)
-                v = np.array([cg * v[0] - sg * v[1], sg * v[0] + cg * v[1], v[2]])
-            return v
-
-        draw_groups = []
-        owner = selected_owner[0]
-        if owner is not None:
-            draw_groups = list(_owner_groups(owner))
-        for gi, group in enumerate(draw_groups):
-            if not _guide_is_enabled(group):
-                continue
-            guide = group['guide']
-            origin = _as_vec3(guide.get('origin', (0, 0, 0)))
-            axis = _as_vec3(guide.get('axis', (0, 0, 1)))
-            an = np.linalg.norm(axis)
-            if an < 1e-12:
-                continue
-            axis = axis / an
-            circles = guide.get('circles') or []
-            for ci, circ in enumerate(circles):
-                segs = _circle_line_segments_m(
-                    _globalize_cm(circ.get('center', origin)),
-                    float(circ.get('radius', 0.0)),
-                    _globalize_dir(circ.get('normal', axis)),
-                    n_seg=64,
-                )
-                if segs.shape[0] == 0:
-                    continue
-                handle = server.scene.add_line_segments(
-                    f"/guides/group_{group.get('id', gi)}/circle_{ci}",
-                    points=segs,
-                    colors=(0.55, 0.75, 0.95),
-                    line_width=1.5,
-                )
-                guide_handles.append(handle)
-            ts = [float(np.dot(_as_vec3(c.get('center', origin)) - origin, axis)) for c in circles] or [0.0]
-            t_lo, t_hi = min(ts) - 3.0, max(ts) + 3.0
-            if abs(t_hi - t_lo) < 4.0:
-                t_lo, t_hi = -8.0, 8.0
-            p0 = _globalize_cm(origin + axis * t_lo) / 100.0
-            p1 = _globalize_cm(origin + axis * t_hi) / 100.0
-            axis_h = server.scene.add_line_segments(
-                f"/guides/group_{group.get('id', gi)}/axis",
-                points=np.array([[p0, p1]]),
-                colors=(1.0, 0.85, 0.2),
-                line_width=3.0,
-            )
-            guide_handles.append(axis_h)
-
-        # Build absorbers
-        absorbers = []
-        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
-        for i, angle_deg in enumerate(angles_deg):
-            if i not in (0, 1):
-                continue
-            angle_rad = np.radians(angle_deg)
-            gx = circle_center_x + radius * np.cos(angle_rad)
-            gy = radius * np.sin(angle_rad)
-            y_offset = 6.5 if i == 0 else -6.5
-            gy = gy + y_offset
-            
-            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
-            if np.linalg.norm(radial) == 0:
-                radial_unit = np.array((1.0, 0.0, 0.0))
-            else:
-                radial_unit = radial / np.linalg.norm(radial)
-            
-            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
-            y_base_offset = -4.2 if i == 0 else 4.2
-            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
-            base_abs_cz = 0.0
-            
-            if not absorbers_enable.value:
-                continue
-            if i == 0:
-                abs_cx = base_abs_cx + abs0_off_x.value
-                abs_cy = base_abs_cy + abs0_off_y.value
-                abs_cz = base_abs_cz + abs0_off_z.value
-            else:
-                abs_cx = base_abs_cx + abs1_off_x.value
-                abs_cy = base_abs_cy + abs1_off_y.value
-                abs_cz = base_abs_cz + abs1_off_z.value
-            
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': None,
-            })
-        
-        # Add abs2 and abs3 at origin with offsets
-        if absorbers_enable.value:
-            # Abs2 with rotation
-            abs_cx = 0.0 + abs2_off_x.value
-            abs_cy = 0.0 + abs2_off_y.value
-            abs_cz = 0.0 + abs2_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs2_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-            
-            # Abs3 with rotation
-            abs_cx = 0.0 + abs3_off_x.value
-            abs_cy = 0.0 + abs3_off_y.value
-            abs_cz = 0.0 + abs3_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs3_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-
-        # ── Apply global Z rotation to absorbers ──
-        if abs(global_rot_z_deg) > 0.01:
-            for a in absorbers:
-                cx, cy, cz = a['center']
-                new_cx = cg * cx - sg * cy
-                new_cy = sg * cx + cg * cy
-                a['center'] = (new_cx, new_cy, cz)
-                # Compose global rotation with existing quaternion rotation
-                if a.get('rotation') is not None:
-                    qw0, qx0, qy0, qz0 = a['rotation']
-                    # Quaternion for Rg around Z: (cos(a/2), 0, 0, sin(a/2))
-                    half = g_rad / 2.0
-                    gqw, gqx, gqy, gqz = np.cos(half), 0.0, 0.0, np.sin(half)
-                    # q_new = q_global * q_existing
-                    nw = gqw*qw0 - gqx*qx0 - gqy*qy0 - gqz*qz0
-                    nx = gqw*qx0 + gqx*qw0 + gqy*qz0 - gqz*qy0
-                    ny = gqw*qy0 - gqx*qz0 + gqy*qw0 + gqz*qx0
-                    nz = gqw*qz0 + gqx*qy0 - gqy*qx0 + gqz*qw0
-                    a['rotation'] = (nw, nx, ny, nz)
-                else:
-                    half = g_rad / 2.0
-                    a['rotation'] = (np.cos(half), 0.0, 0.0, np.sin(half))
-
-        # Draw absorber boxes (red) in the scene
-        for idx, a in enumerate(absorbers):
-            cx, cy, cz = a['center']
-            hx, hy, hz = a['half_sizes']
-            rot = a.get('rotation', None)
-            # Viser add_box dimensions are in meters (x,y,z)
-            dims = ((hx * 2) / 100.0, (hy * 2) / 100.0, (hz * 2) / 100.0)
-            pos_m = (cx / 100.0, cy / 100.0, cz / 100.0)
-            if rot is not None:
-                handle = server.scene.add_box(
-                    f"/absorbers/abs_{idx}",
-                    dimensions=dims,
-                    color=(1.0, 0.0, 0.0),
-                    position=pos_m,
-                    wxyz=rot,
-                )
-            else:
-                handle = server.scene.add_box(
-                    f"/absorbers/abs_{idx}",
-                    dimensions=dims,
-                    color=(1.0, 0.0, 0.0),
-                    position=pos_m,
-                )
-            absorber_handles.append(handle)
-
-        # Draw LEDs as squares with center source (if enabled)
-        if show_led_markers.value:
-            for i, led in enumerate(leds):
-                led_idx = getattr(led, 'led_index', i)
-                led_enabled = not (hasattr(led, 'enabled') and not led.enabled)
-                
-                # Build local coordinate system for LED
-                # Use square_normal (original direction) for mesh if beam_tilt is applied
-                square_dir = getattr(led, 'mesh_normal', led.direction)
-                z_axis = square_dir / np.linalg.norm(square_dir)
-                
-                # Use row_direction as reference for consistent square orientation across all rows
-                row_dir = getattr(led, 'row_direction', None)
-                if row_dir is not None:
-                    # y_axis aligned with row direction (direction along the row of LEDs)
-                    y_axis = row_dir / np.linalg.norm(row_dir)
-                    # Make y_axis perpendicular to z_axis (Gram-Schmidt)
-                    y_axis = y_axis - z_axis * np.dot(y_axis, z_axis)
-                    if np.linalg.norm(y_axis) < 0.01:  # Nearly parallel, use fallback
-                        if abs(z_axis[2]) < 0.9:
-                            x_axis = np.cross(z_axis, [0, 0, 1])
-                        else:
-                            x_axis = np.cross(z_axis, [0, 1, 0])
-                        x_axis = x_axis / np.linalg.norm(x_axis)
-                        y_axis = np.cross(z_axis, x_axis)
-                    else:
-                        y_axis = y_axis / np.linalg.norm(y_axis)
-                        x_axis = np.cross(y_axis, z_axis)
-                else:
-                    # Fallback for backwards compatibility
-                    if abs(z_axis[2]) < 0.9:
-                        x_axis = np.cross(z_axis, [0, 0, 1])
-                    else:
-                        x_axis = np.cross(z_axis, [0, 1, 0])
-                    x_axis = x_axis / np.linalg.norm(x_axis)
-                    y_axis = np.cross(z_axis, x_axis)
-                
-                # Create rotation matrix from local axes to world axes
-                # Square default orientation: thin in X, extends in Y and Z
-                # We want: thin along z_axis (LED direction), extends along x_axis and y_axis
-                # Rotation matrix: columns are the target axes in world coordinates
-                rot_matrix = np.column_stack([z_axis, x_axis, y_axis])
-                
-                # Convert rotation matrix to quaternion (wxyz format)
-                # Using Shepperd's method for numerical stability
-                trace = rot_matrix[0, 0] + rot_matrix[1, 1] + rot_matrix[2, 2]
-                if trace > 0:
-                    s = 0.5 / np.sqrt(trace + 1.0)
-                    w = 0.25 / s
-                    x = (rot_matrix[2, 1] - rot_matrix[1, 2]) * s
-                    y = (rot_matrix[0, 2] - rot_matrix[2, 0]) * s
-                    z = (rot_matrix[1, 0] - rot_matrix[0, 1]) * s
-                else:
-                    if rot_matrix[0, 0] > rot_matrix[1, 1] and rot_matrix[0, 0] > rot_matrix[2, 2]:
-                        s = 2.0 * np.sqrt(1.0 + rot_matrix[0, 0] - rot_matrix[1, 1] - rot_matrix[2, 2])
-                        w = (rot_matrix[2, 1] - rot_matrix[1, 2]) / s
-                        x = 0.25 * s
-                        y = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
-                        z = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
-                    elif rot_matrix[1, 1] > rot_matrix[2, 2]:
-                        s = 2.0 * np.sqrt(1.0 + rot_matrix[1, 1] - rot_matrix[0, 0] - rot_matrix[2, 2])
-                        w = (rot_matrix[0, 2] - rot_matrix[2, 0]) / s
-                        x = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
-                        y = 0.25 * s
-                        z = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
-                    else:
-                        s = 2.0 * np.sqrt(1.0 + rot_matrix[2, 2] - rot_matrix[0, 0] - rot_matrix[1, 1])
-                        w = (rot_matrix[1, 0] - rot_matrix[0, 1]) / s
-                        x = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
-                        y = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
-                        z = 0.25 * s
-                quat_wxyz = np.array([w, x, y, z])
-                
-                # Square size from LED width (in cm, convert to meters)
-                square_size = led.width / 100.0  # LED width in cm converted to meters
-                square_thickness = 0.0002  # Very thin (0.2mm)
-                dims = (square_thickness, square_size, square_size)
-                
-                # White color: bright if enabled, dim if disabled; cyan if this panel is selected
-                square_color = (1.0, 1.0, 1.0) if led_enabled else (0.3, 0.3, 0.3)
-                _owner = getattr(led, 'owner', None)
-                if selected_owner[0] is not None and _owner == selected_owner[0]:
-                    square_color = (0.15, 1.0, 1.0) if led_enabled else (0.08, 0.45, 0.45)
-                
-                # Draw square base with rotation
-                handle = server.scene.add_box(
-                    f"/leds/led_{led_idx}_base",
-                    dimensions=dims,
-                    color=square_color,
-                    position=tuple(led.position / 100.0),  # Convert cm to m for viser
-                    wxyz=tuple(quat_wxyz),
-                )
-                led_handles.append(handle)
-                if _owner is not None:
-                    def _make_owner_click(own):
-                        def _on_click(_event):
-                            _just_clicked_mesh[0] = True
-                            select_panel(own)
-                        return _on_click
-                    handle.on_click(_make_owner_click(_owner))
-                
-                # Draw small center source sphere (only if enabled)
-                if led_enabled:
-                    handle = server.scene.add_icosphere(
-                        f"/leds/led_{led_idx}_source",
-                        radius=0.001,  # Very small 1mm source
-                        color=led.color,
-                        position=tuple(led.position / 100.0),
-                    )
-                    led_handles.append(handle)
-                    if _owner is not None:
-                        handle.on_click(_make_owner_click(_owner))
-
-        # Prepare STL mesh data for ray tracing visualization if enabled
-        stl_mesh_for_raytracing = None
-        if stl_absorber_enable.value and stl_mesh_data[0] is not None:
-            mesh_ref = stl_mesh_data[0]
-            transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
-            # Apply global Z rotation to STL transform
-            if abs(global_rot_z_deg) > 0.01:
-                T_global = np.eye(4)
-                T_global[:3, :3] = Rg
-                transform = T_global @ transform
-            stl_mesh_for_raytracing = {
-                'vertices': mesh_ref.vertices,
-                'faces': mesh_ref.faces,
-                'transform': transform
-            }
-
-        # Draw rays (toggleable)
-        if show_rays_output.value:
-            for i, led in enumerate(leds):
-                if hasattr(led, 'enabled') and not led.enabled:
-                    continue
-                vis_rays = led.get_visualization_rays(ray_length)
-
-                for j, (pos, direction) in enumerate(vis_rays):
-                    # Calculate end point, clipping at absorbers and wall
-                    # Rays have infinite length until they hit something
-                    
-                    # Check absorbers first via box intersection
-                    t_abs_min = None
-                    if absorbers is not None:
-                        for a in absorbers:
-                            t_hit = ray_box_intersection(pos, direction, a)
-                            if t_hit is not None and t_hit > 0:
-                                if t_abs_min is None or t_hit < t_abs_min:
-                                    t_abs_min = t_hit
-                    
-                    # Check STL mesh intersection
-                    if stl_mesh_for_raytracing is not None:
-                        t_stl = _ray_mesh_intersection(pos, direction, stl_mesh_for_raytracing)
-                        if t_stl is not None and t_stl > 0:
-                            if t_abs_min is None or t_stl < t_abs_min:
-                                t_abs_min = t_stl
-
-                    # Clip at wall(s) - if room mode, check all 5 walls
-                    t_wall = None
-                    if room_mode_enable.value:
-                        # Check all 5 room walls
-                        front_dist = room_front_dist.value
-                        side_dist = room_side_dist.value
-                        top_bottom_dist = room_top_bottom_dist.value
-                        
-                        wall_intersections = []
-                        # Front wall
-                        if direction[0] != 0:
-                            t = (front_dist - pos[0]) / direction[0]
-                            if t > 0:
-                                wall_intersections.append(t)
-                        # Left wall
-                        if direction[1] != 0:
-                            t = (-side_dist - pos[1]) / direction[1]
-                            if t > 0:
-                                wall_intersections.append(t)
-                        # Right wall
-                        if direction[1] != 0:
-                            t = (side_dist - pos[1]) / direction[1]
-                            if t > 0:
-                                wall_intersections.append(t)
-                        # Top wall
-                        if direction[2] != 0:
-                            t = (top_bottom_dist - pos[2]) / direction[2]
-                            if t > 0:
-                                wall_intersections.append(t)
-                        # Bottom wall
-                        if direction[2] != 0:
-                            t = (-top_bottom_dist - pos[2]) / direction[2]
-                            if t > 0:
-                                wall_intersections.append(t)
-                        
-                        if wall_intersections:
-                            t_wall = min(wall_intersections)
-                    else:
-                        # Single front wall only
-                        if direction[0] != 0:
-                            t_wall = (wall_dist - pos[0]) / direction[0]
-
-                    # Choose nearest positive intersection (absorber before wall)
-                    t_clip = None
-                    if t_abs_min is not None and t_abs_min > 0:
-                        t_clip = t_abs_min
-                    if t_wall is not None and t_wall > 0:
-                        if t_clip is None or t_wall < t_clip:
-                            t_clip = t_wall
-
-                    # Use intersection point, or very far if no intersection
-                    if t_clip is not None:
-                        end = pos + direction * t_clip
-                    else:
-                        end = pos + direction * 1000.0  # 10 meters if no intersection
-
-                    # Draw line (positions in meters)
-                    points = np.array([pos / 100.0, end / 100.0])
-                    led_idx = getattr(led, 'led_index', i)
-                    handle = server.scene.add_line_segments(
-                        f"/rays/led_{led_idx}/ray_{j}",
-                        points=points.reshape(1, 2, 3),
-                        colors=led.color,  # Single color tuple
-                        line_width=2.0,
-                    )
-                    ray_handles.append(handle)
-
-                # Add random rays if enabled
-                if show_random_rays.value:
-                    led_idx = getattr(led, 'led_index', i)
-                    np.random.seed(42 + led_idx)  # Consistent random rays
-                    num_random_rays = 50  # Fixed number of visualization rays
-                    for k in range(num_random_rays):
-                        # Random direction within viewing cone using cosine power distribution
-                        u1, u2 = np.random.uniform(0, 1, 2)
-                        
-                        uniformity = float(ray_uniformity_slider.value)
-                        n = _get_effective_n(led, uniformity)
-                        
-                        _vis_angle = getattr(led, 'ext_lens_angle', None) or led.viewing_angle
-                        max_theta = np.radians(_vis_angle / 2.0)
-                        cos_max = np.cos(max_theta)
-                        cos_theta_sampled = 1.0 - u1 * (1.0 - cos_max)
-                        cos_theta_sampled = np.clip(cos_theta_sampled, -1.0, 1.0)
-                        theta = np.arccos(cos_theta_sampled)
-                        phi = 2 * np.pi * u2
-
-                        z_axis = led.direction
-                        if abs(z_axis[2]) < 0.9:
-                            x_axis = np.cross(z_axis, [0, 0, 1])
-                        else:
-                            x_axis = np.cross(z_axis, [0, 1, 0])
-                        x_axis = x_axis / np.linalg.norm(x_axis)
-                        y_axis = np.cross(z_axis, x_axis)
-
-                        local_dir = np.array(
-                            [
-                                np.sin(theta) * np.cos(phi),
-                                np.sin(theta) * np.sin(phi),
-                                np.cos(theta),
-                            ]
-                        )
-                        world_dir = (
-                            local_dir[0] * x_axis
-                            + local_dir[1] * y_axis
-                            + local_dir[2] * z_axis
-                        )
-                        world_dir = world_dir / np.linalg.norm(world_dir)
-
-                        # Compute nearest intersection with absorbers or wall
-                        # Rays have infinite length until they hit something
-                        t_abs_min = None
-                        if absorbers is not None:
-                            for a in absorbers:
-                                t_hit = ray_box_intersection(led.position, world_dir, a)
-                                if t_hit is not None and t_hit > 0:
-                                    if t_abs_min is None or t_hit < t_abs_min:
-                                        t_abs_min = t_hit
-                        
-                        # Check STL mesh intersection
-                        if stl_mesh_for_raytracing is not None:
-                            t_stl = _ray_mesh_intersection(led.position, world_dir, stl_mesh_for_raytracing)
-                            if t_stl is not None and t_stl > 0:
-                                if t_abs_min is None or t_stl < t_abs_min:
-                                    t_abs_min = t_stl
-
-                        t_wall = None
-                        if room_mode_enable.value:
-                            # Check all 5 room walls
-                            front_dist = room_front_dist.value
-                            side_dist = room_side_dist.value
-                            top_bottom_dist = room_top_bottom_dist.value
-                            
-                            wall_intersections = []
-                            # Front wall
-                            if world_dir[0] != 0:
-                                t = (front_dist - led.position[0]) / world_dir[0]
-                                if t > 0:
-                                    wall_intersections.append(t)
-                            # Left wall
-                            if world_dir[1] != 0:
-                                t = (-side_dist - led.position[1]) / world_dir[1]
-                                if t > 0:
-                                    wall_intersections.append(t)
-                            # Right wall
-                            if world_dir[1] != 0:
-                                t = (side_dist - led.position[1]) / world_dir[1]
-                                if t > 0:
-                                    wall_intersections.append(t)
-                            # Top wall
-                            if world_dir[2] != 0:
-                                t = (top_bottom_dist - led.position[2]) / world_dir[2]
-                                if t > 0:
-                                    wall_intersections.append(t)
-                            # Bottom wall
-                            if world_dir[2] != 0:
-                                t = (-top_bottom_dist - led.position[2]) / world_dir[2]
-                                if t > 0:
-                                    wall_intersections.append(t)
-                            
-                            if wall_intersections:
-                                t_wall = min(wall_intersections)
-                        else:
-                            # Single front wall only
-                            if world_dir[0] != 0:
-                                t_wall = (wall_dist - led.position[0]) / world_dir[0]
-
-                        t_clip = None
-                        if t_abs_min is not None and t_abs_min > 0:
-                            t_clip = t_abs_min
-                        if t_wall is not None and t_wall > 0:
-                            if t_clip is None or t_wall < t_clip:
-                                t_clip = t_wall
-
-                        # Use intersection point, or very far if no intersection
-                        if t_clip is not None:
-                            end = led.position + world_dir * t_clip
-                        else:
-                            end = led.position + world_dir * 1000.0  # 10 meters if no intersection
-
-                        points = np.array([led.position / 100.0, end / 100.0])
-                        # Dimmer color for random rays
-                        dim_color = (
-                            led.color[0] * 0.5,
-                            led.color[1] * 0.5,
-                            led.color[2] * 0.5,
-                        )
-                        handle = server.scene.add_line_segments(
-                            f"/rays/led_{led_idx}/random_{k}",
-                            points=points.reshape(1, 2, 3),
-                            colors=dim_color,
-                            line_width=1.0,
-                        )
-                        ray_handles.append(handle)
-
-        # Draw camera FOV rectangle on wall
-        if show_camera_fov.value:
-            # Use correct wall distance based on mode
-            if room_mode_enable.value:
-                wall_dist = room_front_dist.value
-            else:
-                wall_dist = wall_dist_slider.value
-            
-            cam_x = camera_pos_x.value
-            cam_y = camera_pos_y.value
-
-            # Footprint of the (possibly pitched) camera FOV on the wall.
-            # With pitch != 0 this is a trapezoid, not a rectangle.
-            z_bot_cm, z_top_cm, w_bot_cm, w_top_cm = _camera_fov_wall_trapezoid(
-                wall_dist - cam_x, camera_pitch.value,
-                camera_fov_h.value, camera_fov_v.value,
-            )
-            z_bot = z_bot_cm / 100.0  # metres
-            z_top = z_top_cm / 100.0
-            w_bot = w_bot_cm / 100.0
-            w_top = w_top_cm / 100.0
-            y_c = cam_y / 100.0  # camera Y offset shifts the footprint sideways
-            wall_x = wall_dist / 100.0 - 0.008  # Slightly in front of wall
-
-            y_bot_l, y_bot_r = y_c - w_bot, y_c + w_bot
-            y_top_l, y_top_r = y_c - w_top, y_c + w_top
-
-            # In room mode, clamp the FOV footprint to the front wall boundaries
-            if room_mode_enable.value:
-                max_half_w = room_side_dist.value / 100.0        # wall half-width in m
-                max_half_h = room_top_bottom_dist.value / 100.0  # wall half-height in m
-                y_bot_l = float(np.clip(y_bot_l, -max_half_w, max_half_w))
-                y_bot_r = float(np.clip(y_bot_r, -max_half_w, max_half_w))
-                y_top_l = float(np.clip(y_top_l, -max_half_w, max_half_w))
-                y_top_r = float(np.clip(y_top_r, -max_half_w, max_half_w))
-                z_bot = float(np.clip(z_bot, -max_half_h, max_half_h))
-                z_top = float(np.clip(z_top, -max_half_h, max_half_h))
-            
-            # Four corner lines
-            corners = [
-                [[wall_x, y_bot_l, z_bot], [wall_x, y_bot_r, z_bot]],  # Bottom
-                [[wall_x, y_bot_r, z_bot], [wall_x, y_top_r, z_top]],  # Right
-                [[wall_x, y_top_r, z_top], [wall_x, y_top_l, z_top]],  # Top
-                [[wall_x, y_top_l, z_top], [wall_x, y_bot_l, z_bot]],  # Left
-            ]
-            
-            handle = server.scene.add_line_segments(
-                "/camera/fov_border",
-                points=np.array(corners),
-                colors=(0.0, 1.0, 0.0),  # Green
-                line_width=6.0,  # Thicker lines
-            )
-            camera_fov_handles.append(handle)
-
-            # Main-camera marker + optical-axis vector (like the VIO cameras)
-            cam_pos_cm = np.array([cam_x, cam_y, 0.0], dtype=float)
-            cam_axis = vio_optical_axis(camera_pitch.value, 0.0)
-            cam_pos_m = cam_pos_cm / 100.0
-            cam_axis_end_m = (cam_pos_cm + cam_axis * 8.0) / 100.0
-            cam_sph = server.scene.add_icosphere(
-                "/camera/marker",
-                radius=0.006,
-                color=(0.0, 1.0, 0.0),
-                position=tuple(cam_pos_m + cam_axis * 0.008),
-            )
-            camera_fov_handles.append(cam_sph)
-            cam_axis_h = server.scene.add_line_segments(
-                "/camera/axis",
-                points=np.array([[cam_pos_m, cam_axis_end_m]]),
-                colors=(0.0, 1.0, 0.0),
-                line_width=4.0,
-            )
-            camera_fov_handles.append(cam_axis_h)
-
-        # Draw VIO fisheye FOV footprints on the wall(s).
-        # In room mode the footprint is projected on ALL room walls (front,
-        # left, right, top, bottom, and back if shown), not just the front one.
-        if show_vio_fov.value:
-            # Wall patches: (axis, plane_coord_cm, u_min, u_max, v_min, v_max, inward_sign)
-            # axis 0=x, 1=y, 2=z; (u, v) are the two remaining axes in
-            # ascending order; inward_sign offsets the overlay into the room.
-            if room_mode_enable.value:
-                _fd = room_front_dist.value
-                _sd = room_side_dist.value
-                _td = room_top_bottom_dist.value
-                # Same extent as draw_room_walls: 2.5x depth behind the front wall
-                _x_back_edge = _fd - (_fd - circle_center_slider.value) * 2.5
-                if show_back_wall.value:
-                    _x_back_edge = max(_x_back_edge, -room_back_dist.value)
-                vio_walls = [
-                    (0, _fd, -_sd, _sd, -_td, _td, -1.0),   # front
-                    (1, -_sd, _x_back_edge, _fd, -_td, _td, +1.0),  # left
-                    (1, _sd, _x_back_edge, _fd, -_td, _td, -1.0),   # right
-                    (2, _td, _x_back_edge, _fd, -_sd, _sd, -1.0),   # top
-                    (2, -_td, _x_back_edge, _fd, -_sd, _sd, +1.0),  # bottom
-                ]
-                if show_back_wall.value:
-                    vio_walls.append((0, -room_back_dist.value, -_sd, _sd, -_td, _td, +1.0))
-            else:
-                _half = wall_view_size.value / 2.0
-                vio_walls = [(0, wall_dist_slider.value, -_half, _half, -_half, _half, -1.0)]
-
-            vio_hfov, vio_vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
-            cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
-            axis_len_cm = 8.0
-            marker_specs = [
-                (1, vio_cam1_pitch.value, vio_cam1_yaw.value, (1.0, 0.0, 1.0), 0.008),  # magenta
-                (2, vio_cam2_pitch.value, vio_cam2_yaw.value, (0.0, 1.0, 1.0), 0.012),  # cyan
-            ]
-            for cam_id, pitch, yaw, color, inset_m in marker_specs:
-                all_verts, all_faces, all_segs = [], [], []
-                n_verts = 0
-                for w_axis, plane_cm, u_min, u_max, v_min, v_max, inward in vio_walls:
-                    # Skip walls the camera is not on the interior side of
-                    if (cam_pos[w_axis] - plane_cm) * inward <= 1e-6:
-                        continue
-                    mask, us, vs = rasterize_fisheye_fov_on_plane(
-                        cam_pos, pitch, yaw, vio_hfov, vio_vfov,
-                        w_axis, plane_cm, u_min, u_max, v_min, v_max, n_grid=90,
-                    )
-                    plane_m = plane_cm / 100.0 + inward * inset_m
-                    verts, faces, segs = fov_plane_mask_to_quads_and_contour(
-                        mask, us, vs, w_axis, plane_m
-                    )
-                    if len(faces) > 0:
-                        all_verts.append(verts)
-                        all_faces.append(faces + np.uint32(n_verts))
-                        n_verts += len(verts)
-                    if len(segs) > 0:
-                        all_segs.append(segs)
-                if vio_fill_fov.value and all_faces:
-                    fill = server.scene.add_mesh_simple(
-                        name=f"/vio_cam{cam_id}/fov_fill",
-                        vertices=np.concatenate(all_verts, axis=0),
-                        faces=np.concatenate(all_faces, axis=0),
-                        color=tuple(int(c * 255) for c in color),
-                        opacity=0.28,
-                        flat_shading=True,
-                        side="double",
-                    )
-                    vio_fov_handles.append(fill)
-                if all_segs:
-                    handle = server.scene.add_line_segments(
-                        f"/vio_cam{cam_id}/fov_border",
-                        points=np.concatenate(all_segs, axis=0),
-                        colors=color,
-                        line_width=4.0,
-                    )
-                    vio_fov_handles.append(handle)
-
-                axis = vio_optical_axis(pitch, yaw)
-                pos_m = cam_pos / 100.0
-                axis_end_m = (cam_pos + axis * axis_len_cm) / 100.0
-                marker_pos = pos_m + axis * 0.008
-                sph = server.scene.add_icosphere(
-                    f"/vio_cam{cam_id}/marker",
-                    radius=0.006,
-                    color=color,
-                    position=tuple(marker_pos),
-                )
-                vio_fov_handles.append(sph)
-                axis_h = server.scene.add_line_segments(
-                    f"/vio_cam{cam_id}/axis",
-                    points=np.array([[pos_m, axis_end_m]]),
-                    colors=color,
-                    line_width=4.0,
-                )
-                vio_fov_handles.append(axis_h)
-
-    @server.scene.on_click()
-    def _on_scene_background_click(_event):
-        if designer_mode[0]:
-            _just_clicked_mesh[0] = False
-            return
-        if _just_clicked_mesh[0]:
-            _just_clicked_mesh[0] = False
-            return
-        if selected_owner[0] is not None:
-            select_panel(None)
-
-    # Add static elements
-    # Wall (at x = wall_dist)
-    wall_dist_init = wall_dist_slider.value
-    wall_size_init = wall_view_size.value / 100.0  # cm -> m
-    wall_handle = server.scene.add_box(
-        "/wall",
-        dimensions=(0.01, wall_size_init, wall_size_init),
-        color=(0.5, 0.5, 0.5),
-        position=(wall_dist_init / 100.0, 0.0, 0.0),
-    )
-
-    # Grid on XY plane (millimeter resolution)
-    grid_points = []
-    for i in range(-10, 11):
-        grid_points.append([[-1.0, i * 0.01, 0], [1.0, i * 0.01, 0]])  # 1mm spacing
-        grid_points.append([[i * 0.01, -1.0, 0], [i * 0.01, 1.0, 0]])  # 1mm spacing
-
-    static_scene_handles.append(server.scene.add_line_segments(
-        "/grid",
-        points=np.array(grid_points),
-        colors=(0.3, 0.3, 0.3),  # Single color for all segments
-        line_width=1.0,
-    ))
-
-    # Origin axes
-    static_scene_handles.append(server.scene.add_line_segments(
-        "/axes/x",
-        points=np.array([[[0, 0, 0], [0.5, 0, 0]]]),
-        colors=(1.0, 0.0, 0.0),
-        line_width=3.0,
-    ))
-    static_scene_handles.append(server.scene.add_line_segments(
-        "/axes/y",
-        points=np.array([[[0, 0, 0], [0, 0.5, 0]]]),
-        colors=(0.0, 1.0, 0.0),
-        line_width=3.0,
-    ))
-    static_scene_handles.append(server.scene.add_line_segments(
-        "/axes/z",
-        points=np.array([[[0, 0, 0], [0, 0, 0.5]]]),
-        colors=(0.0, 0.0, 1.0),
-        line_width=3.0,
-    ))
-
-    # Callback to update wall position and size
-    def update_wall():
-        nonlocal wall_handle
-        if room_mode_enable.value:
-            # In room mode, don't update main wall
-            return
-        wall_dist = wall_dist_slider.value
-        wall_size_m = wall_view_size.value / 100.0  # cm -> m
-        try:
-            wall_handle.remove()
-        except (AttributeError, KeyError):
-            pass
-        wall_handle = server.scene.add_box(
-            "/wall",
-            dimensions=(0.01, wall_size_m, wall_size_m),
-            color=(0.5, 0.5, 0.5),
-            position=(wall_dist / 100.0, 0.0, 0.0),
-        )
-
-    # Function to update cell area info
-    def update_cell_area_info():
-        grid_size = int(intensity_grid_size.value)
-        wall_size_cm = int(wall_view_size.value)
-        cell_size_cm = wall_size_cm / grid_size
-        cell_area_cm2 = cell_size_cm * cell_size_cm
-        cell_area_m2 = cell_area_cm2 / 10000.0  # Convert cm² to m²
-        
-        cell_area_html.content = (
-            f"<div style='font-family: sans-serif; font-size: 11px; color: #666; margin-top: -8px; margin-bottom: 8px;'>"
-            f"Cell: {cell_size_cm:.2f} cm × {cell_size_cm:.2f} cm = {cell_area_cm2:.2f} cm² ({cell_area_m2:.6f} m²)"
-            "</div>"
-        )
-    
-    # Initial cell area update
-    update_cell_area_info()
-
-    # Register callbacks
-    viewing_angle_slider.on_update(lambda _: update_scene())
-    diffuser_enable_chk.on_update(lambda _: update_scene())
-    diffuser_angle_slider.on_update(lambda _: update_scene())
-    rot_front_pos.on_update(lambda _: update_scene())
-    rot_front_neg.on_update(lambda _: update_scene())
-    rot_side_pos.on_update(lambda _: update_scene())
-    rot_side_neg.on_update(lambda _: update_scene())
-    rot_y_front_pos.on_update(lambda _: update_scene())
-    rot_y_front_neg.on_update(lambda _: update_scene())
-    rot_y_side_pos.on_update(lambda _: update_scene())
-    rot_y_side_neg.on_update(lambda _: update_scene())
-    # Group position offset callbacks
-    offset_front_pos_x.on_update(lambda _: update_scene())
-    offset_front_pos_y.on_update(lambda _: update_scene())
-    offset_front_pos_z.on_update(lambda _: update_scene())
-    offset_front_neg_x.on_update(lambda _: update_scene())
-    offset_front_neg_y.on_update(lambda _: update_scene())
-    offset_front_neg_z.on_update(lambda _: update_scene())
-    offset_side_pos_x.on_update(lambda _: update_scene())
-    offset_side_pos_y.on_update(lambda _: update_scene())
-    offset_side_pos_z.on_update(lambda _: update_scene())
-    offset_side_neg_x.on_update(lambda _: update_scene())
-    offset_side_neg_y.on_update(lambda _: update_scene())
-    offset_side_neg_z.on_update(lambda _: update_scene())
-    radius_slider.on_update(lambda _: update_scene())
-    circle_center_slider.on_update(lambda _: update_scene())
-    def _on_global_rotation_change(_):
-        """Handle global rotation slider: update LEDs immediately, debounce mesh update."""
-        update_scene()
-        # Schedule mesh update with debounce to avoid recomputing on every tick
-        import threading
-        if hasattr(_on_global_rotation_change, '_timer') and _on_global_rotation_change._timer is not None:
-            _on_global_rotation_change._timer.cancel()
-        def _deferred_mesh():
-            try:
-                update_stl_mesh(skip_lighting=True)
-            except Exception:
-                pass
-        _on_global_rotation_change._timer = threading.Timer(0.3, _deferred_mesh)
-        _on_global_rotation_change._timer.start()
-    _on_global_rotation_change._timer = None
-    global_rotation_z_slider.on_update(_on_global_rotation_change)
-    global_pos_x_slider.on_update(_on_global_rotation_change)
-    global_pos_y_slider.on_update(_on_global_rotation_change)
-    global_pos_z_slider.on_update(_on_global_rotation_change)
-    ray_length_slider.on_update(lambda _: update_scene())
-    led_lumens_slider.on_update(lambda _: None)  # No auto-update, use manual button
-    show_random_rays.on_update(lambda _: update_scene())
-    show_rays_output.on_update(lambda _: update_scene())
-    show_led_markers.on_update(lambda _: update_scene())
-    show_intensity_map.on_update(lambda _: None if _mode_toggle_syncing[0] else update_intensity_map())
-    row1_chk.on_update(lambda _: update_scene())
-    row2_chk.on_update(lambda _: update_scene())
-    row3_chk.on_update(lambda _: update_scene())
-    row4_chk.on_update(lambda _: update_scene())
-    absorbers_enable.on_update(lambda _: (update_scene(), update_ui_visibility()))
-    show_camera_fov.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    camera_fov_h.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    camera_pos_y.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    camera_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    show_vio_fov.on_update(lambda _: update_scene())
-    vio_fill_fov.on_update(lambda _: update_scene())
-    vio_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_pos_y.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_pos_z.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_cam1_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_cam1_yaw.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_cam2_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_cam2_yaw.on_update(lambda _: (update_scene(), _refresh_uniformity()))
-    vio_long_fov.on_update(lambda _: (_refresh_vio_fov_label(), update_scene(), _refresh_uniformity()))
-    vio_landscape.on_update(lambda _: (_refresh_vio_fov_label(), update_scene(), _refresh_uniformity()))
-    abs0_off_x.on_update(lambda _: update_scene())
-    abs0_off_y.on_update(lambda _: update_scene())
-    abs0_off_z.on_update(lambda _: update_scene())
-    abs1_off_x.on_update(lambda _: update_scene())
-    abs1_off_y.on_update(lambda _: update_scene())
-    abs1_off_z.on_update(lambda _: update_scene())
-    abs2_off_x.on_update(lambda _: update_scene())
-    abs2_off_y.on_update(lambda _: update_scene())
-    abs2_off_z.on_update(lambda _: update_scene())
-    abs2_rot_z.on_update(lambda _: update_scene())
-    abs3_off_x.on_update(lambda _: update_scene())
-    abs3_off_y.on_update(lambda _: update_scene())
-    abs3_off_z.on_update(lambda _: update_scene())
-    abs3_rot_z.on_update(lambda _: update_scene())
-    intensity_rays_slider.on_update(lambda _: None)  # No auto-update - manual button only
-    ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
-    intensity_threshold_slider.on_update(lambda _: _refresh_uniformity())
-    uniformity_percentile_slider.on_update(lambda _: _refresh_uniformity())
-    intensity_grid_size.on_update(lambda _: update_cell_area_info())  # Update cell area when resolution changes
-    wall_view_size.on_update(lambda _: update_cell_area_info())  # Update cell area when wall size changes
-    
-    # Room mode callback - draw/clear room walls when toggled
-    def on_room_mode_toggle(_):
-        nonlocal wall_handle, intensity_handles
-        if room_mode_enable.value:
-            # Hide main wall and show room walls
-            try:
-                wall_handle.remove()
-            except (KeyError, AttributeError):
-                pass
-            for handle in intensity_handles:
-                try:
-                    handle.remove()
-                except KeyError:
-                    pass
-            intensity_handles = []
-            _mode_toggle_syncing[0] = True
-            try:
-                show_intensity_map.value = False
-            finally:
-                _mode_toggle_syncing[0] = False
-            legend_html.content = (
-                "<div style='font-family: sans-serif;'>"
-                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-                "<div style='color:#888;font-size:12px;'>Room Mode is active. Enable 'Show Room Intensity' and click 'Update Room Intensity'.</div>"
-                "</div>"
-            )
-            draw_room_walls()
-        else:
-            # Clear room intensity handles
-            for handle in room_intensity_handles:
-                try:
-                    handle.remove()
-                except KeyError:
-                    pass
-            room_intensity_handles.clear()
-            # Clear room wall handles
-            for handle in room_wall_handles:
-                try:
-                    handle.remove()
-                except KeyError:
-                    pass
-            room_wall_handles.clear()
-            _mode_toggle_syncing[0] = True
-            try:
-                show_room_intensity.value = False
-            finally:
-                _mode_toggle_syncing[0] = False
-            _last_room_cache['grids'] = None
-            # Restore main wall
-            wall_dist = wall_dist_slider.value
-            wall_size_m = wall_view_size.value / 100.0
-            wall_handle = server.scene.add_box(
-                "/wall",
-                dimensions=(0.01, wall_size_m, wall_size_m),
-                color=(0.5, 0.5, 0.5),
-                position=(wall_dist / 100.0, 0.0, 0.0),
-            )
-            if _last_intensity_cache['grid'] is not None:
-                _refresh_uniformity()
-            else:
-                legend_html.content = (
-                    "<div style='font-family: sans-serif;'>"
-                    "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-                    "<div style='color:#888;font-size:12px;'>Enable 'Show intensity on wall' and click 'Update Intensity Map' to see the legend</div>"
-                    "</div>"
-                )
-    
-    room_mode_enable.on_update(on_room_mode_toggle)
-    show_room_walls.on_update(lambda _: draw_room_walls())
-    show_room_intensity.on_update(
-        lambda _: None if _mode_toggle_syncing[0] else (
-            (update_room_intensity_map() if (room_mode_enable.value and show_room_intensity.value) else draw_room_walls())
-            if room_mode_enable.value else None
-        )
-    )
-    room_front_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
-    room_side_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
-    room_top_bottom_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
-    show_back_wall.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
-    room_back_dist.on_update(lambda _: (draw_room_walls(), update_scene()) if room_mode_enable.value else None)
-    wall_view_size.on_update(lambda _: (update_wall(), update_cell_area_info(), update_scene()))  # Update wall size, cell area, VIO FOV clip
-
-    def on_wall_dist_change(_):
-        """Clear stale intensity map when wall distance changes."""
-        # Remove old intensity visualization (values are no longer valid)
-        for h in intensity_handles:
-            try:
-                h.remove()
-            except KeyError:
-                pass
-        intensity_handles.clear()
-        # Update legend to inform user that recalculation is needed
-        legend_html.content = (
-            "<div style='font-family: sans-serif;'>"
-            "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
-            "<div style='color:#F0AD4E;font-size:12px;'>⚠ Wall distance changed.<br>Click 'Update Intensity Map' to recalculate.</div>"
-            "</div>"
-        )
-        update_wall()
-        update_scene()
-
-    wall_dist_slider.on_update(on_wall_dist_change)
-    
-    # Register LED control button callbacks
-    # Group buttons
-    for group_idx, btn in group_buttons.items():
-        def make_group_handler(g_idx):
-            def handler(_):
-                start_idx = g_idx * 12
-                end_idx = start_idx + 12
-                any_on = any(led_states[start_idx:end_idx])
-                new_state = not any_on
-                for i in range(start_idx, end_idx):
-                    led_states[i] = new_state
-                print(f"Group {g_idx} toggled: LEDs {start_idx}-{end_idx-1} set to {new_state}")
-                update_scene()
-                update_ui_visibility()
-            return handler
-        btn.on_click(make_group_handler(group_idx))
-    
-    # Row buttons
-    for (group_idx, row_idx), btn in row_buttons.items():
-        def make_row_handler(g_idx, r_idx):
-            def handler(_):
-                start_idx = g_idx * 12 + r_idx * 3
-                end_idx = start_idx + 3
-                any_on = any(led_states[start_idx:end_idx])
-                new_state = not any_on
-                for i in range(start_idx, end_idx):
-                    led_states[i] = new_state
-                print(f"Group {g_idx} Row {r_idx} toggled: LEDs {start_idx}-{end_idx-1} set to {new_state}")
-                update_scene()
-                update_ui_visibility()
-            return handler
-        btn.on_click(make_row_handler(group_idx, row_idx))
-    
-    # Individual LED buttons
-    for led_idx, btn in led_buttons.items():
-        def make_led_handler(l_idx):
-            def handler(_):
-                led_states[l_idx] = not led_states[l_idx]
-                print(f"LED {l_idx} toggled to {led_states[l_idx]}")
-                update_scene()
-                update_ui_visibility()
-            return handler
-        btn.on_click(make_led_handler(led_idx))
-    
-    # Button for manual intensity map update
-    update_intensity_button.on_click(lambda _: update_intensity_map())
-    
-    # Button for exporting lux matrix
-    export_lux_matrix_button.on_click(lambda _: export_lux_matrix())
-    
-    # Button for running benchmark (multi-distance)
-    run_benchmark_button.on_click(lambda _: run_benchmark())
-    
-    # Buttons for CSV pattern import
-    csv_import_btn.on_click(lambda _: import_csv_pattern())
-    csv_clear_btn.on_click(lambda _: clear_csv_pattern())
-
-    # Button for capturing FOV intensity image
-    capture_fov_btn.on_click(lambda _: capture_camera_fov_image())
-    
-    # Button for room intensity map update
-    update_room_button.on_click(lambda _: update_room_intensity_map())
+    def update_scene(*a, **k):
+        return _scene_view_late.update_scene(*a, **k)
 
     # --- Panel system (see ui/panels.py) ---
     _panels_ns = _panels.build(_SimpleNamespace(
@@ -5514,6 +1689,444 @@ def main():
     new_project = _config_io_ns.new_project
     update_all_led_buttons = _config_io_ns.update_all_led_buttons
     update_ui_visibility = _config_io_ns.update_ui_visibility
+    # --- Wall intensity map (see ui/intensity_map.py) ---
+    _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
+        _absorber_config=_absorber_config,
+        _expand_mirror_configs=_expand_mirror_configs,
+        _panel_slot_data=_panel_slot_data,
+        bw_scale_chk=bw_scale_chk,
+        calibration_factor_slider=calibration_factor_slider,
+        camera_fov_h=camera_fov_h,
+        camera_fov_v=camera_fov_v,
+        camera_pitch=camera_pitch,
+        camera_pos_x=camera_pos_x,
+        camera_pos_y=camera_pos_y,
+        circle_center_slider=circle_center_slider,
+        custom_groups=custom_groups,
+        custom_reflectance_slider=custom_reflectance_slider,
+        diffuser_angle_slider=diffuser_angle_slider,
+        diffuser_enable_chk=diffuser_enable_chk,
+        diffuser_transmission_slider=diffuser_transmission_slider,
+        global_pos_x_slider=global_pos_x_slider,
+        global_pos_y_slider=global_pos_y_slider,
+        global_pos_z_slider=global_pos_z_slider,
+        global_rotation_z_slider=global_rotation_z_slider,
+        individual_leds=individual_leds,
+        intensity_grid_size=intensity_grid_size,
+        intensity_handles=intensity_handles,
+        intensity_rays_slider=intensity_rays_slider,
+        intensity_threshold_slider=intensity_threshold_slider,
+        led_lumens_slider=led_lumens_slider,
+        led_states=led_states,
+        legend_html=legend_html,
+        legend_max_input=legend_max_input,
+        max_bounces_slider_room=max_bounces_slider_room,
+        offset_front_neg_x=offset_front_neg_x,
+        offset_front_neg_y=offset_front_neg_y,
+        offset_front_neg_z=offset_front_neg_z,
+        offset_front_pos_x=offset_front_pos_x,
+        offset_front_pos_y=offset_front_pos_y,
+        offset_front_pos_z=offset_front_pos_z,
+        offset_side_neg_x=offset_side_neg_x,
+        offset_side_neg_y=offset_side_neg_y,
+        offset_side_neg_z=offset_side_neg_z,
+        offset_side_pos_x=offset_side_pos_x,
+        offset_side_pos_y=offset_side_pos_y,
+        offset_side_pos_z=offset_side_pos_z,
+        radius_slider=radius_slider,
+        ray_uniformity_slider=ray_uniformity_slider,
+        reflections_enable=reflections_enable,
+        room_mode_enable=room_mode_enable,
+        rot_front_neg=rot_front_neg,
+        rot_front_pos=rot_front_pos,
+        rot_side_neg=rot_side_neg,
+        rot_side_pos=rot_side_pos,
+        rot_y_front_neg=rot_y_front_neg,
+        rot_y_front_pos=rot_y_front_pos,
+        rot_y_side_neg=rot_y_side_neg,
+        rot_y_side_pos=rot_y_side_pos,
+        row1_chk=row1_chk,
+        row2_chk=row2_chk,
+        row3_chk=row3_chk,
+        row4_chk=row4_chk,
+        server=server,
+        show_intensity_map=show_intensity_map,
+        stl_absorber_enable=stl_absorber_enable,
+        stl_mesh_data=stl_mesh_data,
+        stl_pos_x=stl_pos_x,
+        stl_pos_y=stl_pos_y,
+        stl_pos_z=stl_pos_z,
+        stl_rot_x=stl_rot_x,
+        stl_rot_y=stl_rot_y,
+        stl_rot_z=stl_rot_z,
+        stl_scale=stl_scale,
+        uniformity_percentile_slider=uniformity_percentile_slider,
+        viewing_angle_slider=viewing_angle_slider,
+        vio_cam1_pitch=vio_cam1_pitch,
+        vio_cam1_yaw=vio_cam1_yaw,
+        vio_cam2_pitch=vio_cam2_pitch,
+        vio_cam2_yaw=vio_cam2_yaw,
+        vio_landscape=vio_landscape,
+        vio_long_fov=vio_long_fov,
+        vio_pos_x=vio_pos_x,
+        vio_pos_y=vio_pos_y,
+        vio_pos_z=vio_pos_z,
+        wall_dist_slider=wall_dist_slider,
+        wall_view_size=wall_view_size,
+    ))
+    _build_current_leds_and_absorbers = _intensity_map_ns._build_current_leds_and_absorbers
+    _build_lux_legend_html = _intensity_map_ns._build_lux_legend_html
+    _last_intensity_cache = _intensity_map_ns._last_intensity_cache
+    _last_room_cache = _intensity_map_ns._last_room_cache
+    _mode_toggle_syncing = _intensity_map_ns._mode_toggle_syncing
+    _refresh_uniformity = _intensity_map_ns._refresh_uniformity
+    _room_metrics_html = _intensity_map_ns._room_metrics_html
+    compute_room_intensity = _intensity_map_ns.compute_room_intensity
+    compute_wall_intensity = _intensity_map_ns.compute_wall_intensity
+    intensity_to_color = _intensity_map_ns.intensity_to_color
+    update_intensity_map = _intensity_map_ns.update_intensity_map
+    # --- CSV pattern import (benchmark / FOV captures), lux-matrix export and the multi-distance benchmark. (see ui/csv_overlay.py) ---
+    _csv_overlay_ns = _csv_overlay.build(_SimpleNamespace(
+        _build_current_leds_and_absorbers=_build_current_leds_and_absorbers,
+        _last_intensity_cache=_last_intensity_cache,
+        compute_wall_intensity=compute_wall_intensity,
+        csv_diff_html=csv_diff_html,
+        csv_import_path=csv_import_path,
+        csv_import_status=csv_import_status,
+        csv_legend_html=csv_legend_html,
+        csv_legend_max_input=csv_legend_max_input,
+        imported_csv_handles=imported_csv_handles,
+        intensity_grid_size=intensity_grid_size,
+        intensity_rays_slider=intensity_rays_slider,
+        intensity_to_color=intensity_to_color,
+        room_front_dist=room_front_dist,
+        room_mode_enable=room_mode_enable,
+        server=server,
+        wall_dist_slider=wall_dist_slider,
+        wall_view_size=wall_view_size,
+    ))
+    clear_csv_pattern = _csv_overlay_ns.clear_csv_pattern
+    export_lux_matrix = _csv_overlay_ns.export_lux_matrix
+    import_csv_pattern = _csv_overlay_ns.import_csv_pattern
+    run_benchmark = _csv_overlay_ns.run_benchmark
+    # --- Room mode (see ui/room_mode.py) ---
+    _room_mode_ns = _room_mode.build(_SimpleNamespace(
+        _build_lux_legend_html=_build_lux_legend_html,
+        _build_stl_transform=_build_stl_transform,
+        _last_room_cache=_last_room_cache,
+        _room_metrics_html=_room_metrics_html,
+        abs0_off_x=abs0_off_x,
+        abs0_off_y=abs0_off_y,
+        abs0_off_z=abs0_off_z,
+        abs1_off_x=abs1_off_x,
+        abs1_off_y=abs1_off_y,
+        abs1_off_z=abs1_off_z,
+        abs2_off_x=abs2_off_x,
+        abs2_off_y=abs2_off_y,
+        abs2_off_z=abs2_off_z,
+        abs2_rot_z=abs2_rot_z,
+        abs3_off_x=abs3_off_x,
+        abs3_off_y=abs3_off_y,
+        abs3_off_z=abs3_off_z,
+        abs3_rot_z=abs3_rot_z,
+        absorbers_enable=absorbers_enable,
+        circle_center_slider=circle_center_slider,
+        compute_room_intensity=compute_room_intensity,
+        current_leds=current_leds,
+        global_rotation_z_slider=global_rotation_z_slider,
+        intensity_rays_slider=intensity_rays_slider,
+        intensity_to_color=intensity_to_color,
+        legend_html=legend_html,
+        legend_max_input=legend_max_input,
+        radius_slider=radius_slider,
+        room_back_dist=room_back_dist,
+        room_front_dist=room_front_dist,
+        room_grid_size=room_grid_size,
+        room_intensity_handles=room_intensity_handles,
+        room_mode_enable=room_mode_enable,
+        room_side_dist=room_side_dist,
+        room_top_bottom_dist=room_top_bottom_dist,
+        room_wall_handles=room_wall_handles,
+        server=server,
+        show_back_wall=show_back_wall,
+        show_room_intensity=show_room_intensity,
+        show_room_walls=show_room_walls,
+        stl_absorber_enable=stl_absorber_enable,
+        stl_mesh_data=stl_mesh_data,
+        stl_pos_x=stl_pos_x,
+        stl_pos_y=stl_pos_y,
+        stl_pos_z=stl_pos_z,
+        stl_rot_x=stl_rot_x,
+        stl_rot_y=stl_rot_y,
+        stl_rot_z=stl_rot_z,
+        stl_scale=stl_scale,
+    ))
+    draw_room_walls = _room_mode_ns.draw_room_walls
+    update_room_intensity_map = _room_mode_ns.update_room_intensity_map
+    # --- Main-camera FOV capture (see ui/fov_capture.py) ---
+    _fov_capture_ns = _fov_capture.build(_SimpleNamespace(
+        _expand_mirror_configs=_expand_mirror_configs,
+        _panel_slot_data=_panel_slot_data,
+        abs0_off_x=abs0_off_x,
+        abs0_off_y=abs0_off_y,
+        abs0_off_z=abs0_off_z,
+        abs1_off_x=abs1_off_x,
+        abs1_off_y=abs1_off_y,
+        abs1_off_z=abs1_off_z,
+        abs2_off_x=abs2_off_x,
+        abs2_off_y=abs2_off_y,
+        abs2_off_z=abs2_off_z,
+        abs2_rot_z=abs2_rot_z,
+        abs3_off_x=abs3_off_x,
+        abs3_off_y=abs3_off_y,
+        abs3_off_z=abs3_off_z,
+        abs3_rot_z=abs3_rot_z,
+        absorbers_enable=absorbers_enable,
+        calibration_factor_slider=calibration_factor_slider,
+        camera_fov_h=camera_fov_h,
+        camera_fov_v=camera_fov_v,
+        camera_pitch=camera_pitch,
+        camera_pos_x=camera_pos_x,
+        camera_pos_y=camera_pos_y,
+        circle_center_slider=circle_center_slider,
+        custom_groups=custom_groups,
+        diffuser_angle_slider=diffuser_angle_slider,
+        diffuser_enable_chk=diffuser_enable_chk,
+        diffuser_transmission_slider=diffuser_transmission_slider,
+        individual_leds=individual_leds,
+        intensity_rays_slider=intensity_rays_slider,
+        intensity_to_color=intensity_to_color,
+        led_lumens_slider=led_lumens_slider,
+        led_states=led_states,
+        offset_front_neg_x=offset_front_neg_x,
+        offset_front_neg_y=offset_front_neg_y,
+        offset_front_neg_z=offset_front_neg_z,
+        offset_front_pos_x=offset_front_pos_x,
+        offset_front_pos_y=offset_front_pos_y,
+        offset_front_pos_z=offset_front_pos_z,
+        offset_side_neg_x=offset_side_neg_x,
+        offset_side_neg_y=offset_side_neg_y,
+        offset_side_neg_z=offset_side_neg_z,
+        offset_side_pos_x=offset_side_pos_x,
+        offset_side_pos_y=offset_side_pos_y,
+        offset_side_pos_z=offset_side_pos_z,
+        radius_slider=radius_slider,
+        ray_uniformity_slider=ray_uniformity_slider,
+        room_front_dist=room_front_dist,
+        room_mode_enable=room_mode_enable,
+        rot_front_neg=rot_front_neg,
+        rot_front_pos=rot_front_pos,
+        rot_side_neg=rot_side_neg,
+        rot_side_pos=rot_side_pos,
+        rot_y_front_neg=rot_y_front_neg,
+        rot_y_front_pos=rot_y_front_pos,
+        rot_y_side_neg=rot_y_side_neg,
+        rot_y_side_pos=rot_y_side_pos,
+        row1_chk=row1_chk,
+        row2_chk=row2_chk,
+        row3_chk=row3_chk,
+        row4_chk=row4_chk,
+        stl_absorber_enable=stl_absorber_enable,
+        stl_mesh_data=stl_mesh_data,
+        stl_pos_x=stl_pos_x,
+        stl_pos_y=stl_pos_y,
+        stl_pos_z=stl_pos_z,
+        stl_rot_x=stl_rot_x,
+        stl_rot_y=stl_rot_y,
+        stl_rot_z=stl_rot_z,
+        stl_scale=stl_scale,
+        viewing_angle_slider=viewing_angle_slider,
+        wall_dist_slider=wall_dist_slider,
+    ))
+    capture_camera_fov_image = _fov_capture_ns.capture_camera_fov_image
+    # --- Export helpers (see ui/exports.py) ---
+    _exports_ns = _exports.build(_SimpleNamespace(
+        current_leds=current_leds,
+        individual_leds=individual_leds,
+    ))
+    export_custom_group_dxf = _exports_ns.export_custom_group_dxf
+    export_individual_leds_simple = _exports_ns.export_individual_leds_simple
+    export_leds_to_stl = _exports_ns.export_leds_to_stl
+    # --- 3-D scene (see ui/scene_view.py) ---
+    _scene_view_ns = _scene_view.build(_SimpleNamespace(
+        _ELIOS3_SLOTS=_ELIOS3_SLOTS,
+        _clear_mirror_state=_clear_mirror_state,
+        _clear_panel_slot=_clear_panel_slot,
+        _enable_mirror_for=_enable_mirror_for,
+        _expand_mirror_configs=_expand_mirror_configs,
+        _inspector_handles=_inspector_handles,
+        _inspector_syncing=_inspector_syncing,
+        _just_clicked_mesh=_just_clicked_mesh,
+        _last_intensity_cache=_last_intensity_cache,
+        _last_room_cache=_last_room_cache,
+        _mirror_counterpart_name=_mirror_counterpart_name,
+        _mirror_primary=_mirror_primary,
+        _mode_toggle_syncing=_mode_toggle_syncing,
+        _owner_display_name=_owner_display_name,
+        _owner_groups=_owner_groups,
+        _owner_individual_leds=_owner_individual_leds,
+        _panel_dropdowns=_panel_dropdowns,
+        _panel_slot_data=_panel_slot_data,
+        _refresh_uniformity=_refresh_uniformity,
+        _refresh_vio_fov_label=_refresh_vio_fov_label,
+        _select_panel_impl=_select_panel_impl,
+        abs0_off_x=abs0_off_x,
+        abs0_off_y=abs0_off_y,
+        abs0_off_z=abs0_off_z,
+        abs1_off_x=abs1_off_x,
+        abs1_off_y=abs1_off_y,
+        abs1_off_z=abs1_off_z,
+        abs2_off_x=abs2_off_x,
+        abs2_off_y=abs2_off_y,
+        abs2_off_z=abs2_off_z,
+        abs2_rot_z=abs2_rot_z,
+        abs3_off_x=abs3_off_x,
+        abs3_off_y=abs3_off_y,
+        abs3_off_z=abs3_off_z,
+        abs3_rot_z=abs3_rot_z,
+        absorber_handles=absorber_handles,
+        absorbers_enable=absorbers_enable,
+        camera_fov_h=camera_fov_h,
+        camera_fov_handles=camera_fov_handles,
+        camera_fov_v=camera_fov_v,
+        camera_pitch=camera_pitch,
+        camera_pos_x=camera_pos_x,
+        camera_pos_y=camera_pos_y,
+        capture_camera_fov_image=capture_camera_fov_image,
+        capture_fov_btn=capture_fov_btn,
+        cell_area_html=cell_area_html,
+        circle_center_slider=circle_center_slider,
+        clear_csv_pattern=clear_csv_pattern,
+        create_custom_group=create_custom_group,
+        csv_clear_btn=csv_clear_btn,
+        csv_import_btn=csv_import_btn,
+        current_leds=current_leds,
+        custom_groups=custom_groups,
+        designer_gizmo=designer_gizmo,
+        designer_led_nodes=designer_led_nodes,
+        designer_mode=designer_mode,
+        designer_scene_handles=designer_scene_handles,
+        designer_state=designer_state,
+        designer_syncing=designer_syncing,
+        designer_ui_handles=designer_ui_handles,
+        designer_widget_refs=designer_widget_refs,
+        diffuser_angle_slider=diffuser_angle_slider,
+        diffuser_enable_chk=diffuser_enable_chk,
+        draw_room_walls=draw_room_walls,
+        export_lux_matrix=export_lux_matrix,
+        export_lux_matrix_button=export_lux_matrix_button,
+        get_available_templates=get_available_templates,
+        global_pos_x_slider=global_pos_x_slider,
+        global_pos_y_slider=global_pos_y_slider,
+        global_pos_z_slider=global_pos_z_slider,
+        global_rotation_z_slider=global_rotation_z_slider,
+        group_buttons=group_buttons,
+        group_colors_hex=group_colors_hex,
+        guide_handles=guide_handles,
+        import_csv_pattern=import_csv_pattern,
+        imported_csv_handles=imported_csv_handles,
+        individual_leds=individual_leds,
+        inspector_tab=inspector_tab,
+        intensity_grid_size=intensity_grid_size,
+        intensity_handles=intensity_handles,
+        intensity_rays_slider=intensity_rays_slider,
+        intensity_threshold_slider=intensity_threshold_slider,
+        led_buttons=led_buttons,
+        led_handles=led_handles,
+        led_lumens_slider=led_lumens_slider,
+        led_states=led_states,
+        legend_html=legend_html,
+        loading_in_progress=loading_in_progress,
+        offset_front_neg_x=offset_front_neg_x,
+        offset_front_neg_y=offset_front_neg_y,
+        offset_front_neg_z=offset_front_neg_z,
+        offset_front_pos_x=offset_front_pos_x,
+        offset_front_pos_y=offset_front_pos_y,
+        offset_front_pos_z=offset_front_pos_z,
+        offset_side_neg_x=offset_side_neg_x,
+        offset_side_neg_y=offset_side_neg_y,
+        offset_side_neg_z=offset_side_neg_z,
+        offset_side_pos_x=offset_side_pos_x,
+        offset_side_pos_y=offset_side_pos_y,
+        offset_side_pos_z=offset_side_pos_z,
+        open_panel_designer_btn=open_panel_designer_btn,
+        radius_slider=radius_slider,
+        ray_handles=ray_handles,
+        ray_length_slider=ray_length_slider,
+        ray_uniformity_slider=ray_uniformity_slider,
+        room_back_dist=room_back_dist,
+        room_front_dist=room_front_dist,
+        room_intensity_handles=room_intensity_handles,
+        room_mode_enable=room_mode_enable,
+        room_side_dist=room_side_dist,
+        room_top_bottom_dist=room_top_bottom_dist,
+        room_wall_handles=room_wall_handles,
+        rot_front_neg=rot_front_neg,
+        rot_front_pos=rot_front_pos,
+        rot_side_neg=rot_side_neg,
+        rot_side_pos=rot_side_pos,
+        rot_y_front_neg=rot_y_front_neg,
+        rot_y_front_pos=rot_y_front_pos,
+        rot_y_side_neg=rot_y_side_neg,
+        rot_y_side_pos=rot_y_side_pos,
+        row1_chk=row1_chk,
+        row2_chk=row2_chk,
+        row3_chk=row3_chk,
+        row4_chk=row4_chk,
+        row_buttons=row_buttons,
+        run_benchmark=run_benchmark,
+        run_benchmark_button=run_benchmark_button,
+        save_custom_group_template=save_custom_group_template,
+        select_panel=select_panel,
+        selected_owner=selected_owner,
+        server=server,
+        show_back_wall=show_back_wall,
+        show_camera_fov=show_camera_fov,
+        show_intensity_map=show_intensity_map,
+        show_led_markers=show_led_markers,
+        show_random_rays=show_random_rays,
+        show_rays_output=show_rays_output,
+        show_room_intensity=show_room_intensity,
+        show_room_walls=show_room_walls,
+        show_vio_fov=show_vio_fov,
+        static_scene_handles=static_scene_handles,
+        stl_absorber_enable=stl_absorber_enable,
+        stl_mesh_data=stl_mesh_data,
+        stl_mesh_handle=stl_mesh_handle,
+        stl_pos_x=stl_pos_x,
+        stl_pos_y=stl_pos_y,
+        stl_pos_z=stl_pos_z,
+        stl_rot_x=stl_rot_x,
+        stl_rot_y=stl_rot_y,
+        stl_rot_z=stl_rot_z,
+        stl_scale=stl_scale,
+        template_dropdown=template_dropdown,
+        uniformity_percentile_slider=uniformity_percentile_slider,
+        update_all_led_buttons=update_all_led_buttons,
+        update_intensity_button=update_intensity_button,
+        update_intensity_map=update_intensity_map,
+        update_room_button=update_room_button,
+        update_room_intensity_map=update_room_intensity_map,
+        update_stl_mesh=update_stl_mesh,
+        update_ui_visibility=update_ui_visibility,
+        viewing_angle_slider=viewing_angle_slider,
+        vio_cam1_pitch=vio_cam1_pitch,
+        vio_cam1_yaw=vio_cam1_yaw,
+        vio_cam2_pitch=vio_cam2_pitch,
+        vio_cam2_yaw=vio_cam2_yaw,
+        vio_fill_fov=vio_fill_fov,
+        vio_fov_handles=vio_fov_handles,
+        vio_landscape=vio_landscape,
+        vio_long_fov=vio_long_fov,
+        vio_pos_x=vio_pos_x,
+        vio_pos_y=vio_pos_y,
+        vio_pos_z=vio_pos_z,
+        wall_dist_slider=wall_dist_slider,
+        wall_view_size=wall_view_size,
+    ))
+    update_scene = _scene_view_ns.update_scene
+    update_wall = _scene_view_ns.update_wall
+    _scene_view_late.update_scene = _scene_view_ns.update_scene
     # --- Optimize tab (see ui/optimize_tab.py) ---
     _optimize_tab_ns = _optimize_tab.build(_SimpleNamespace(
         _project_root=_project_root,
