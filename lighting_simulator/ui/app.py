@@ -1698,7 +1698,6 @@ def main():
     _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
         _absorber_config=_absorber_config,
         _expand_mirror_configs=_expand_mirror_configs,
-        _just_clicked_mesh=_just_clicked_mesh,
         _panel_slot_data=_panel_slot_data,
         bw_scale_chk=bw_scale_chk,
         calibration_factor_slider=calibration_factor_slider,
@@ -1784,6 +1783,7 @@ def main():
     ))
     _build_current_leds_and_absorbers = _intensity_map_ns._build_current_leds_and_absorbers
     _build_lux_legend_html = _intensity_map_ns._build_lux_legend_html
+    read_cell_at_ray = _intensity_map_ns.read_cell_at_ray
     _last_intensity_cache = _intensity_map_ns._last_intensity_cache
     _last_room_cache = _intensity_map_ns._last_room_cache
     _mode_toggle_syncing = _intensity_map_ns._mode_toggle_syncing
@@ -2061,6 +2061,7 @@ def main():
         radius_slider=radius_slider,
         ray_handles=ray_handles,
         ray_length_slider=ray_length_slider,
+        read_cell_at_ray=read_cell_at_ray,
         ray_uniformity_slider=ray_uniformity_slider,
         room_back_dist=room_back_dist,
         room_front_dist=room_front_dist,

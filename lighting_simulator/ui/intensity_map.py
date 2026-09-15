@@ -28,7 +28,6 @@ from lighting_simulator.ui.mesh_lighting import _build_stl_transform
 def build(ctx):
     _absorber_config = ctx._absorber_config
     _expand_mirror_configs = ctx._expand_mirror_configs
-    _just_clicked_mesh = ctx._just_clicked_mesh
     _panel_slot_data = ctx._panel_slot_data
     bw_scale_chk = ctx.bw_scale_chk
     calibration_factor_slider = ctx.calibration_factor_slider
@@ -655,32 +654,6 @@ def build(ctx):
                 visible=True,
             )
             intensity_handles.append(handle)
-
-            @handle.on_click
-            def _on_cell_click(event, _x=x_pos, _grid=intensity_grid, _wall=actual_wall_size,
-                               _cell=cell_size_cm, _area=cell_area_m2):
-                if not cell_readout_chk.value:
-                    return
-                _just_clicked_mesh[0] = True  # keep the scene click from deselecting the panel
-                o = np.asarray(event.ray_origin, dtype=float)
-                d = np.asarray(event.ray_direction, dtype=float)
-                if abs(d[0]) < 1e-9:
-                    return
-                t = (_x - o[0]) / d[0]
-                y_cm, z_cm = (o[1] + t * d[1]) * 100.0, (o[2] + t * d[2]) * 100.0
-                gy = int((y_cm + _wall / 2) // _cell)
-                gz = int((z_cm + _wall / 2) // _cell)
-                n = _grid.shape[0]
-                if not (0 <= gy < n and 0 <= gz < n):
-                    return
-                lux = float(_grid[gz, gy])
-                cell_readout_html.content = (
-                    "<div style='font-family:sans-serif;font-size:12px;padding:6px 8px;margin:-4px 0 8px;"
-                    "border:1px solid #ccc;border-radius:4px;background:#f7f7f7;'>"
-                    f"<b>{lux:,.0f} lux</b> &nbsp;({lux * _area:.3f} lm/cell)<br>"
-                    f"<span style='color:#666;'>row {gz}, col {gy} &nbsp;·&nbsp; y = {y_cm:+.1f} cm, z = {z_cm:+.1f} cm</span>"
-                    "</div>"
-                )
         
         t_viz_end = _time.perf_counter()
         print(f"  [TIMING] Visualization: {t_viz_end - t_viz_start:.2f}s ({vert_idx // 4} cells)")
@@ -708,7 +681,37 @@ def build(ctx):
     def _(_):
         cell_readout_html.content = _READOUT_HINT if cell_readout_chk.value else ""
 
+    def read_cell_at_ray(ray_origin, ray_direction):
+        """Show the lux of the displayed wall cell hit by a click ray. Returns True if a cell was hit."""
+        grid = _last_intensity_cache['grid']
+        if not cell_readout_chk.value or grid is None or not intensity_handles:
+            return False
+        wall_cm = float(_last_intensity_cache['wall_size_cm'])
+        o = np.asarray(ray_origin, dtype=float)
+        d = np.asarray(ray_direction, dtype=float)
+        if abs(d[0]) < 1e-9:
+            return False
+        t = (float(_last_intensity_cache['wall_dist']) / 100.0 - o[0]) / d[0]
+        if t <= 0:
+            return False
+        y_cm, z_cm = (o[1] + t * d[1]) * 100.0, (o[2] + t * d[2]) * 100.0
+        n = grid.shape[0]
+        cell_cm = wall_cm / n
+        gy = int((y_cm + wall_cm / 2) // cell_cm)
+        gz = int((z_cm + wall_cm / 2) // cell_cm)
+        if not (0 <= gy < n and 0 <= gz < n):
+            return False
+        lux = float(grid[gz, gy])
+        cell_readout_html.content = (
+            "<div style='font-family:sans-serif;font-size:12px;padding:6px 8px;margin:-4px 0 8px;"
+            "border:1px solid #ccc;border-radius:4px;background:#f7f7f7;'>"
+            f"<b>{lux:,.0f} lux</b> &nbsp;({lux * float(_last_intensity_cache['cell_area_m2']):.3f} lm/cell)<br>"
+            f"<span style='color:#666;'>row {gz}, col {gy} &nbsp;·&nbsp; y = {y_cm:+.1f} cm, z = {z_cm:+.1f} cm</span>"
+            "</div>"
+        )
+        return True
+
     # ── CSV Pattern Import logic ──────────────────────────────────────────
 
 
-    return SimpleNamespace(_build_current_leds_and_absorbers=_build_current_leds_and_absorbers, _build_lux_legend_html=_build_lux_legend_html, _last_intensity_cache=_last_intensity_cache, _last_room_cache=_last_room_cache, _mode_toggle_syncing=_mode_toggle_syncing, _refresh_uniformity=_refresh_uniformity, _room_metrics_html=_room_metrics_html, compute_room_intensity=compute_room_intensity, compute_wall_intensity=compute_wall_intensity, intensity_to_color=intensity_to_color, update_intensity_map=update_intensity_map)
+    return SimpleNamespace(_build_current_leds_and_absorbers=_build_current_leds_and_absorbers, _build_lux_legend_html=_build_lux_legend_html, _last_intensity_cache=_last_intensity_cache, _last_room_cache=_last_room_cache, _mode_toggle_syncing=_mode_toggle_syncing, _refresh_uniformity=_refresh_uniformity, _room_metrics_html=_room_metrics_html, compute_room_intensity=compute_room_intensity, compute_wall_intensity=compute_wall_intensity, intensity_to_color=intensity_to_color, read_cell_at_ray=read_cell_at_ray, update_intensity_map=update_intensity_map)

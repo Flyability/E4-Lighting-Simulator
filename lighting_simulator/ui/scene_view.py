@@ -130,6 +130,7 @@ def build(ctx):
     radius_slider = ctx.radius_slider
     ray_handles = ctx.ray_handles
     ray_length_slider = ctx.ray_length_slider
+    read_cell_at_ray = ctx.read_cell_at_ray
     ray_uniformity_slider = ctx.ray_uniformity_slider
     room_back_dist = ctx.room_back_dist
     room_front_dist = ctx.room_front_dist
@@ -2152,6 +2153,8 @@ def build(ctx):
             return
         if _just_clicked_mesh[0]:
             _just_clicked_mesh[0] = False
+            return
+        if read_cell_at_ray(_event.ray_origin, _event.ray_direction):
             return
         if selected_owner[0] is not None:
             select_panel(None)
