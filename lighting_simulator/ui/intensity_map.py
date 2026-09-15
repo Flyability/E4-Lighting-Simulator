@@ -28,6 +28,7 @@ from lighting_simulator.ui.mesh_lighting import _build_stl_transform
 def build(ctx):
     _absorber_config = ctx._absorber_config
     _expand_mirror_configs = ctx._expand_mirror_configs
+    _just_clicked_mesh = ctx._just_clicked_mesh
     _panel_slot_data = ctx._panel_slot_data
     bw_scale_chk = ctx.bw_scale_chk
     calibration_factor_slider = ctx.calibration_factor_slider
@@ -36,6 +37,8 @@ def build(ctx):
     camera_pitch = ctx.camera_pitch
     camera_pos_x = ctx.camera_pos_x
     camera_pos_y = ctx.camera_pos_y
+    cell_readout_chk = ctx.cell_readout_chk
+    cell_readout_html = ctx.cell_readout_html
     circle_center_slider = ctx.circle_center_slider
     custom_groups = ctx.custom_groups
     custom_reflectance_slider = ctx.custom_reflectance_slider
@@ -652,6 +655,32 @@ def build(ctx):
                 visible=True,
             )
             intensity_handles.append(handle)
+
+            @handle.on_click
+            def _on_cell_click(event, _x=x_pos, _grid=intensity_grid, _wall=actual_wall_size,
+                               _cell=cell_size_cm, _area=cell_area_m2):
+                if not cell_readout_chk.value:
+                    return
+                _just_clicked_mesh[0] = True  # keep the scene click from deselecting the panel
+                o = np.asarray(event.ray_origin, dtype=float)
+                d = np.asarray(event.ray_direction, dtype=float)
+                if abs(d[0]) < 1e-9:
+                    return
+                t = (_x - o[0]) / d[0]
+                y_cm, z_cm = (o[1] + t * d[1]) * 100.0, (o[2] + t * d[2]) * 100.0
+                gy = int((y_cm + _wall / 2) // _cell)
+                gz = int((z_cm + _wall / 2) // _cell)
+                n = _grid.shape[0]
+                if not (0 <= gy < n and 0 <= gz < n):
+                    return
+                lux = float(_grid[gz, gy])
+                cell_readout_html.content = (
+                    "<div style='font-family:sans-serif;font-size:12px;padding:6px 8px;margin:-4px 0 8px;"
+                    "border:1px solid #ccc;border-radius:4px;background:#f7f7f7;'>"
+                    f"<b>{lux:,.0f} lux</b> &nbsp;({lux * _area:.3f} lm/cell)<br>"
+                    f"<span style='color:#666;'>row {gz}, col {gy} &nbsp;·&nbsp; y = {y_cm:+.1f} cm, z = {z_cm:+.1f} cm</span>"
+                    "</div>"
+                )
         
         t_viz_end = _time.perf_counter()
         print(f"  [TIMING] Visualization: {t_viz_end - t_viz_start:.2f}s ({vert_idx // 4} cells)")
@@ -671,6 +700,13 @@ def build(ctx):
         legend_html.content = legend + _wall_metrics_html(
             intensity_grid, actual_wall_size, wall_dist,
         )
+
+    _READOUT_HINT = ("<div style='color:#888;font-size:11px;margin:-4px 0 8px;'>"
+                     "Click a cell in the 3-D view to read its lux.</div>")
+
+    @cell_readout_chk.on_update
+    def _(_):
+        cell_readout_html.content = _READOUT_HINT if cell_readout_chk.value else ""
 
     # ── CSV Pattern Import logic ──────────────────────────────────────────
 

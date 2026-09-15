@@ -541,6 +541,11 @@ def main():
             "Cell area: calculating..."
             "</div>"
         )
+        cell_readout_chk = server.gui.add_checkbox(
+            "Cell readout on click", initial_value=False,
+            hint="Click a cell of the wall intensity map in the 3-D view to show its lux value here.",
+        )
+        cell_readout_html = server.gui.add_html("")
         legend_html = server.gui.add_html(
             "<div style='font-family: sans-serif;'>"
             "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
@@ -1693,6 +1698,7 @@ def main():
     _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
         _absorber_config=_absorber_config,
         _expand_mirror_configs=_expand_mirror_configs,
+        _just_clicked_mesh=_just_clicked_mesh,
         _panel_slot_data=_panel_slot_data,
         bw_scale_chk=bw_scale_chk,
         calibration_factor_slider=calibration_factor_slider,
@@ -1701,6 +1707,8 @@ def main():
         camera_pitch=camera_pitch,
         camera_pos_x=camera_pos_x,
         camera_pos_y=camera_pos_y,
+        cell_readout_chk=cell_readout_chk,
+        cell_readout_html=cell_readout_html,
         circle_center_slider=circle_center_slider,
         custom_groups=custom_groups,
         custom_reflectance_slider=custom_reflectance_slider,
