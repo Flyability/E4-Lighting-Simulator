@@ -101,7 +101,13 @@ def test_run_methods_produce_outputs(tmp_path, method):
     out = tmp_path / problem.name
     assert (out / "best_config.json").exists() and (out / "history.csv").exists()
     assert summary['best_score'] == pytest.approx(best.score)
+    assert summary['run_dir'] == str(out)
     assert len(build_scene_from_config(load_config(out / "best_config.json")).leds) > 0
+    # a second run with the same name must not overwrite the first
+    summary2, _ = run(problem, OptimizerSpec(method=method, max_evals=12, population=6, log_every=0),
+                      output_dir=tmp_path, report=False)
+    assert summary2['run_dir'] == str(tmp_path / f"{problem.name}_002")
+    assert (out / "summary.json").exists() and (tmp_path / f"{problem.name}_002" / "summary.json").exists()
 
 
 def test_duct_center_delta_shifts_all_leds():

@@ -130,13 +130,26 @@ def _snap_integers(problem, x):
     return x
 
 
+def unique_run_dir(output_dir, name):
+    """``<output_dir>/<name>``, or ``<name>_002``, ``_003``… if that folder already has outputs."""
+    base = Path(output_dir)
+    cand = base / name
+    if not cand.exists() or not any(cand.iterdir()):
+        return cand
+    n = 2
+    while (base / f"{name}_{n:03d}").exists():
+        n += 1
+    return base / f"{name}_{n:03d}"
+
+
 def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eval=None, stop_event=None,
         report=True):
     """Optimise ``problem`` and return (summary dict, best Evaluation).
 
     ``on_eval`` / ``stop_event`` are forwarded to ``RunLogger`` for live progress and
     cancellation (a stopped run still writes its summary and best config). ``report``
-    renders ``report.pdf`` next to the other outputs.
+    renders ``report.pdf`` next to the other outputs. Existing run folders are never
+    overwritten; the actual folder is ``summary['run_dir']``.
     """
     from scipy import optimize
 
@@ -145,7 +158,9 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
         print("[optim] use_gpu=True: forcing workers=1")
         opt = OptimizerSpec(**{**asdict(opt), 'workers': 1})
 
-    out_dir = Path(output_dir) / problem.name
+    out_dir = unique_run_dir(output_dir, problem.name)
+    if out_dir.name != problem.name:
+        print(f"[optim] '{problem.name}' already has results → writing to {out_dir}")
     logger = RunLogger(problem, out_dir, log_every=opt.log_every, on_eval=on_eval, stop_event=stop_event,
                        confirm_best=opt.confirm_best)
     bounds = problem.bounds
@@ -177,7 +192,7 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
             traceback.print_exc()
             print("[optim] report generation failed (see traceback above)")
 
-    summary = logger.close({"optimizer": asdict(opt), "stopped": stopped,
+    summary = logger.close({"optimizer": asdict(opt), "stopped": stopped, "run_dir": str(out_dir),
                             "report": str(report_path) if report_path else None})
     print(f"[optim] done: {summary['evaluations']} evals in {summary['elapsed_s']}s → {logger.best.summary()}")
     print(f"[optim] best config: {out_dir / 'best_config.json'}")

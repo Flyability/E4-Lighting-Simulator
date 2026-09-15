@@ -49,7 +49,7 @@ def main():
     if args.save_config:
         import shutil
         from pathlib import Path
-        src = Path(spec.get("output_dir", "exports/optim")) / summary["name"] / "best_config.json"
+        src = Path(summary["run_dir"]) / "best_config.json"
         shutil.copyfile(src, args.save_config)
         print(f"[optim] copied best config to {args.save_config}")
 
