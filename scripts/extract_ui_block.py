@@ -1,0 +1,213 @@
+"""Move self-contained line ranges out of ``ui/app.py::main()`` into ``ui/<module>.py``.
+
+Each block becomes the body of ``build(ctx)``: the names it reads from ``main()`` are
+unpacked from ``ctx`` at the top and the names ``main()`` keeps using are returned in a
+SimpleNamespace. Run with ``--analyse`` first; it lists inputs/outputs and flags hazards
+(names that main() rebinds later, or that the block rebinds through ``nonlocal``), which
+must be turned into in-place mutation before ``--write``.
+
+Usage: PYTHONPATH=. python scripts/extract_ui_block.py [--analyse | --write]
+"""
+import ast, builtins, re, symtable, sys
+from pathlib import Path
+
+APP = Path("lighting_simulator/ui/app.py")
+
+# name, [(lo, hi), ...], docstring, extra imports, lists rebound with `x = []` -> `x.clear()`
+BLOCKS = [
+    ("config_io", [(255, 1537)],
+     "Saved-configuration I/O: read the GUI into a config dict, apply a config dict to the GUI, new project, templates.",
+     ["import json", "import os", "import time", "import numpy as np",
+      "from lighting_simulator.domain.guides import (",
+      "    bake_and_disable_guide, enable_circular_guide, guide_is_enabled as _guide_is_enabled,",
+      "    restore_group_guide, serialize_guide,",
+      ")"],
+     []),
+    ("panels", [(1557, 2220), (3146, 3442), (3640, 4370), (4430, 4632), (4636, 4748)],
+     "Panel system: custom groups, individual LEDs, template loading, panel slots and XZ mirroring helpers.",
+     ["import json", "import os", "import time", "import numpy as np",
+      "from lighting_simulator.domain.geometry import as_vec3 as _as_vec3",
+      "from lighting_simulator.domain.guides import (",
+      "    bake_and_disable_guide, enable_circular_guide, guide_is_enabled as _guide_is_enabled,",
+      "    restore_group_guide, serialize_guide,",
+      ")",
+      "from lighting_simulator.domain.mirroring import expand_mirror_configs"],
+     []),
+]
+
+src_lines = APP.read_text().splitlines(keepends=True)
+tree = ast.parse("".join(src_lines))
+main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+
+module_names = set(dir(builtins))
+for n in tree.body:
+    if isinstance(n, (ast.Import, ast.ImportFrom)):
+        module_names.update((a.asname or a.name).split(".")[0] for a in n.names)
+    elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+        module_names.add(n.name)
+    elif isinstance(n, ast.Assign):
+        module_names.update(x.id for t in n.targets for x in ast.walk(t) if isinstance(x, ast.Name))
+
+
+def scope_stores(stmts):
+    """name -> [lineno...] of direct (non-nested-def) stores in this scope."""
+    out = {}
+    def visit(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.setdefault(node.name, []).append(node.lineno); return
+        if isinstance(node, ast.Lambda):
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            out.setdefault(node.id, []).append(node.lineno)
+        for ch in ast.iter_child_nodes(node):
+            visit(ch)
+    for s in stmts:
+        visit(s)
+    return out
+
+
+def nonlocal_stores(stmts):
+    """Names rebound inside nested functions via `nonlocal` (name -> lines of `x = ...`)."""
+    out = {}
+    for s in stmts:
+        for fn in ast.walk(s):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            nl = {nm for st in fn.body for n in ast.walk(st) if isinstance(n, ast.Nonlocal) for nm in n.names}
+            if not nl:
+                continue
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id in nl:
+                    out.setdefault(n.id, []).append(n.lineno)
+    return out
+
+
+def loads(stmts):
+    names = set()
+    for s in stmts:
+        for n in ast.walk(s):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                names.add(n.id)
+            elif isinstance(n, ast.Nonlocal):
+                names.update(n.names)
+    return names
+
+
+def in_block(stmt, ranges):
+    return any(lo <= stmt.lineno <= hi for lo, hi in ranges)
+
+
+LOOP_TEMPS = {"f", "i", "_h", "k", "j", "g", "h", "v", "n", "x", "y", "z", "c", "p", "d", "a", "b", "m", "s", "t"}
+
+
+def free_names(text):
+    """Names the block reads without binding anywhere inside it (true free variables).
+
+    ``nonlocal`` declarations are pre-bound so symtable accepts them; they count as free.
+    """
+    nl = {nm for n in ast.walk(ast.parse("def _b():\n" + text)) if isinstance(n, ast.Nonlocal) for nm in n.names}
+    pre = "".join(f"    {n} = None\n" for n in sorted(nl))
+    top = symtable.symtable("def _b():\n" + pre + text, "<block>", "exec")
+    build = top.get_children()[0]
+    out = set(nl)
+
+    def walk(tab):
+        for s in tab.get_symbols():
+            if s.is_global() and not s.is_assigned():
+                out.add(s.get_name())
+        for ch in tab.get_children():
+            walk(ch)
+    walk(build)
+    return out
+
+
+def analyse(ranges):
+    block = [s for s in main.body if in_block(s, ranges)]
+    rest = [s for s in main.body if not in_block(s, ranges)]
+    bb, ob = scope_stores(block), scope_stores(rest)
+    rl = loads(rest)
+    fr = free_names(block_text(ranges, []))
+    inputs = sorted(n for n in fr if n in ob and n not in module_names)
+    outputs = sorted(n for n in bb if n in rl and n not in LOOP_TEMPS)
+    nl_rest = nonlocal_stores(rest)
+    rebound_outside = {n: ob[n] + nl_rest.get(n, []) for n in inputs if len(ob[n]) > 1 or n in nl_rest}
+    rebound_inside = {n: ls for n, ls in nonlocal_stores(block).items() if n in inputs or n in outputs}
+    return inputs, outputs, rebound_outside, rebound_inside
+
+
+def block_text(ranges, inplace):
+    text = "".join("".join(src_lines[lo - 1:hi]) + "\n" for lo, hi in ranges)
+    for name in inplace:
+        text = re.sub(rf"^(\s*){name} = \[\]\s*$", rf"\1{name}.clear()", text, flags=re.M)
+    return text
+
+
+def undefined_names(text):
+    tree_ = ast.parse(text)
+    bound = set(dir(builtins))
+    for n in ast.walk(tree_):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            bound.update((a.asname or a.name).split(".")[0] for a in n.names)
+        elif isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.Lambda)):
+            if not isinstance(n, ast.Lambda):
+                bound.add(n.name)
+            bound.update(a.arg for a in n.args.args + n.args.kwonlyargs)
+            if n.args.vararg: bound.add(n.args.vararg.arg)
+            if n.args.kwarg: bound.add(n.args.kwarg.arg)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            bound.add(n.id)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+    return sorted({n.id for n in ast.walk(tree_) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+                   and n.id not in bound})
+
+
+def main_():
+    write = "--write" in sys.argv
+    edits, out_files, all_outputs = [], {}, []
+    for mod, ranges, doc, imports, inplace in BLOCKS:
+        inputs, outputs, reb_out, reb_in = analyse(ranges)
+        print(f"\n[{mod}] {ranges}: {len(inputs)} inputs, {len(outputs)} outputs")
+        print("  inputs :", ", ".join(inputs))
+        print("  outputs:", ", ".join(outputs))
+        if reb_out:
+            print("  !! inputs REBOUND by main() elsewhere (ctx snapshot would go stale):", reb_out)
+        if reb_in:
+            print("  !! names rebound INSIDE block via nonlocal (main would go stale):", reb_in)
+        text = block_text(ranges, inplace)
+        header = (f'"""{doc}\n\nExtracted verbatim from ``ui.app.main``; ``build(ctx)`` receives the GUI handles and\n'
+                  f'callbacks it needs and returns the closures main() keeps using.\n"""\n'
+                  "from types import SimpleNamespace\n" + "".join(i + "\n" for i in imports) + "\n\ndef build(ctx):\n"
+                  + "".join(f"    {n} = ctx.{n}\n" for n in inputs) + "\n")
+        footer = "\n    return SimpleNamespace(" + ", ".join(f"{n}={n}" for n in outputs) + ")\n"
+        module_text = header + text + footer
+        und = undefined_names(module_text)
+        if und:
+            print("  !! undefined names in generated module:", und)
+        out_files[mod] = module_text
+        call = (f"    # --- {doc.split(':')[0]} (see ui/{mod}.py) ---\n"
+                f"    _{mod}_ns = _{mod}.build(_SimpleNamespace(\n"
+                + "".join(f"        {n}={n},\n" for n in inputs) + "    ))\n"
+                + "".join(f"    {n} = _{mod}_ns.{n}\n" for n in outputs))
+        edits.append((mod, ranges, call))
+    if not write:
+        print("\n(dry run — pass --write to apply; call sites are inserted at the BUILD_MARKER comment)")
+        return
+    lines = list(src_lines)
+    marker = next(i for i, l in enumerate(lines) if "# --- Optimize tab (see ui/optimize_tab.py) ---" in l)
+    calls = "".join(c for _, _, c in edits)
+    lines[marker:marker] = [calls]
+    # delete ranges bottom-up
+    for lo, hi in sorted((r for _, ranges, _ in edits for r in ranges), reverse=True):
+        del lines[lo - 1:hi]
+    text = "".join(lines)
+    imp = "from types import SimpleNamespace as _SimpleNamespace\n"
+    text = text.replace(imp, imp + "".join(f"from lighting_simulator.ui import {m} as _{m}\n" for m, *_ in BLOCKS), 1)
+    APP.write_text(text)
+    for mod, t in out_files.items():
+        Path(f"lighting_simulator/ui/{mod}.py").write_text(t)
+    print("written; app.py now", text.count("\n"), "lines")
+
+
+if __name__ == "__main__":
+    main_()
