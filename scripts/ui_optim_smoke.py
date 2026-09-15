@@ -131,4 +131,17 @@ find("Max evaluations").value = 30
 find("Method").value = "random_search"
 find("Rays per pixel").value = 50
 run_and_wait("ducts")
+
+# tilted ducts + VIO scored on the six room walls
+find("Duct rotation X/Y/Z (°)").value = (8.0, -5.0, 0.0)
+fire_update(find("Duct rotation X/Y/Z (°)"))
+n_duct_nodes = sum(1 for n in server.scene._handle_from_node_name if n.startswith("/optim_ducts/"))
+print("[smoke] duct preview nodes after rotation:", n_duct_nodes)
+assert n_duct_nodes >= 6
+find("Evaluate VIO on").value = "Room (6 walls around the rig)"
+fire_update(find("Evaluate VIO on"))
+find("Room wall distance (cm)").value = 300
+find("Room grid per wall").value = 15
+find("Max evaluations").value = 12
+run_and_wait("ducts (tilted, room VIO)")
 print("[smoke] errors:", errors or "none")

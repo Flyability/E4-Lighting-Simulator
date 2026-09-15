@@ -46,10 +46,16 @@ class Duct:
     reference: tuple = (1.0, 0.0, 0.0)
     mount_offset: float = 0.3
     """Stand-off of the LED face from the cylinder surface, along the outward normal."""
+    rotation_deg: tuple | None = None
+    """Extrinsic X-Y-Z Euler rotation (deg) of ``axis`` and ``reference`` about ``center`` (tilted ducts)."""
 
     def frame(self):
-        a = normalize(self.axis)
+        a = np.asarray(self.axis, dtype=float)
         u = np.asarray(self.reference, dtype=float)
+        if self.rotation_deg is not None and any(abs(float(r)) > 1e-9 for r in self.rotation_deg):
+            R = euler_xyz_matrix(*(float(r) for r in self.rotation_deg))
+            a, u = R @ a, R @ u
+        a = normalize(a)
         u = u - a * np.dot(u, a)
         if np.linalg.norm(u) < 1e-9:
             u = np.cross(a, [0.0, 1.0, 0.0])

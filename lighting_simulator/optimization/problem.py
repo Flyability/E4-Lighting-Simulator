@@ -22,8 +22,11 @@ import numpy as np
 from lighting_simulator.analysis.uniformity import trapezoid_mask, uniformity_metrics
 from lighting_simulator.camera.fov import camera_fov_wall_trapezoid, points_in_fisheye_fov, vio_hfov_vfov_deg
 from lighting_simulator.scene.builder import build_scene_from_config, load_config
-from lighting_simulator.simulation.room_geometry import wall_grid_cell_centers_cm
-from lighting_simulator.simulation.settings import EmissionSettings, WallSettings
+from lighting_simulator.simulation.room import compute_room_intensity
+from lighting_simulator.simulation.room_geometry import (
+    build_wall_specs, room_wall_cell_centers, wall_grid_cell_centers_cm,
+)
+from lighting_simulator.simulation.settings import EmissionSettings, RoomSettings, WallSettings
 from lighting_simulator.simulation.wall import compute_wall_intensity
 
 from .electrical import DriverModel
@@ -69,8 +72,11 @@ class ObjectiveSpec:
 class VioSpec:
     """Two VD66GY fisheye VIO cameras (same convention as the UI 'VIO Cameras' folder).
 
-    Their footprint is evaluated on a dedicated far wall (``wall_dist`` cm) so
-    the *fraction of VIO-visible wall cells above a lux threshold* can be scored.
+    ``geometry="wall"``: the footprint is evaluated on a dedicated far wall (``wall_dist`` cm).
+    ``geometry="room"``: on all six walls of a closed room ``room_dist`` cm from the rig in
+    every direction (coarse ``room_grid_size``² grid per wall), which is what the 170°
+    fisheyes at ±45° actually see. Either way the score uses the *fraction of VIO-visible
+    cells above a lux threshold*.
     """
 
     position: tuple = (10.0, 0.0, 0.0)
@@ -80,22 +86,49 @@ class VioSpec:
     cam2_yaw: float = 0.0
     long_fov: float = 170.0
     landscape: bool = True
+    geometry: str = "wall"
     wall_dist: float = 300.0
     wall_size: float = 1200.0
     grid_size: int = 40
+    room_dist: float = 300.0
+    """Distance (cm) to each of the six room walls (opposite walls are 2× this apart)."""
+    room_grid_size: int = 20
 
     def wall_settings(self, rays_per_pixel):
         return WallSettings(wall_dist=self.wall_dist, grid_size=self.grid_size, wall_size=self.wall_size,
                             rays_per_pixel=rays_per_pixel)
 
-    def mask(self):
-        """Union of both cameras' footprints on the VIO wall grid."""
-        pts = wall_grid_cell_centers_cm((self.grid_size, self.grid_size), self.wall_size, self.wall_dist)
+    def room_settings(self, rays_per_pixel=1):
+        d = float(self.room_dist)
+        return RoomSettings(front_dist=d, side_dist=d, top_bottom_dist=d, back_dist=d,
+                            grid_size=int(self.room_grid_size), rays_per_pixel=int(rays_per_pixel),
+                            max_bounces=0, wall_reflectance=0.0)
+
+    def room_wall_specs(self):
+        s = self.room_settings()
+        return build_wall_specs(s.front_dist, s.side_dist, s.top_bottom_dist, s.grid_size,
+                                s.led_x_center, s.back_dist)
+
+    def _fisheye_union(self, pts):
         hfov, vfov = vio_hfov_vfov_deg(self.long_fov, self.landscape)
         pos = np.asarray(self.position, float)
         m1 = points_in_fisheye_fov(pos, self.cam1_pitch, self.cam1_yaw, hfov, vfov, pts)
         m2 = points_in_fisheye_fov(pos, self.cam2_pitch, self.cam2_yaw, hfov, vfov, pts)
         return m1 | m2
+
+    def mask(self):
+        """Union of both cameras' footprints on the VIO wall grid."""
+        pts = wall_grid_cell_centers_cm((self.grid_size, self.grid_size), self.wall_size, self.wall_dist)
+        return self._fisheye_union(pts)
+
+    def room_masks(self):
+        """``{wall: bool grid}`` of VIO-visible cells; side/top/bottom cells behind the back wall are dropped."""
+        s = self.room_settings()
+        masks = {}
+        for name, spec in self.room_wall_specs().items():
+            pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
+            masks[name] = self._fisheye_union(pts) & (pts[..., 0] >= -s.back_dist - 1e-6)
+        return masks
 
 
 @dataclass
@@ -256,7 +289,14 @@ class Problem:
             for w in self.walls
         ]
         self._needs_vio = self.vio is not None and any(m.vio_min_lux for m in self.modes)
-        if self._needs_vio:
+        self._vio_room = self._needs_vio and self.vio.geometry == "room"
+        if self._vio_room:
+            self._vio_wall = None
+            self._vio_masks = self.vio.room_masks()
+            self._vio_mask = self._vio_masks['front']
+            if not any(np.any(m) for m in self._vio_masks.values()):
+                raise ValueError("VIO cameras do not see the VIO room walls: check the poses")
+        elif self._needs_vio:
             self._vio_wall = self.vio.wall_settings(wall.rays_per_pixel)
             self._vio_mask = self.vio.mask()
             if not np.any(self._vio_mask):
@@ -348,7 +388,10 @@ class Problem:
         vio_grid = None
         if self.modes:
             vio_lit = None
-            if self._needs_vio:
+            if self._vio_room:
+                vio_grid = self._trace_room(scene, len(active))
+                vio_lit = np.concatenate([vio_grid[n][m] for n, m in self._vio_masks.items() if n in vio_grid])
+            elif self._needs_vio:
                 vio_grid = self._trace(scene, self._vio_wall)
                 vio_lit = vio_grid[self._vio_mask]
             design_current = float(currents.mean())
@@ -374,6 +417,16 @@ class Problem:
                                       stl_mesh_data=scene.stl_mesh_data, use_gpu=self.use_gpu,
                                       verbose=False, parallel=False)
         return np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _trace_room(self, scene, n_active):
+        """VIO room trace with roughly the same total ray budget as one main-wall trace."""
+        w = self.walls[0]
+        room_cells = int(self.vio.room_grid_size) ** 2
+        rpp = max(1, int(round(w.rays_per_pixel * w.grid_size ** 2 / max(1, n_active * room_cells))))
+        grids, _ = compute_room_intensity(scene.leds, self.vio.room_settings(rpp), self.emission,
+                                          absorbers=scene.absorbers, stl_mesh_data=scene.stl_mesh_data,
+                                          use_gpu=self.use_gpu, verbose=False)
+        return {n: np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for n, g in grids.items()}
 
     def _mode_penalties(self, mode: ModeSpec, design_current, e_avgs, vio_lit, penalties):
         """Lux / VIO targets of one operating point; flux scales linearly with current."""

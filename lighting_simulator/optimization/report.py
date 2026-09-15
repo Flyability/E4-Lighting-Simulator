@@ -154,7 +154,7 @@ def _verifier(problem, factor):
     p = copy.copy(problem)
     p.walls = [WallSettings(wall_dist=w.wall_dist, grid_size=w.grid_size, wall_size=w.wall_size,
                             rays_per_pixel=int(w.rays_per_pixel * factor)) for w in problem.walls]
-    if getattr(problem, "_needs_vio", False):
+    if getattr(problem, "_needs_vio", False) and getattr(problem, "_vio_wall", None) is not None:
         v = problem._vio_wall
         p._vio_wall = WallSettings(wall_dist=v.wall_dist, grid_size=v.grid_size, wall_size=v.wall_size,
                                    rays_per_pixel=int(v.rays_per_pixel * factor))
@@ -268,10 +268,12 @@ def _page_problem(w: _Writer, problem, designs):
            f"max {d.max_current_a:g} A per LED, {d.leds_per_driver} LED(s) per driver")
     if problem.vio is not None:
         v = problem.vio
+        where = (f"VIO room: six walls {v.room_dist:g} cm away ({2*v.room_dist/100:g} m across), "
+                 f"{v.room_grid_size}² cells per wall" if v.geometry == "room" else
+                 f"VIO wall at {v.wall_dist:g} cm, {v.wall_size:g} cm wide, {v.grid_size}² cells")
         w.line(f"VIO cameras: at {_fmt(list(v.position))} cm, cam1 pitch {v.cam1_pitch:g}° yaw {v.cam1_yaw:g}°, "
                f"cam2 pitch {v.cam2_pitch:g}° yaw {v.cam2_yaw:g}°, long-side FOV {v.long_fov:g}° "
-               f"({'landscape' if v.landscape else 'portrait'}); VIO wall at {v.wall_dist:g} cm, "
-               f"{v.wall_size:g} cm wide, {v.grid_size}² cells")
+               f"({'landscape' if v.landscape else 'portrait'}); {where}")
     if problem.modes:
         w.heading("Operating modes")
         for m in problem.modes:
@@ -478,7 +480,10 @@ def _page_heatmaps(pdf, problem, designs):
     n_rows = len(labels)
     cols = [(f"wall {wl.wall_dist:g} cm", wl.wall_size, i) for i, wl in enumerate(problem.walls)]
     has_vio = any(designs[l][1].vio_grid is not None for l in labels)
-    if has_vio:
+    vio_room = has_vio and getattr(problem, "_vio_room", False)
+    if vio_room:
+        cols.append((f"VIO room, front wall {problem.vio.room_dist:g} cm", 2 * problem.vio.room_dist, "vio"))
+    elif has_vio:
         cols.append((f"VIO wall {problem.vio.wall_dist:g} cm", problem.vio.wall_size, "vio"))
     n_cols = len(cols)
     fig = Figure(figsize=A4, dpi=110)
@@ -490,7 +495,10 @@ def _page_heatmaps(pdf, problem, designs):
         grids = []
         for l in labels:
             ev = designs[l][1]
-            g = ev.vio_grid if key == "vio" else (_as_grid_list(ev)[key] if _as_grid_list(ev) else None)
+            if key == "vio":
+                g = ev.vio_grid.get('front') if isinstance(ev.vio_grid, dict) else ev.vio_grid
+            else:
+                g = _as_grid_list(ev)[key] if _as_grid_list(ev) else None
             grids.append(g)
         vmax = max([float(np.nanmax(g)) for g in grids if g is not None] + [1e-9])
         half = wall_size / 2
@@ -515,7 +523,11 @@ def _page_heatmaps(pdf, problem, designs):
                     sub = "unlit"
             else:
                 mask = problem._vio_mask
-                sub = f"{np.count_nonzero(mask)} VIO cells"
+                if vio_room:
+                    n_all = sum(int(np.count_nonzero(m)) for m in problem._vio_masks.values())
+                    sub = f"{np.count_nonzero(mask)} VIO cells on front wall ({n_all} over 6 walls)"
+                else:
+                    sub = f"{np.count_nonzero(mask)} VIO cells"
                 if mask.size and not mask.all():
                     ax.contour(np.linspace(-half, half, g.shape[1]), np.linspace(-half, half, g.shape[0]),
                                mask.astype(float), levels=[0.5], colors="cyan", linewidths=0.8)

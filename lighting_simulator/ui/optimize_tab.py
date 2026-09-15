@@ -93,6 +93,8 @@ def build(ctx):
     _MODE_REFINE = "1 · Refine the current panels"
     _MODE_DUCTS = "2 · Design LEDs on the ducts (from scratch)"
     _MODE_PRESET = "3 · Run a preset spec file"
+    _VIO_GEOM_ROOM = "Room (6 walls around the rig)"
+    _VIO_GEOM_WALL = "Single far wall"
 
     with tab_optim:
         server.gui.add_html(
@@ -210,6 +212,10 @@ def build(ctx):
         duct_radius = server.gui.add_number("Duct radius (cm)", 8.5, min=1.0, max=50.0, step=0.1)
         duct_axis = server.gui.add_dropdown("Duct axis", options=["Z (vertical)", "Y (lateral)", "X (forward)"],
                                             initial_value="Z (vertical)")
+        duct_rot = server.gui.add_vector3("Duct rotation X/Y/Z (°)", (0.0, 0.0, 0.0),
+                                          min=(-90.0, -90.0, -180.0), max=(90.0, 90.0, 180.0), step=0.5,
+                                          hint="Tilt of the duct about its centre (applied X, then Y, then Z); "
+                                               "the mirrored duct is tilted symmetrically")
         duct_mirror = server.gui.add_checkbox("Mirror across XZ (symmetric pair)", initial_value=True)
         duct_theta0 = server.gui.add_slider("Nominal LED position on duct (°, 0 = +X)", min=-180, max=180,
                                             step=5, initial_value=30)
@@ -241,6 +247,20 @@ def build(ctx):
                   "Y (lateral)": ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
                   "X (forward)": ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0])}
 
+    def _duct_rotation():
+        rot = [float(v) for v in duct_rot.value]
+        return rot if any(abs(r) > 1e-9 for r in rot) else None
+
+    def _duct_frame_vectors(mirror=False):
+        """(axis, reference) after the duct rotation; ``mirror`` reflects them across XZ."""
+        from lighting_simulator.optimization.variables import Duct
+        axis, ref = _DUCT_AXES[duct_axis.value]
+        a, u, _v = Duct(axis=tuple(axis), reference=tuple(ref), rotation_deg=_duct_rotation()).frame()
+        if mirror:
+            flip = np.array([1.0, -1.0, 1.0])
+            a, u = a * flip, u * flip
+        return a, u
+
     def _optim_duct_variables():
         from lighting_simulator.optimization.variables import arc_cm_to_deg
         axis, ref = _DUCT_AXES[duct_axis.value]
@@ -252,7 +272,7 @@ def build(ctx):
         var = {
             'type': 'duct_ring', 'name': 'duct',
             'duct': {'center': [float(v) for v in duct_center.value], 'axis': axis, 'radius': r,
-                     'reference': ref, 'mount_offset': 0.0},
+                     'reference': ref, 'mount_offset': 0.0, 'rotation_deg': _duct_rotation()},
             'placement': 'arc',
             'n_leds': rows * cols, 'n_rows': rows,
             'theta_range': [float(duct_theta0.value) - d_theta, float(duct_theta0.value) + d_theta],
@@ -310,8 +330,6 @@ def build(ctx):
         _duct_preview_handles.clear()
         if not duct_show.value or optim_mode.value != _MODE_DUCTS:
             return
-        axis, ref = _DUCT_AXES[duct_axis.value]
-        axis = np.asarray(axis, float)
         centers = [np.asarray(duct_center.value, float)]
         if duct_mirror.value:
             centers.append(centers[0] * np.array([1.0, -1.0, 1.0]))
@@ -323,10 +341,12 @@ def build(ctx):
         shift = float(max(duct_tol_center.value))
         half = tol_t + 2.0
         from lighting_simulator.optimization.variables import Duct
-        _a, _u, _v = Duct(center=(0, 0, 0), axis=tuple(axis), radius=1.0, reference=tuple(ref)).frame()
+        _a, _u, _v = Duct(center=(0, 0, 0), axis=tuple(_DUCT_AXES[duct_axis.value][0]), radius=1.0,
+                          reference=tuple(_DUCT_AXES[duct_axis.value][1])).frame()
         # XZ mirroring flips theta only if the circumferential direction runs along Y
         mirror_sign = -1.0 if abs(_v[1]) > 0.5 else 1.0
         for i, c in enumerate(centers):
+            axis, ref = _duct_frame_vectors(mirror=(i == 1))
             th0 = theta0 * (mirror_sign if i == 1 else 1.0)
             for k, t in enumerate((-half, 0.0, half)):  # the duct itself
                 segs = _circle_line_segments_m(c + axis * t, r, axis, n_seg=64)
@@ -346,7 +366,7 @@ def build(ctx):
                 _duct_preview_handles.append(server.scene.add_line_segments(
                     f"/optim_ducts/{i}/envelope", points=segs, colors=(1.0, 0.95, 0.6), line_width=1.0))
 
-    for _h in (duct_show, duct_center, duct_radius, duct_axis, duct_mirror, duct_tol_radius,
+    for _h in (duct_show, duct_center, duct_radius, duct_axis, duct_rot, duct_mirror, duct_tol_radius,
                duct_tol_axial, duct_theta0, duct_tol_arc, duct_span_cm, duct_tol_center):
         _h.on_update(_draw_duct_preview)
 
@@ -388,12 +408,29 @@ def build(ctx):
         server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>VIO coverage (normal mode)</div>")
         optim_vio_enable = server.gui.add_checkbox("Require VIO FOV coverage", initial_value=False,
                                                    hint="Uses the VIO camera poses from the FOV tab")
-        optim_vio_lux = server.gui.add_number("Min lux on VIO wall", 120, min=0, step=10)
+        optim_vio_lux = server.gui.add_number("Min lux on VIO surfaces", 120, min=0, step=10)
         optim_vio_fraction = server.gui.add_slider("Min share of VIO FOV lit (%)", min=0, max=100, step=5,
                                                    initial_value=50)
+        optim_vio_geometry = server.gui.add_dropdown(
+            "Evaluate VIO on", options=[_VIO_GEOM_ROOM, _VIO_GEOM_WALL], initial_value=_VIO_GEOM_ROOM,
+            hint="Room: six walls around the rig (what the fisheyes really see). Wall: a single far plane.")
+        optim_vio_room_dist = server.gui.add_number("Room wall distance (cm)", 300, min=50, max=2000, step=10,
+                                                    hint="Opposite walls are twice this apart (300 → 6 m room)")
+        optim_vio_room_grid = server.gui.add_number("Room grid per wall", 20, min=5, max=80, step=5,
+                                                    hint="Coarse on purpose: 20 → 30 cm cells in a 6 m room")
         optim_vio_dist = server.gui.add_number("VIO wall distance (cm)", 300, min=50, max=2000, step=10)
         optim_vio_wall_size = server.gui.add_number("VIO wall size (cm)", 1200, min=100, max=5000, step=50)
         optim_vio_grid = server.gui.add_number("VIO wall grid resolution", 40, min=5, max=200, step=5)
+
+    def _optim_vio_geometry_changed(_=None):
+        room = optim_vio_geometry.value == _VIO_GEOM_ROOM
+        for h in (optim_vio_room_dist, optim_vio_room_grid):
+            h.visible = room
+        for h in (optim_vio_dist, optim_vio_wall_size, optim_vio_grid):
+            h.visible = not room
+
+    optim_vio_geometry.on_update(_optim_vio_geometry_changed)
+    _optim_vio_geometry_changed()
 
     with tab_optim:
         _optim_obj_folder = server.gui.add_folder("Objective & constraints", order=50)
@@ -542,6 +579,9 @@ def build(ctx):
         optim_drv_max_current.value = float(drv.get('max_current_a', 13.0))
         optim_leds_per_driver.value = int(drv.get('leds_per_driver', 1))
         vio = spec.get('vio') or {}
+        optim_vio_geometry.value = _VIO_GEOM_ROOM if vio.get('geometry') == 'room' else _VIO_GEOM_WALL
+        optim_vio_room_dist.value = int(vio.get('room_dist', 300))
+        optim_vio_room_grid.value = int(vio.get('room_grid_size', 20))
         optim_vio_dist.value = int(vio.get('wall_dist', 300))
         optim_vio_wall_size.value = int(vio.get('wall_size', 1200))
         optim_vio_grid.value = int(vio.get('grid_size', 40))
@@ -584,6 +624,7 @@ def build(ctx):
             duct_radius.value = r
             ax = np.asarray(d.get('axis', [0, 0, 1]), float)
             duct_axis.value = max(_DUCT_AXES, key=lambda k: abs(np.dot(_DUCT_AXES[k][0], ax)))
+            duct_rot.value = tuple(float(c) for c in (d.get('rotation_deg') or (0.0, 0.0, 0.0)))
             duct_mirror.value = bool(v.get('mirror_xz', False))
             th = v.get('theta_range', [-60, 60])
             duct_theta0.value = int(round((th[0] + th[1]) / 2 / 5) * 5)
@@ -786,6 +827,8 @@ def build(ctx):
                 'cam1_pitch': float(vio_cam1_pitch.value), 'cam1_yaw': float(vio_cam1_yaw.value),
                 'cam2_pitch': float(vio_cam2_pitch.value), 'cam2_yaw': float(vio_cam2_yaw.value),
                 'long_fov': float(vio_long_fov.value), 'landscape': bool(vio_landscape.value),
+                'geometry': 'room' if optim_vio_geometry.value == _VIO_GEOM_ROOM else 'wall',
+                'room_dist': float(optim_vio_room_dist.value), 'room_grid_size': int(optim_vio_room_grid.value),
                 'wall_dist': float(optim_vio_dist.value), 'wall_size': float(optim_vio_wall_size.value),
                 'grid_size': int(optim_vio_grid.value),
             }
