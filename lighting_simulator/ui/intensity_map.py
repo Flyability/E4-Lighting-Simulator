@@ -423,7 +423,7 @@ def build(ctx):
                 config['led_positions'] = translated_positions
                 config['led_rotations'] = rotated_directions
                 config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                config['led_beam_tilts'] = group.get('led_beam_tilts', [])
+                config['led_beam_tilts'] = group.get('led_beam_tilts') or []
                 if rotated_row_dirs:
                     config['led_row_directions'] = rotated_row_dirs
             if group.get('lumens_override') and group['lumens_override'].value:

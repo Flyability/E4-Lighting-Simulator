@@ -96,7 +96,7 @@ def group_config_to_factory(group_cfg, owner=None, row_enabled=None):
             'led_positions': positions,
             'led_rotations': directions,
             'led_viewing_angles': list(group_cfg.get('led_viewing_angles', [])),
-            'led_beam_tilts': list(group_cfg.get('led_beam_tilts', [])),
+            'led_beam_tilts': list(group_cfg.get('led_beam_tilts') or []),
             'led_sizes': list(group_cfg.get('led_sizes', [])),
             'led_lumens': list(group_cfg.get('led_lumens', [])),
         })

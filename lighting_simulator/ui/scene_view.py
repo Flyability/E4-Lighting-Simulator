@@ -709,6 +709,7 @@ def build(ctx):
         group['led_row_directions'] = rows
         group['original_led_row_directions'] = list(rows)
         group['led_euler_angles'] = [(led['rx'], led['ry'], led['rz']) for led in leds]
+        group['led_beam_tilts'] = [0.0] * len(leds)
         group['led_sizes'] = [led['size'] for led in leds]
         group['led_viewing_angles'] = [led['view_angle'] for led in leds]
         group['led_lumens'] = [led['lumens'] if led['custom_lumens'] else None for led in leds]

@@ -213,13 +213,13 @@ def _create_individual_leds(configs, viewing_angle, default_lumens, start_index)
 
 
 def _create_dynamic_group_leds(config, viewing_angle, default_lumens, start_index):
-    positions = config.get('led_positions', [])
-    rotations = config.get('led_rotations', [])
-    sizes = config.get('led_sizes', [])
-    viewing_angles = config.get('led_viewing_angles', [])
-    row_directions = config.get('led_row_directions', [])
-    beam_tilts = config.get('led_beam_tilts', [])
-    led_states = config.get('led_states', [])
+    positions = config.get('led_positions') or []
+    rotations = config.get('led_rotations') or []
+    sizes = config.get('led_sizes') or []
+    viewing_angles = config.get('led_viewing_angles') or []
+    row_directions = config.get('led_row_directions') or []
+    beam_tilts = config.get('led_beam_tilts') or []
+    led_states = config.get('led_states') or []
     leds = []
     color = (1.0, 0.0, 1.0)
 
