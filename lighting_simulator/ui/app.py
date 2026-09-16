@@ -83,6 +83,7 @@ from lighting_simulator.ui import panels as _panels
 from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
 from lighting_simulator.scene.absorbers import build_elios_absorbers, rotate_absorbers_z
 from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
+from lighting_simulator.scene.step_import import STEP_MM_TO_CM, is_step_file, load_step_mesh
 from lighting_simulator.scene.stl import (
     _rot4_x, _rot4_y, _rot4_z,
     global_z_rotation_4x4,
@@ -681,11 +682,14 @@ def main():
     stl_mesh_data = [None]  # Store loaded trimesh object
 
     with tab_advanced:
-        _stl_folder = server.gui.add_folder("3D Models (STL)")
+        _stl_folder = server.gui.add_folder("3D Models (STL / STEP)")
     with _stl_folder:
         server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Import 3D CAD models</div>")
-        stl_file_path = server.gui.add_text("STL File Path", initial_value=r"C:\Users\gianmatteo.marietti_\Downloads\109045 E3 CAGE ASSEMBLY_Coarse.STL")
-        stl_load_button = server.gui.add_button("📂 Load STL", color="#4CAF50")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:6px;'>"
+                            "STEP keeps the CAD units and origin (true size, scale 0.1 = mm→cm). "
+                            "STL has no units: it is centred and auto-fitted to 70 cm; set Scale to 0.1 for a mm export.</div>")
+        stl_file_path = server.gui.add_text("Model file path (.stl / .step)", initial_value=r"C:\Users\gianmatteo.marietti_\Downloads\109045 E3 CAGE ASSEMBLY_Coarse.STL")
+        stl_load_button = server.gui.add_button("📂 Load model", color="#4CAF50")
         stl_clear_button = server.gui.add_button("🗑️ Clear Model", color="#FF5555")
         
         server.gui.add_html("<hr style='margin:8px 0;'>")
@@ -744,7 +748,7 @@ def main():
             return os.path.join(cache_dir, f"{cache_hash}.npz")
 
         def load_stl_file():
-            """Load STL file and display in scene. Uses numpy binary cache for fast reloads."""
+            """Load an STL or STEP model into the scene. Uses a numpy binary cache for fast reloads."""
             file_path = stl_file_path.value.strip()
             if not file_path:
                 print("⚠️ Please enter a file path")
@@ -754,13 +758,14 @@ def main():
                 print(f"⚠️ File not found: {file_path}")
                 return
             
+            is_step = is_step_file(file_path)
             try:
                 t_start = time.perf_counter()
                 cache_path = _get_stl_cache_path(file_path)
                 
                 # Try loading from numpy binary cache first (10-50x faster)
                 if os.path.exists(cache_path):
-                    print(f"Loading STL from cache: {os.path.basename(file_path)}")
+                    print(f"Loading {'STEP' if is_step else 'STL'} from cache: {os.path.basename(file_path)}")
                     cached = np.load(cache_path)
                     mesh = trimesh.Trimesh(
                         vertices=cached['vertices'],
@@ -770,6 +775,16 @@ def main():
                     )
                     t_load = time.perf_counter()
                     print(f"  Cache loaded in {t_load - t_start:.2f}s")
+                elif is_step:
+                    print(f"Loading STEP file: {file_path} (tessellating, will cache)")
+                    mesh = load_step_mesh(file_path)
+                    t_load = time.perf_counter()
+                    print(f"  STEP tessellated in {t_load - t_start:.2f}s")
+                    try:
+                        np.savez(cache_path, vertices=mesh.vertices.astype(np.float32), faces=mesh.faces,
+                                 vertex_normals=mesh.vertex_normals.astype(np.float32))
+                    except Exception as ce:
+                        print(f"  Warning: could not save cache: {ce}")
                 else:
                     print(f"Loading STL file: {file_path} (first load, will cache)")
                     mesh = trimesh.load(file_path, force='mesh', process=False)
@@ -807,14 +822,20 @@ def main():
                 bounds = mesh.bounds
                 size = bounds[1] - bounds[0]
                 
-                # Auto-calculate ideal scale
-                target_size_cm = 70.0
-                max_dimension = np.max(size)
-                ideal_scale = 1.0
-                
-                if max_dimension > 0:
-                    ideal_scale = target_size_cm / max_dimension
+                if is_step:
+                    # STEP is unit-aware: OpenCascade delivers mm, and the modelled origin is kept
+                    ideal_scale = STEP_MM_TO_CM
                     stl_scale.value = ideal_scale
+                    units_note = "mm (from STEP)"
+                else:
+                    # STL has no units: fit the largest dimension to 70 cm as a starting point
+                    target_size_cm = 70.0
+                    max_dimension = np.max(size)
+                    ideal_scale = 1.0
+                    if max_dimension > 0:
+                        ideal_scale = target_size_cm / max_dimension
+                        stl_scale.value = ideal_scale
+                    units_note = "unknown (STL) — auto-fitted to 70 cm"
                 
                 # Update info
                 info_text = (
@@ -822,18 +843,18 @@ def main():
                     f"✓ Model loaded<br>"
                     f"Vertices: {num_vertices:,}<br>"
                     f"Faces: {num_faces:,}<br>"
-                    f"Original size: {size[0]:.1f} × {size[1]:.1f} × {size[2]:.1f}<br>"
+                    f"Original size: {size[0]:.1f} × {size[1]:.1f} × {size[2]:.1f} [{units_note}]<br>"
                     f"Scaled size: {size[0]*ideal_scale:.1f} × {size[1]*ideal_scale:.1f} × {size[2]*ideal_scale:.1f} cm"
                     f"</div>"
                 )
                 stl_info_html.content = info_text
                 
                 t_total = time.perf_counter() - t_start
-                print(f"✓ STL loaded: {num_vertices:,} vertices, {num_faces:,} faces ({t_total:.2f}s total)")
+                print(f"✓ {'STEP' if is_step else 'STL'} loaded: {num_vertices:,} vertices, {num_faces:,} faces ({t_total:.2f}s total)")
                 update_stl_mesh(skip_lighting=True)
                 
             except Exception as e:
-                print(f"❌ Error loading STL: {e}")
+                print(f"❌ Error loading model: {e}")
                 import traceback; traceback.print_exc()
                 stl_info_html.content = f"<div style='color:#FF5555;'>Error: {str(e)}</div>"
         

@@ -13,6 +13,10 @@ dependencies = [
     "trimesh>=4.0.0",
 ]
 
+[project.optional-dependencies]
+# STEP import (Advanced → 3D Models) and STEP panel export; pulls OpenCascade (~300 MB)
+step = ["cadquery>=2.4"]
+
 [dependency-groups]
 # Installed by default (tool.uv.default-groups) so `uv run`/`uv sync` always
 # provide GPU acceleration; raytracing/gpu.py falls back to CPU if no GPU.
