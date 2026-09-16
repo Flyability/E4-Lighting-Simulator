@@ -553,6 +553,7 @@ def main():
             "<span style='color:#2a2a2a;background:#555;'>■</span> dark grey = off &nbsp;"
             "<span style='color:#FFF21A;'>■</span> selected panel</div>"
         )
+        mode_lumens_html = server.gui.add_html("")
         show_intensity_map = server.gui.add_checkbox(
             "Show intensity on wall", initial_value=False
         )
@@ -607,7 +608,9 @@ def main():
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
         )
         led_lumens_slider = server.gui.add_slider(
-            "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=168
+            "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=168,
+            hint="Continuous flux used in the 'Flight' operating mode (VIO + Both LEDs). "
+                 "Panels / LEDs with a lumens override use their own value instead.",
         )
         server.gui.add_html("<hr style='margin:8px 0;'><b>Electrical (roles / flash):</b>")
         led_voltage_input = server.gui.add_number("LED forward voltage (V)", 6.0, min=1.0, max=60.0, step=0.1)
@@ -616,6 +619,22 @@ def main():
             "Flash current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1,
             hint="Used by the 'Flash (pulse)' operating mode: lm = I · V · efficacy for Flash / Both LEDs",
         )
+
+        def _refresh_mode_lumens_html(_=None):
+            v, eff, i_fl = float(led_voltage_input.value), float(led_efficacy_input.value), float(flash_current_input.value)
+            lm_cont = float(led_lumens_slider.value)
+            i_cont = lm_cont / (v * eff) if v * eff > 0 else 0.0
+            mode_lumens_html.content = (
+                "<div style='font-size:11px;color:#bbb;margin:-2px 0 6px;line-height:1.5;'>"
+                f"<b>Flight</b> (VIO + Both): <b>{lm_cont:,.0f} lm</b>/LED ≈ {i_cont:.2f} A continuous "
+                "<span style='color:#888;'>(Display → LED lumens; panel / LED overrides win)</span><br>"
+                f"<b>Flash</b> (Flash + Both): <b>{flash_lumens():,.0f} lm</b>/LED = {i_fl:g} A × {v:g} V × {eff:g} lm/W "
+                "<span style='color:#888;'>(Display → Electrical); VIO LEDs stay at their flight flux</span></div>"
+            )
+
+        for _h in (led_lumens_slider, led_voltage_input, led_efficacy_input, flash_current_input):
+            _h.on_update(_refresh_mode_lumens_html)
+        _refresh_mode_lumens_html()
         
         server.gui.add_html("<hr style='margin:8px 0;'><b>Diffuser Lens:</b>")
         server.gui.add_html(
@@ -2068,6 +2087,7 @@ def main():
         absorber_handles=absorber_handles,
         absorbers_enable=absorbers_enable,
         apply_view_mode=apply_view_mode,
+        flash_lumens=flash_lumens,
         camera_fov_h=camera_fov_h,
         camera_fov_handles=camera_fov_handles,
         camera_fov_v=camera_fov_v,

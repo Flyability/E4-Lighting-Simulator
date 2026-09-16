@@ -65,6 +65,7 @@ def build(ctx):
     absorber_handles = ctx.absorber_handles
     absorbers_enable = ctx.absorbers_enable
     apply_view_mode = ctx.apply_view_mode
+    flash_lumens = ctx.flash_lumens
     camera_fov_h = ctx.camera_fov_h
     camera_fov_handles = ctx.camera_fov_handles
     camera_fov_v = ctx.camera_fov_v
@@ -322,6 +323,16 @@ def build(ctx):
             f"{n_on} on: <span style='color:{_ROLE_COLORS['vio']};'>■ VIO {counts['vio']}</span> &nbsp;"
             f"<span style='color:{_ROLE_COLORS['flash']};'>■ Flash {counts['flash']}</span> &nbsp;"
             f"<span style='color:{_ROLE_COLORS['both']};'>■ Both {counts['both']}</span></div>"
+        ))
+        _ovr = group.get('lumens_override')
+        if _ovr is not None and _ovr.value:
+            _cont_lm, _cont_src = float(group['lumens_value'].value), "panel override"
+        else:
+            _cont_lm, _cont_src = float(led_lumens_slider.value), "Display → LED lumens"
+        _inspector_add(server.gui.add_html(
+            "<div style='font-size:11px;color:#bbb;margin:-2px 0 6px;'>"
+            f"Flight flux <b>{_cont_lm:,.0f} lm</b>/LED ({_cont_src}) · "
+            f"Flash flux <b>{flash_lumens():,.0f} lm</b>/LED (Display → Electrical)</div>"
         ))
         all_btn = _inspector_add(server.gui.add_button(
             "ALL LEDs", color="#BBBBBB" if any(led_states_g) else "#666666"
