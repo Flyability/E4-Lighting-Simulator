@@ -55,6 +55,37 @@ def test_duct_ring_arc_generates_lattice_and_mirror():
     assert len(scene.active_leds) == 10
 
 
+def test_duct_ring_variable_counts_keep_per_led_variables_in_place():
+    """role[i] must address the same lattice cell whether the lattice is 3x5 or 2x3."""
+    var = DuctRingLayout(name="d", duct=Duct(radius=7), n_leds=15, n_rows=3, n_rows_range=(1, 3), n_cols_range=(1, 5),
+                         optimize_enabled=True, optimize_roles=True, tilt_axial_range=None)
+    assert not var.optimize_enabled  # counts are variables -> on/off dropped
+    assert not var.roles_allow_off
+    role_idx = [i for i, n in enumerate(var.names) if '.role[' in n]
+    assert len(role_idx) == 15 and all(var.bounds[i] == (1.0, 3.0) for i in role_idx)
+    x = list(var.x0)
+    x[role_idx[7]] = 1   # centre of the 3x5 max lattice (row 1, col 2) -> vio
+    x[role_idx[10]] = 2  # row 2, col 0 -> flash
+
+    cfg = {'custom_groups': []}
+    var.apply(x, cfg)
+    g = cfg['custom_groups'][0]
+    assert g['num_leds'] == 15 and g['led_roles'][7] == 'vio' and g['led_roles'][10] == 'flash'
+    assert all(g['led_states'])
+
+    x[0], x[1] = 3, 3  # shrink to 3x3: centred sub-block, columns 1..3 of the max lattice
+    cfg = {'custom_groups': []}
+    var.apply(x, cfg)
+    g = cfg['custom_groups'][0]
+    assert g['num_leds'] == 9 and g['led_rows'] == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    assert g['led_roles'][4] == 'vio'          # row 1, centre column is still the vio LED
+    assert 'flash' not in g['led_roles']       # row 2 col 0 of the max lattice was trimmed away
+    assert all(g['led_states'])
+
+    fixed = DuctRingLayout(name="f", duct=Duct(radius=7), n_leds=6, n_rows=2, optimize_roles=True, tilt_axial_range=None)
+    assert fixed.roles_allow_off and all(fixed.bounds[i] == (0.0, 3.0) for i, n in enumerate(fixed.names) if '.role[' in n)
+
+
 def test_panel_pose_and_led_states_modify_base_groups():
     cfg = load_config("configs/Elios3.json")
     pose = PanelPose(group_index=0, pos_delta=(1, 0, 1), rot_delta=(0, 0, 5))

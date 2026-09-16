@@ -257,9 +257,11 @@ def build(ctx):
                                                 initial_value=(90, 130))
         duct_current = server.gui.add_multi_slider("Drive current range (A)", min=0.1, max=13.0, step=0.1,
                                                    initial_value=(0.3, 3.0))
-        duct_on_off = server.gui.add_checkbox("Optimise per-LED on/off", initial_value=False)
+        duct_on_off = server.gui.add_checkbox("Optimise per-LED on/off", initial_value=False,
+                                              hint="Only when the row / column count is fixed: the counts already decide how many LEDs exist")
         duct_roles = server.gui.add_checkbox("Optimise LED roles (VIO / flash / both)", initial_value=False,
-                                             hint="Needs flash mode enabled below; replaces on/off")
+                                             hint="Needs flash mode enabled below; replaces on/off. With variable row / column counts "
+                                                  "every LED keeps a role (no 'off'); with fixed counts a role may also be 'off'.")
         duct_led_size = server.gui.add_number("LED size (cm)", 1.0, min=0.2, max=3.0, step=0.1)
 
     _DUCT_AXES = {"Z (vertical)": ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
@@ -487,6 +489,12 @@ def build(ctx):
 
     optim_flash_enable.on_update(_optim_flash_changed)
     _optim_flash_changed()
+
+    def _duct_var_counts_changed(_=None):
+        duct_on_off.visible = not bool(duct_var_counts.value)
+
+    duct_var_counts.on_update(_duct_var_counts_changed)
+    _duct_var_counts_changed()
 
     optim_vio_geometry.on_update(_optim_vio_geometry_changed)
     _optim_vio_geometry_changed()

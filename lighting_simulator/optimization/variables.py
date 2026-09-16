@@ -139,8 +139,12 @@ class DuctRingLayout(VariableGroup):
     shared_beam_angle: bool = True
     default_beam_angle: float = 120.0
     optimize_enabled: bool = False
+    """Per-LED on/off. Ignored when the row/column counts are variables (the counts already set
+    how many LEDs there are; a second knob for the same thing only confuses the search)."""
     optimize_roles: bool = False
-    """Per-LED role variable (0 off, 1 vio, 2 flash, 3 both); supersedes ``optimize_enabled``."""
+    """Per-LED role variable (1 vio, 2 flash, 3 both; 0 = off when ``roles_allow_off``); supersedes ``optimize_enabled``."""
+    roles_allow_off: bool | None = None
+    """Whether the role variable may switch an LED off. Default: only when the counts are fixed."""
     default_role: str = "both"
     current_range: tuple | None = None
     """Shared drive current (A); converted to lumens with ``driver``."""
@@ -168,6 +172,12 @@ class DuctRingLayout(VariableGroup):
             self._count_bounds = ((r_lo, r_hi), (c_lo, c_hi))
         if self.placement == "arc" and self.n_leds % self.n_rows:
             raise ValueError(f"{self.name}: n_leds={self.n_leds} not divisible by n_rows={self.n_rows}")
+        if self._variable_counts and self.optimize_enabled:
+            if not self.optimize_roles:
+                print(f"[optim] {self.name}: per-LED on/off ignored because the row/column counts are optimised")
+            self.optimize_enabled = False
+        if self.roles_allow_off is None:
+            self.roles_allow_off = not self._variable_counts
 
         if self.placement == "free":
             for i in range(self.n_leds):
@@ -215,8 +225,9 @@ class DuctRingLayout(VariableGroup):
                 self._add(f"beam[{i}]" if n_beam > 1 else "beam", *self.beam_angle_range,
                           x0=min(max(self.default_beam_angle, self.beam_angle_range[0]), self.beam_angle_range[1]))
         if self.optimize_roles:
+            lo = 0 if self.roles_allow_off else 1
             for i in range(self.n_leds):
-                self._add(f"role[{i}]", 0, 3, integer=True, x0=ROLE_CODES.get(self.default_role, 3))
+                self._add(f"role[{i}]", lo, 3, integer=True, x0=max(lo, ROLE_CODES.get(self.default_role, 3)))
         elif self.optimize_enabled:
             for i in range(self.n_leds):
                 self._add(f"on[{i}]", 0, 1, integer=True, x0=1)
@@ -230,6 +241,25 @@ class DuctRingLayout(VariableGroup):
         self.bounds.append((float(lo), float(hi)))
         self.integrality.append(integer)
         self.x0.append(float((lo + hi) / 2 if x0 is None else x0))
+
+    def _per_led_slots(self, rows):
+        """Index into the per-LED variable arrays for each generated LED.
+
+        The arrays are sized for the maximum lattice; a smaller ``n_rows x n_cols`` lattice
+        reads the centred sub-block so each variable keeps its lattice position when the
+        counts change (a flat ``[:n_out]`` slice would shift every row).
+        """
+        n_out = sum(len(m) for m in rows)
+        if self.placement != "arc":
+            return list(range(n_out))
+        r_hi, c_hi = self.n_rows, self.n_leds // self.n_rows
+        n_rows, n_cols = len(rows), (len(rows[0]) if rows else 0)
+        r0, c0 = (r_hi - n_rows) // 2, (c_hi - n_cols) // 2
+        slots = [0] * n_out
+        for r, members in enumerate(rows):
+            for c, i in enumerate(members):
+                slots[i] = (r0 + r) * c_hi + (c0 + c)
+        return slots
 
     def _layout(self, x):
         """Return per-LED (theta, axial) and row membership."""
@@ -288,11 +318,14 @@ class DuctRingLayout(VariableGroup):
             beams = [self.default_beam_angle]
         if self.optimize_roles:
             codes = [int(round(next(it))) for _ in range(self.n_leds)]
-            states = [c != 0 for c in codes]
-            roles = [CODE_ROLES.get(c, self.default_role) if c else self.default_role for c in codes]
+            all_states = [c != 0 for c in codes]
+            all_roles = [CODE_ROLES.get(c, self.default_role) if c else self.default_role for c in codes]
         else:
-            states = [bool(round(next(it))) for _ in range(self.n_leds)] if self.optimize_enabled else [True] * self.n_leds
-            roles = [self.default_role] * self.n_leds
+            all_states = [bool(round(next(it))) for _ in range(self.n_leds)] if self.optimize_enabled else [True] * self.n_leds
+            all_roles = [self.default_role] * self.n_leds
+        slots = self._per_led_slots(rows)
+        states = [all_states[s] for s in slots]
+        roles = [all_roles[s] for s in slots]
         current_a = float(next(it)) if self.current_range is not None else None
 
         positions, directions, row_dirs = [], [], []
@@ -320,8 +353,8 @@ class DuctRingLayout(VariableGroup):
             'led_sizes': [self.led_size] * n_out,
             'led_viewing_angles': [float(beams[i if len(beams) > 1 else 0]) for i in range(n_out)],
             'led_beam_tilts': [0.0] * n_out,
-            'led_states': states[:n_out],
-            'led_roles': roles[:n_out],
+            'led_states': states,
+            'led_roles': roles,
             'led_rows': rows,
             'led_euler_angles': [],
             'led_lumens': [],
