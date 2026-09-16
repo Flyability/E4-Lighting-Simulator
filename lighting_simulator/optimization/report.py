@@ -514,7 +514,8 @@ def _page_heatmaps(pdf, problem, designs):
         cols.append((f"VIO wall {problem.vio.wall_dist:g} cm", problem.vio.wall_size, "vio"))
     n_cols = len(cols)
     fig = Figure(figsize=A4, dpi=110)
-    fig.suptitle("Wall illuminance — initial vs. best designs", fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
+    fig.suptitle("Wall illuminance — initial vs. best designs" + (" (flight mode)" if problem.flash_modes else ""),
+                 fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
     axs = np.atleast_2d(fig.subplots(n_rows, n_cols, squeeze=False))
     fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.10, hspace=0.35, wspace=0.35)
 
@@ -574,10 +575,72 @@ def _page_heatmaps(pdf, problem, designs):
     pdf.savefig(fig)
 
 
+def _page_flash_heatmaps(pdf, problem, designs):
+    """One page per wall: flight (continuous LEDs) next to flash (pulse) illuminance for every design."""
+    labels = list(designs.keys())
+    if not problem.flash_modes or not any(designs[l][1].flash_grid is not None for l in labels):
+        return
+    flash_mode = problem.flash_modes[0]
+    pct = problem.objective.min_percentile
+
+    def _grid(ev, attr, wi):
+        g = getattr(ev, attr)
+        if g is None:
+            return None
+        return g[wi] if isinstance(g, list) else (g if wi == 0 else None)
+
+    for wi, wl in enumerate(problem.walls):
+        fig = Figure(figsize=A4, dpi=110)
+        fig.suptitle(f"Flight vs. flash illuminance — wall {wl.wall_dist:g} cm", fontsize=15, weight="bold",
+                     x=MARGIN, ha="left", y=0.965)
+        axs = np.atleast_2d(fig.subplots(len(labels), 2, squeeze=False))
+        fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.10, hspace=0.35, wspace=0.3)
+        half = wl.wall_size / 2
+        cols = [("flight — VIO + Both LEDs, continuous current", "grid"),
+                (f"flash — Flash + Both LEDs at {flash_mode.current_a:g} A (+ VIO continuous)", "flash_grid")]
+        for j, (title, attr) in enumerate(cols):
+            grids = [_grid(designs[l][1], attr, wi) for l in labels]
+            vmax = max([float(np.nanmax(g)) for g in grids if g is not None] + [1e-9])
+            im = None
+            for i, l in enumerate(labels):
+                ax = axs[i, j]
+                g = grids[i]
+                if g is None:
+                    ax.axis("off"); continue
+                im = ax.imshow(g, origin="lower", extent=[-half, half, -half, half], cmap="inferno", vmin=0, vmax=vmax,
+                               aspect="equal")
+                ax.add_patch(_fov_polygon(problem, wl.wall_dist))
+                fov = g[problem._fov_masks[wi]]
+                lit = fov[fov > 0]
+                if lit.size:
+                    e_min = np.percentile(lit, pct) if pct > 0 else lit.min()
+                    sub = f"U0 {e_min / lit.mean() * 100:.0f} % (P{pct:g})  ·  E_avg {lit.mean():,.0f} lx"
+                else:
+                    sub = "unlit"
+                el = designs[l][1].electrical
+                n = (el.get('n_vio', 0) + el.get('n_both', 0)) if attr == "grid" else (el.get('n_flash', 0) + el.get('n_both', 0))
+                ax.invert_xaxis()
+                ax.set_title((title + "\n" if i == 0 else "") + f"{sub}  ·  {n} LEDs lit", fontsize=7)
+                ax.tick_params(labelsize=6)
+                if i == len(labels) - 1:
+                    ax.set_xlabel("Y (cm)", fontsize=7)
+                if j == 0:
+                    ax.set_ylabel(f"{l}\nZ (cm)", fontsize=8, weight="bold")
+            if im is not None:
+                cb = fig.colorbar(im, ax=axs[:, j].tolist(), orientation="horizontal", fraction=0.025, pad=0.06)
+                cb.ax.tick_params(labelsize=6); cb.set_label("lux", fontsize=7)
+        fig.text(MARGIN, 0.02, "Each column has its own colour scale (the flash image is typically 10–100× brighter). "
+                 "Dashed white: main-camera FOV footprint.", fontsize=7.5, color="#444")
+        pdf.savefig(fig)
+
+
 def _page_layouts(pdf, problem, designs):
     labels = list(designs.keys())
+    roles_on = bool(problem.flash_modes)
+    role_color = {'vio': "#1e88e5", 'flash': "#fb8c00", 'both': "#8e24aa"}
     fig = Figure(figsize=A4, dpi=110)
-    fig.suptitle("LED layouts (active LEDs, arrows = beam axis)", fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
+    fig.suptitle("LED layouts (active LEDs, arrows = beam axis" + (", colour = role)" if roles_on else ")"),
+                 fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
     axs = np.atleast_2d(fig.subplots(len(labels), 2, squeeze=False))
     fig.subplots_adjust(left=0.09, right=0.97, top=0.91, bottom=0.05, hspace=0.45, wspace=0.3)
     all_pos = []
@@ -600,12 +663,21 @@ def _page_layouts(pdf, problem, designs):
         for j, (a, b, name_a, name_b) in enumerate([(0, 1, "X (cm)", "Y (cm)"), (1, 2, "Y (cm)", "Z (cm)")]):
             ax = axs[i, j]
             if len(pos):
-                sc = ax.scatter(pos[:, a], pos[:, b], c=lum, cmap="viridis", s=28, edgecolor="k", lw=0.4, zorder=3)
+                if roles_on:
+                    from lighting_simulator.domain.led import led_role
+                    colors = [role_color[led_role(led)] for led in leds]
+                    ax.scatter(pos[:, a], pos[:, b], c=colors, s=28, edgecolor="k", lw=0.4, zorder=3)
+                    if i == 0 and j == 1:
+                        from matplotlib.lines import Line2D
+                        ax.legend(handles=[Line2D([], [], marker='o', ls='', color=c, label=r) for r, c in role_color.items()],
+                                  fontsize=6, loc="upper right")
+                else:
+                    sc = ax.scatter(pos[:, a], pos[:, b], c=lum, cmap="viridis", s=28, edgecolor="k", lw=0.4, zorder=3)
+                    if i == 0 and j == 1:
+                        cb = fig.colorbar(sc, ax=axs[:, 1].tolist(), fraction=0.03, pad=0.03); cb.set_label("lm / LED", fontsize=7)
+                        cb.ax.tick_params(labelsize=6)
                 ax.quiver(pos[:, a], pos[:, b], dirs[:, a], dirs[:, b], angles="xy", scale_units="xy", scale=0.35,
                           color="#c62828", width=0.005, zorder=2)
-                if i == 0 and j == 1:
-                    cb = fig.colorbar(sc, ax=axs[:, 1].tolist(), fraction=0.03, pad=0.03); cb.set_label("lm / LED", fontsize=7)
-                    cb.ax.tick_params(labelsize=6)
             ax.set_xlim(lo[a], hi[a]); ax.set_ylim(lo[b], hi[b]); ax.set_aspect("equal")
             if j == 1:
                 ax.invert_xaxis()
@@ -751,6 +823,7 @@ def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=F
         w.close()
         _page_convergence(pdf, problem, records, designs)
         _page_heatmaps(pdf, problem, designs)
+        _page_flash_heatmaps(pdf, problem, designs)
         _page_layouts(pdf, problem, designs)
         _page_variable_bounds(pdf, problem, designs)
         _page_variable_history(pdf, problem, records, designs)
