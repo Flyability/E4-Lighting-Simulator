@@ -131,6 +131,10 @@ class DuctRingLayout(VariableGroup):
     tilt_axial_range: tuple | None = (-30.0, 30.0)
     tilt_tangential_range: tuple | None = None
     shared_tilt: bool = True
+    symmetric_tilt: bool = False
+    """Axial tilt mirrored about the panel's middle row: one variable per row pair (outer → inner);
+    the top row of a pair looks +t along the duct axis, the bottom row −t, a middle row stays at 0.
+    Overrides ``shared_tilt`` for the axial tilt."""
     beam_angle_range: tuple | None = None
     shared_beam_angle: bool = True
     default_beam_angle: float = 120.0
@@ -192,9 +196,16 @@ class DuctRingLayout(VariableGroup):
                     self._center_axes.append("xyz".index(axis))
                     self._add(f"dc{axis}", -float(d), float(d), x0=0.0)
         n_tilt = 1 if self.shared_tilt else self.n_leds
+        self._n_tilt_pairs = (self.n_rows + 1) // 2 if self.symmetric_tilt else 0
         if self.tilt_axial_range is not None:
-            for i in range(n_tilt):
-                self._add(f"tilt_axial[{i}]" if n_tilt > 1 else "tilt_axial", *self.tilt_axial_range, x0=0.0)
+            if self.symmetric_tilt:
+                lo, hi = self.tilt_axial_range
+                lo, hi = min(abs(lo), abs(hi)) if lo * hi > 0 else 0.0, max(abs(lo), abs(hi))
+                for k in range(self._n_tilt_pairs):
+                    self._add(f"tilt_axial_pair[{k}]" if self._n_tilt_pairs > 1 else "tilt_axial_pair", lo, hi, x0=lo)
+            else:
+                for i in range(n_tilt):
+                    self._add(f"tilt_axial[{i}]" if n_tilt > 1 else "tilt_axial", *self.tilt_axial_range, x0=0.0)
         if self.tilt_tangential_range is not None:
             for i in range(n_tilt):
                 self._add(f"tilt_tan[{i}]" if n_tilt > 1 else "tilt_tan", *self.tilt_tangential_range, x0=0.0)
@@ -256,7 +267,20 @@ class DuctRingLayout(VariableGroup):
         for ax in self._center_axes:
             center_offset[ax] = next(it)
         n_tilt = 1 if self.shared_tilt else self.n_leds
-        tilt_ax = [next(it) for _ in range(n_tilt)] if self.tilt_axial_range is not None else [0.0]
+        if self.tilt_axial_range is not None and self.symmetric_tilt:
+            pair_tilt = [next(it) for _ in range(self._n_tilt_pairs)]
+            n_rows = len(rows)
+            tilt_ax = [0.0] * n_out
+            for r, members in enumerate(rows):
+                side = (r - (n_rows - 1) / 2.0)  # < 0 bottom half, > 0 top half, 0 middle row
+                sign = 0.0 if abs(side) < 1e-9 else (1.0 if side > 0 else -1.0)
+                t = sign * pair_tilt[min(r, n_rows - 1 - r)]
+                for i in members:
+                    tilt_ax[i] = t
+        elif self.tilt_axial_range is not None:
+            tilt_ax = [next(it) for _ in range(n_tilt)]
+        else:
+            tilt_ax = [0.0]
         tilt_tan = [next(it) for _ in range(n_tilt)] if self.tilt_tangential_range is not None else [0.0]
         if self.beam_angle_range is not None:
             beams = [next(it) for _ in range(1 if self.shared_beam_angle else self.n_leds)]

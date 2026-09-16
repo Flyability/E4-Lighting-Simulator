@@ -248,6 +248,11 @@ def build(ctx):
                                                     initial_value=(0.8, 2.0))
         duct_tilt = server.gui.add_slider("± beam tilt toward axis (°)", min=0, max=90, step=5, initial_value=60)
         duct_tilt_shared = server.gui.add_checkbox("Shared tilt for all LEDs", initial_value=False)
+        duct_tilt_symmetric = server.gui.add_checkbox(
+            "Mirror tilt top / bottom", initial_value=False,
+            hint="Arc grid: rows above the panel middle look up by +t, rows below look down by −t "
+                 "(one tilt per row pair, middle row straight). Overrides 'Shared tilt'.",
+        )
         duct_beam = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
                                                 initial_value=(90, 130))
         duct_current = server.gui.add_multi_slider("Drive current range (A)", min=0.1, max=13.0, step=0.1,
@@ -296,6 +301,7 @@ def build(ctx):
             'radial_range': [-float(duct_tol_radius.value), float(duct_tol_radius.value)],
             'tilt_axial_range': [-t, t] if t > 0 else None,
             'shared_tilt': bool(duct_tilt_shared.value),
+            'symmetric_tilt': bool(duct_tilt_symmetric.value),
             'beam_angle_range': [float(v) for v in duct_beam.value], 'shared_beam_angle': True,
             'current_range': [float(v) for v in duct_current.value],
             'optimize_enabled': bool(duct_on_off.value),
@@ -724,6 +730,7 @@ def build(ctx):
             tilt = v.get('tilt_axial_range')
             duct_tilt.value = int(max(abs(tilt[0]), abs(tilt[1]))) if tilt else 0
             duct_tilt_shared.value = bool(v.get('shared_tilt', True))
+            duct_tilt_symmetric.value = bool(v.get('symmetric_tilt', False))
             duct_beam.value = tuple(float(b) for b in v.get('beam_angle_range', (90, 130)))
             duct_current.value = tuple(float(c) for c in v.get('current_range', (0.3, 3.0)))
             duct_on_off.value = bool(v.get('optimize_enabled', False))

@@ -131,6 +131,7 @@ assert find("Design mode").value == MODE_DUCTS
 # --- mode 2: ducts -----------------------------------------------------------
 find("± duct centre shift (cm)").value = (2.0, 2.0, 0.0)
 find("Optimise LED roles (VIO / flash / both)").value = True
+find("Mirror tilt top / bottom").value = True
 find("Optimise for").value = "Flash image only"
 find("Max evaluations").value = 30
 find("Method").value = "random_search"
