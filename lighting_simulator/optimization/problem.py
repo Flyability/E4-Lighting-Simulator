@@ -47,10 +47,14 @@ class CameraSpec:
         trap = camera_fov_wall_trapezoid(wall_dist - self.pos_x, self.pitch + pitch_offset, self.fov_h, self.fov_v)
         return (*trap, self.pos_y)
 
-    def fit_wall_size(self, wall_dist, margin=1.15, step=10.0):
-        """Smallest centred square wall (cm) containing the footprint at ``wall_dist`` × ``margin``."""
-        z_bot, z_top, w_bot, w_top, y_c = self.trapezoid(wall_dist)
-        extent = max(abs(z_bot), abs(z_top), abs(y_c) + max(w_bot, w_top))
+    def fit_wall_size(self, wall_dist, margin=1.15, step=10.0, pitch_offsets=(0.0,)):
+        """Smallest centred square wall (cm) containing the footprint(s) at ``wall_dist`` × ``margin``.
+
+        ``pitch_offsets`` lists extra camera pitches to include (e.g. ``(0, +45, -45)`` for the tilt FOVs)."""
+        extent = 0.0
+        for off in pitch_offsets:
+            z_bot, z_top, w_bot, w_top, y_c = self.trapezoid(wall_dist, off)
+            extent = max(extent, abs(z_bot), abs(z_top), abs(y_c) + max(w_bot, w_top))
         size = 2.0 * extent * float(margin)
         return float(max(step, np.ceil(size / step) * step))
 
@@ -281,8 +285,13 @@ class Problem:
         self.objective = objective or ObjectiveSpec()
         self.constraints = constraints or ConstraintSpec()
         dists = [float(d) for d in (wall_dists or [wall.wall_dist])]
+        t = self.objective.tilt_fov_deg
         if isinstance(wall_sizes, str) and wall_sizes == "auto":
-            sizes = [camera.fit_wall_size(d) for d in dists]
+            offs = (0.0, float(t), -float(t)) if t else (0.0,)
+            sizes = [camera.fit_wall_size(d, pitch_offsets=offs) for d in dists]
+            if t:
+                print("[optim] auto wall sizes include the ±%g° tilt footprints: %s cm (cell %s cm)" % (
+                    t, ", ".join(f"{s:g}" for s in sizes), ", ".join(f"{s / wall.grid_size:.1f}" for s in sizes)))
         elif wall_sizes is None:
             sizes = [float(wall.wall_size)] * len(dists)
         else:
@@ -298,7 +307,6 @@ class Problem:
             for w in self.walls
         ]
         # Same camera pitched up / down: (mask_up, mask_down) per wall, or None
-        t = self.objective.tilt_fov_deg
         self._tilt_masks = [
             tuple(trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist, s * t))
                   for s in (+1.0, -1.0))

@@ -61,6 +61,17 @@ def trapezoid_mask(grid_shape, wall_size_cm, fov_trapezoid):
     return in_z[:, None] & (np.abs(y_centers - y_center)[None, :] <= half_w_at_z[:, None])
 
 
+def trapezoid_visible_fraction(grid_shape, wall_size_cm, fov_trapezoid):
+    """Share (0–1) of the footprint area that lies on the wall, i.e. inside the grid."""
+    z_bot, z_top, w_bot, w_top, _ = fov_trapezoid
+    area = (w_bot + w_top) * max(z_top - z_bot, 0.0)
+    if area <= 0:
+        return 1.0
+    cell_cm = wall_size_cm / grid_shape[1]
+    on_wall = np.count_nonzero(trapezoid_mask(grid_shape, wall_size_cm, fov_trapezoid)) * cell_cm ** 2
+    return float(min(1.0, on_wall / area))
+
+
 def crop_to_fov_rect(grid, wall_size_cm, fov_w_cm, fov_h_cm):
     """Sub-grid inside a centred ``fov_w × fov_h`` rectangle."""
     gz, gy = grid.shape

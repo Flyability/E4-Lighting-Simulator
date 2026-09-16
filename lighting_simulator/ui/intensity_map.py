@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import time as _time
 import numpy as np
 import trimesh
-from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
+from lighting_simulator.analysis.uniformity import (
+    compute_uniformity_html as _compute_uniformity_html, trapezoid_visible_fraction as _trapezoid_visible_fraction,
+)
 from lighting_simulator.camera.fov import (
     camera_fov_wall_trapezoid as _camera_fov_wall_trapezoid, points_in_fisheye_fov, points_in_pinhole_fov,
     vio_hfov_vfov_deg,
@@ -360,12 +362,16 @@ def build(ctx):
         if not html:
             html = _empty_fov_html()
         for title, pitch in _tilt_fov_pitches():
-            trap = _camera_fov_wall_trapezoid(wall_dist - camera_pos_x.value, pitch,
-                                              camera_fov_h.value, camera_fov_v.value)
+            trap = (*_camera_fov_wall_trapezoid(wall_dist - camera_pos_x.value, pitch,
+                                                camera_fov_h.value, camera_fov_v.value), camera_pos_y.value)
             html += _compute_uniformity_html(
-                grid, fov_trapezoid=(*trap, camera_pos_y.value), wall_size_cm=wall_size_cm,
+                grid, fov_trapezoid=trap, wall_size_cm=wall_size_cm,
                 min_percentile=float(uniformity_percentile_slider.value), title=title, compact=True,
             ) or _empty_fov_html(title)
+            visible = _trapezoid_visible_fraction(np.asarray(grid).shape, wall_size_cm, trap)
+            if visible < 0.97:
+                html += (f"<div style='color:#F0AD4E;font-size:11px;margin:-4px 0 4px 8px;'>⚠ {100 * (1 - visible):.0f}% "
+                         f"of this footprint is off the wall — enlarge 'Wall view size' or use Room Mode.</div>")
         return html + _compute_vio_occupancy_html()
 
     def _room_metrics_html():
