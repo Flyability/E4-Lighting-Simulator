@@ -648,8 +648,8 @@
                 0,
                 0
             ],
-            "lumens_override_enabled": false,
-            "lumens_value": 100
+            "lumens_override_enabled": true,
+            "lumens_value": 13000
         }
     ],
     "individual_leds": [],
