@@ -31,6 +31,7 @@ import webbrowser as _wb
 import socket as _socket
 
 from lighting_simulator.domain.led_factory import create_leds
+from lighting_simulator.domain.led import apply_operating_mode
 from lighting_simulator.domain.geometry import as_vec3 as _as_vec3
 from lighting_simulator.domain.optics import effective_lambertian_exponent as _get_effective_n
 from lighting_simulator.domain.guides import (
@@ -91,6 +92,9 @@ from lighting_simulator.scene.stl import (
 
 # Suppress viser warnings about removing already-removed nodes
 warnings.filterwarnings("ignore", message="Attempted to remove already removed node")
+
+_VIEW_FLIGHT = "Flight (continuous)"
+_VIEW_FLASH = "Flash (pulse)"
 
 
 def _json_default(o):
@@ -267,6 +271,14 @@ def main():
     def select_panel(owner):
         _select_panel_impl[0](owner)
 
+    def flash_lumens():
+        return float(flash_current_input.value) * float(led_voltage_input.value) * float(led_efficacy_input.value)
+
+    def apply_view_mode(leds):
+        """Apply the selected operating mode (LED roles) to freshly built LEDs, in place."""
+        flash = view_mode_dropdown.value == _VIEW_FLASH
+        return apply_operating_mode(leds, flash, flash_lumens() if flash else None)
+
     def save_custom_group_template(name, groups_list, individual_leds_list):
         """Save all custom groups and individual LEDs as a reusable template."""
         path = os.path.join(custom_groups_templates_dir, f"{name.lower().replace(' ', '_')}.json")
@@ -385,7 +397,8 @@ def main():
                             'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
                             'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
                             'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                            'led_states': group['led_states'][:]
+                            'led_states': group['led_states'][:],
+                            'led_roles': list(group.get('led_roles') or ['both'] * len(group['led_states'])),
                         }
                         # Save dynamic group properties if present
                         if group.get('is_dynamic', False):
@@ -425,6 +438,7 @@ def main():
                             'viewing_angle': led['viewing_angle'].value,
                             'square_roll': led['square_roll'].value,
                             'beam_tilt': led['beam_tilt'].value,
+                            'role': led.get('role', 'both'),
                             'lumens_override_enabled': led.get('lumens_override') and led['lumens_override'].value,
                             'lumens_value': led['lumens_value'].value if led.get('lumens_value') else 100,
                         })
@@ -523,6 +537,12 @@ def main():
 
     with quick_tab:
         update_intensity_button = server.gui.add_button("Update Intensity Map")
+        view_mode_dropdown = server.gui.add_dropdown(
+            "Operating mode", options=[_VIEW_FLIGHT, _VIEW_FLASH], initial_value=_VIEW_FLIGHT,
+            hint="Flight: VIO + Both LEDs at their continuous flux, Flash-only LEDs off. "
+                 "Flash: Flash + Both LEDs at the flash current (Display tab), VIO LEDs continuous. "
+                 "Set roles per LED in the Selected panel or the Panel Designer.",
+        )
         show_intensity_map = server.gui.add_checkbox(
             "Show intensity on wall", initial_value=False
         )
@@ -578,6 +598,13 @@ def main():
         )
         led_lumens_slider = server.gui.add_slider(
             "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=168
+        )
+        server.gui.add_html("<hr style='margin:8px 0;'><b>Electrical (roles / flash):</b>")
+        led_voltage_input = server.gui.add_number("LED forward voltage (V)", 6.0, min=1.0, max=60.0, step=0.1)
+        led_efficacy_input = server.gui.add_number("Efficacy (lm/W)", 180.0, min=10.0, max=400.0, step=5.0)
+        flash_current_input = server.gui.add_number(
+            "Flash current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1,
+            hint="Used by the 'Flash (pulse)' operating mode: lm = I · V · efficacy for Flash / Both LEDs",
         )
         
         server.gui.add_html("<hr style='margin:8px 0;'><b>Diffuser Lens:</b>")
@@ -1709,6 +1736,7 @@ def main():
         _absorber_config=_absorber_config,
         _expand_mirror_configs=_expand_mirror_configs,
         _panel_slot_data=_panel_slot_data,
+        apply_view_mode=apply_view_mode,
         bw_scale_chk=bw_scale_chk,
         calibration_factor_slider=calibration_factor_slider,
         camera_fov_h=camera_fov_h,
@@ -1780,6 +1808,7 @@ def main():
         stl_scale=stl_scale,
         tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
+        view_mode_dropdown=view_mode_dropdown,
         viewing_angle_slider=viewing_angle_slider,
         vio_cam1_pitch=vio_cam1_pitch,
         vio_cam1_yaw=vio_cam1_yaw,
@@ -1888,6 +1917,7 @@ def main():
     _fov_capture_ns = _fov_capture.build(_SimpleNamespace(
         _expand_mirror_configs=_expand_mirror_configs,
         _panel_slot_data=_panel_slot_data,
+        apply_view_mode=apply_view_mode,
         abs0_off_x=abs0_off_x,
         abs0_off_y=abs0_off_y,
         abs0_off_z=abs0_off_z,
@@ -2007,6 +2037,7 @@ def main():
         abs3_rot_z=abs3_rot_z,
         absorber_handles=absorber_handles,
         absorbers_enable=absorbers_enable,
+        apply_view_mode=apply_view_mode,
         camera_fov_h=camera_fov_h,
         camera_fov_handles=camera_fov_handles,
         camera_fov_v=camera_fov_v,
@@ -2133,6 +2164,10 @@ def main():
         update_room_intensity_map=update_room_intensity_map,
         update_stl_mesh=update_stl_mesh,
         update_ui_visibility=update_ui_visibility,
+        view_mode_dropdown=view_mode_dropdown,
+        flash_current_input=flash_current_input,
+        led_voltage_input=led_voltage_input,
+        led_efficacy_input=led_efficacy_input,
         viewing_angle_slider=viewing_angle_slider,
         vio_cam1_pitch=vio_cam1_pitch,
         vio_cam1_yaw=vio_cam1_yaw,
@@ -2168,9 +2203,12 @@ def main():
         diffuser_angle_slider=diffuser_angle_slider,
         diffuser_enable_chk=diffuser_enable_chk,
         diffuser_transmission_slider=diffuser_transmission_slider,
+        flash_current_input=flash_current_input,
         get_available_configs=get_available_configs,
         get_current_config=get_current_config,
+        led_efficacy_input=led_efficacy_input,
         led_lumens_slider=led_lumens_slider,
+        led_voltage_input=led_voltage_input,
         project_loaded=project_loaded,
         ray_uniformity_slider=ray_uniformity_slider,
         save_name_input=save_name_input,

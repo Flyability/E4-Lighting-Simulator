@@ -1,7 +1,7 @@
 import numpy as np
 
 from .geometry import default_row_direction, rotate_vector
-from .led import LED
+from .led import LED, normalize_role, normalize_roles
 from .placement import LEDPlacement
 
 
@@ -134,6 +134,7 @@ def _create_standard_group_leds(config, viewing_angle, default_lumens, start_ind
     row_direction = rotation @ roll_matrix @ np.array([0.0, -1.0, 0.0])
     radial = rotation @ np.array([1.0, 0.0, 0.0])
     led_states = config.get('led_states', [True] * 12)
+    led_roles = normalize_roles(config.get('led_roles'), 12)
     row_enabled = config.get('row_enabled', [True] * 4)
     inclinations = [90, 30, -30, -90]
     row_offsets = [-0.85, -0.55, 0.55, 0.85]
@@ -158,6 +159,7 @@ def _create_standard_group_leds(config, viewing_angle, default_lumens, start_ind
                 color=(1.0, 0.0, 1.0),
                 lumens=_resolve_lumens(config, index, default_lumens),
                 enabled=enabled,
+                role=led_roles[index],
             )
             leds.append(_placement(
                 led,
@@ -195,6 +197,7 @@ def _create_individual_leds(configs, viewing_angle, default_lumens, start_index)
             width=config.get('size', 0.5),
             viewing_angle=config.get('viewing_angle', viewing_angle),
             enabled=config.get('led_on', True),
+            role=normalize_role(config.get('role')),
         )
         placement = _placement(
             led,
@@ -220,10 +223,12 @@ def _create_dynamic_group_leds(config, viewing_angle, default_lumens, start_inde
     row_directions = config.get('led_row_directions') or []
     beam_tilts = config.get('led_beam_tilts') or []
     led_states = config.get('led_states') or []
+    n_leds = int(config.get('num_leds', 0))
+    led_roles = normalize_roles(config.get('led_roles'), n_leds)
     leds = []
     color = (1.0, 0.0, 1.0)
 
-    for index in range(config.get('num_leds', 0)):
+    for index in range(n_leds):
         if index >= len(positions):
             break
 
@@ -257,6 +262,7 @@ def _create_dynamic_group_leds(config, viewing_angle, default_lumens, start_inde
             color=color,
             lumens=_resolve_lumens(config, index, default_lumens),
             enabled=led_states[index] if index < len(led_states) else True,
+            role=led_roles[index],
         )
         leds.append(_placement(
             led,

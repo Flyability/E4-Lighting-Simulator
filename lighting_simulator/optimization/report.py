@@ -212,8 +212,17 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
         ["E_avg in FOV (mean over walls)", *[f"{e.e_avg:,.0f} lx" for e in evs]],
         ["Active LEDs", *[str(e.n_active) for e in evs]],
         ["Drivers", *[str(e.n_drivers) for e in evs]],
-        ["Total current", *[f"{e.total_current_a:.1f} A" for e in evs]],
+        ["Continuous current", *[f"{e.total_current_a:.1f} A" for e in evs]],
     ]
+    if any(e.electrical for e in evs):
+        rows += [
+            ["LED roles vio / flash / both", *[
+                f"{e.electrical.get('n_vio', 0)} / {e.electrical.get('n_flash', 0)} / {e.electrical.get('n_both', 0)}"
+                for e in evs]],
+            ["Pulse / continuous drivers", *[
+                f"{e.electrical.get('n_pulse_drivers', 0)} / {e.electrical.get('n_cont_drivers', 0)}" for e in evs]],
+            ["Peak current (flash)", *[f"{e.electrical.get('peak_current_a', 0):.1f} A" for e in evs]],
+        ]
     if evs[0].metrics is not None:
         rows += [
             ["E_min / E_max (last wall)", *[
@@ -227,6 +236,11 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
     for mode in problem.modes:
         rows.append([f"{mode.name}: E_avg", *[
             f"{e.modes.get(mode.name, {}).get('e_avg', 0):,.0f} lx" for e in evs]])
+        if mode.is_flash or mode.uniformity_weight:
+            rows.append([f"{mode.name}: U0 ({'pulse' if mode.is_flash else 'continuous'} LEDs)", *[
+                (lambda u: f"{u:.1f} %" if u is not None else "—")(e.modes.get(mode.name, {}).get('uniformity_pct'))
+                for e in evs]])
+            rows.append([f"{mode.name}: LEDs lit", *[str(e.modes.get(mode.name, {}).get('n_leds', '—')) for e in evs]])
         if mode.vio_min_lux:
             rows.append([f"{mode.name}: VIO ≥{mode.vio_min_lux:g} lx", *[
                 (lambda f: f"{f*100:.0f} %" if f is not None else "—")(e.modes.get(mode.name, {}).get('vio_fraction'))
@@ -268,8 +282,12 @@ def _page_problem(w: _Writer, problem, designs):
            + (";  diffuser " + f"{problem.diffuser[0]:g}° × {problem.diffuser[1]*100:.0f} %" if problem.diffuser else "")
            + (";  STL occluder active" if problem.stl_mesh is not None else ""))
     d = problem.driver
-    w.line(f"Driver model: {d.voltage_v:g} V, {d.efficacy_lm_per_w:g} lm/W → {d.lumens(1.0):,.0f} lm/A, "
+    w.line(f"Pulse driver model: {d.voltage_v:g} V, {d.efficacy_lm_per_w:g} lm/W → {d.lumens(1.0):,.0f} lm/A, "
            f"max {d.max_current_a:g} A per LED, {d.leds_per_driver} LED(s) per driver")
+    if problem.cont_driver is not problem.driver:
+        cd = problem.cont_driver
+        w.line(f"Continuous driver model ('vio' LEDs): max {cd.max_current_a:g} A per LED, "
+               f"{cd.leds_per_driver} LED(s) per driver")
     if problem.vio is not None:
         v = problem.vio
         where = (f"VIO room: six walls {v.room_dist:g} cm away ({2*v.room_dist/100:g} m across), "
@@ -281,7 +299,10 @@ def _page_problem(w: _Writer, problem, designs):
     if problem.modes:
         w.heading("Operating modes")
         for m in problem.modes:
-            parts = [f"current {m.current_a:g} A" if m.current_a is not None else f"flux × {m.lumens_scale:g}"]
+            parts = [(f"pulse: flash + both LEDs at {m.current_a:g} A, vio LEDs continuous" if m.is_flash
+                      else f"continuous: vio + both LEDs, flux × {m.lumens_scale:g}")]
+            if m.uniformity_weight:
+                parts.append(f"uniformity term w={m.uniformity_weight:g}")
             if m.min_avg_lux:
                 parts.append(f"E_avg ≥ {m.min_avg_lux:,.0f} lx"
                              + (f" at {m.min_avg_lux_dist:g} cm" if m.min_avg_lux_dist else "") + f" (w={m.lux_weight:g})")

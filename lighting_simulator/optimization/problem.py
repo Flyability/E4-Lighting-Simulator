@@ -4,23 +4,26 @@ Score is minimised. It combines the uniformity metric inside the main-camera
 footprint with soft penalties for the configurable constraints. All knobs
 come from a JSON spec (see ``problem_from_spec`` and ``optimization_specs/``).
 
-Operating modes (``ModeSpec``) share the geometry and differ only by drive
-current, so the wall is traced once and the lux grids are rescaled per mode
-(``lm ∝ I``): e.g. a *flash* mode that must reach 41 klx at 50 cm and a
-*normal* mode that must light ≥ 50 % of the VIO field of view at 3 m.
+Operating modes (``ModeSpec``) share the geometry. Each LED has a *role*
+(``domain.led``): 'vio' LEDs are on continuously, 'flash' LEDs only fire during the
+photogrammetry pulse, 'both' do both. A flash mode (``current_a`` set) is traced as
+"vio LEDs at their continuous flux + flash/both LEDs at the pulse current", a flight
+mode as "vio + both at their continuous flux". Without roles (all 'both') this reduces
+to the older "rescale everything by I_mode / I_design" model.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
 from lighting_simulator.analysis.uniformity import trapezoid_mask, uniformity_metrics
 from lighting_simulator.camera.fov import camera_fov_wall_trapezoid, points_in_fisheye_fov, vio_hfov_vfov_deg
+from lighting_simulator.domain.led import split_by_role
 from lighting_simulator.scene.builder import build_scene_from_config, load_config
 from lighting_simulator.simulation.room import compute_room_intensity
 from lighting_simulator.simulation.room_geometry import (
@@ -65,6 +68,8 @@ class ObjectiveSpec:
     """'u0' (Emin/Eavg), 'u1' (Emin/Emax) or 'cv' (σ/Eavg, minimised directly)."""
     min_percentile: float = 0.0
     """Use this percentile of lit FOV cells as Emin (0 = hard minimum, as in the UI)."""
+    flight_weight: float = 1.0
+    """Weight of the flight-mode (continuous LEDs) uniformity term; 0 = optimise the flash image only."""
     coverage_weight: float = 1.0
     """Penalty weight for the fraction of FOV cells that receive no light."""
     min_avg_lux: float | None = None
@@ -141,26 +146,34 @@ class VioSpec:
 
 @dataclass
 class ModeSpec:
-    """An operating point of the same hardware (e.g. 'normal' vs 'flash').
+    """An operating point of the same hardware (e.g. 'flight' vs 'flash').
 
-    Exactly one of ``current_a`` (absolute per-LED current, scaled against the
-    design current implied by the LED lumens) or ``lumens_scale`` sets the flux
-    multiplier relative to the decoded config.
+    A mode with ``current_a`` is a *flash* (pulse) mode: 'flash' and 'both' LEDs run at
+    that current while 'vio' LEDs keep their continuous flux. A mode without it is a
+    *flight* mode ('vio' + 'both' at continuous flux, ``lumens_scale`` applied).
     """
 
     name: str = "normal"
     current_a: float | None = None
     lumens_scale: float = 1.0
+    flash: bool | None = None
+    """Force pulse (True) / flight (False) semantics; None = pulse iff ``current_a`` is set."""
     min_avg_lux: float | None = None
     """Average lux target inside the main-camera FOV (e.g. 41000 for flash)."""
     min_avg_lux_dist: float | None = None
     """Wall distance (cm) the lux target refers to; nearest entry of ``wall_dists`` is used."""
     lux_weight: float = 1.0
+    uniformity_weight: float = 0.0
+    """Adds ``w · (1 − U)`` of this mode's own FOV grid (e.g. the flash image) to the score."""
     vio_min_lux: float | None = None
     """Lux threshold on the VIO wall (e.g. 120 at 3 m)."""
     vio_min_fraction: float = 0.5
     """Required share of VIO-visible cells above ``vio_min_lux``."""
     vio_weight: float = 1.0
+
+    @property
+    def is_flash(self):
+        return self.flash if self.flash is not None else self.current_a is not None
 
 
 @dataclass
@@ -173,10 +186,19 @@ class ConstraintSpec:
     max_drivers: int | None = None
     max_drivers_weight: float = 0.05
     driver_cost: float = 0.0
-    """Penalty per driver IC (``ceil(n_leds / driver.leds_per_driver)``)."""
+    """Penalty per driver IC (all classes)."""
+    max_pulse_drivers: int | None = None
+    pulse_driver_cost: float = 0.0
+    """Per pulse-class driver (flash / both LEDs) when a flash mode exists."""
+    max_cont_drivers: int | None = None
+    cont_driver_cost: float = 0.0
+    """Per continuous-class driver ('vio' LEDs) when a flash mode exists."""
     max_total_current_a: float | None = None
     current_weight: float = 1.0
-    """Penalty for the relative excess of summed LED current (thermal / supply budget)."""
+    """Penalty for the relative excess of summed continuous LED current (thermal / supply budget)."""
+    max_peak_current_a: float | None = None
+    peak_current_weight: float = 1.0
+    """Penalty for the relative excess of the summed current during the flash pulse."""
     min_led_spacing_cm: float | None = None
     spacing_weight: float = 1.0
     keep_out: list = field(default_factory=list)
@@ -204,10 +226,14 @@ class Evaluation:
     vio_grid: np.ndarray | None = None
     n_drivers: int = 0
     total_current_a: float = 0.0
+    """Summed continuous current (flight)."""
     modes: dict = field(default_factory=dict)
-    """Per-mode diagnostics: ``{name: {'e_avg', 'vio_fraction', 'scale'}}``."""
+    """Per-mode diagnostics: ``{name: {'e_avg', 'vio_fraction', 'scale', 'uniformity_pct', 'n_leds'}}``."""
     tilt: dict = field(default_factory=dict)
     """±tilt FOV uniformity (%): ``{'up': .., 'down': ..}`` when ``objective.tilt_fov_deg`` is set."""
+    electrical: dict = field(default_factory=dict)
+    """``{'n_pulse_drivers', 'n_cont_drivers', 'peak_current_a', 'n_vio', 'n_flash', 'n_both'}`` with a flash mode."""
+    flash_grid: np.ndarray | None = None
 
     def summary(self):
         pen = ", ".join(f"{k}={v:.3f}" for k, v in self.penalties.items() if v)
@@ -217,8 +243,15 @@ class Evaluation:
             s += f" tilt[↑{self.tilt.get('up', 0):.0f}% ↓{self.tilt.get('down', 0):.0f}%]"
         if self.n_drivers:
             s += f" drv={self.n_drivers} I={self.total_current_a:.1f}A"
+        el = self.electrical
+        if el:
+            s += (f" [vio {el.get('n_vio', 0)} / flash {el.get('n_flash', 0)} / both {el.get('n_both', 0)};"
+                  f" pulse drv {el.get('n_pulse_drivers', 0)}, cont drv {el.get('n_cont_drivers', 0)},"
+                  f" peak {el.get('peak_current_a', 0):.1f}A]")
         for name, m in self.modes.items():
             parts = [f"Eavg={m['e_avg']:.0f}lx"]
+            if m.get('uniformity_pct') is not None:
+                parts.append(f"U={m['uniformity_pct']:.0f}%")
             if m.get('vio_fraction') is not None:
                 parts.append(f"VIO={m['vio_fraction']*100:.0f}%")
             s += f" {name}[{' '.join(parts)}]"
@@ -231,12 +264,11 @@ class Evaluation:
         modes = {}
         for name, m in self.modes.items():
             o = other.modes.get(name, m)
-            modes[name] = {
-                'scale': m['scale'],
-                'e_avg': 0.5 * (m['e_avg'] + o['e_avg']),
-                'vio_fraction': (None if m.get('vio_fraction') is None
-                                 else 0.5 * (m['vio_fraction'] + (o.get('vio_fraction') or m['vio_fraction']))),
-            }
+            modes[name] = dict(m)
+            modes[name]['e_avg'] = 0.5 * (m['e_avg'] + o['e_avg'])
+            for k in ('vio_fraction', 'uniformity_pct'):
+                if m.get(k) is not None:
+                    modes[name][k] = 0.5 * (m[k] + (o.get(k) if o.get(k) is not None else m[k]))
         return Evaluation(
             score=0.5 * (self.score + other.score),
             uniformity_pct=0.5 * (self.uniformity_pct + other.uniformity_pct),
@@ -246,6 +278,7 @@ class Evaluation:
             vio_grid=self.vio_grid, n_drivers=self.n_drivers, total_current_a=self.total_current_a,
             modes=modes,
             tilt={k: 0.5 * (v + other.tilt.get(k, v)) for k, v in self.tilt.items()},
+            electrical=dict(self.electrical), flash_grid=self.flash_grid,
         )
 
 
@@ -255,7 +288,7 @@ class Problem:
                  constraints: ConstraintSpec | None = None, clear_base=False, name="optim",
                  wall_dists=None, use_gpu=False, stl_mesh=None, diffuser=None,
                  driver: DriverModel | None = None, vio: VioSpec | None = None, modes=None,
-                 wall_sizes=None):
+                 wall_sizes=None, cont_driver: DriverModel | None = None):
         """``wall_dists``: optional list of distances (cm); the score is averaged over them
         so a layout is optimised for a range instead of a single wall distance.
         ``wall_sizes``: matching list of wall extents (cm), or ``"auto"`` to fit each wall
@@ -263,15 +296,20 @@ class Problem:
 
         ``use_gpu`` traces on the GPU backend (single process only). ``stl_mesh`` /
         ``diffuser`` are forwarded to ``build_scene_from_config`` so the UI scene is
-        reproduced exactly. ``driver`` converts LED flux to current and counts driver
-        ICs; ``vio`` + ``modes`` add the per-operating-point lux / VIO-coverage targets."""
+        reproduced exactly. ``driver`` is the pulse-class driver (flash / both LEDs),
+        ``cont_driver`` the continuous class ('vio' LEDs; defaults to ``driver``);
+        ``vio`` + ``modes`` add the per-operating-point lux / VIO-coverage targets."""
         self.name = name
         self.use_gpu = bool(use_gpu)
         self.stl_mesh = stl_mesh
         self.diffuser = diffuser
         self.driver = driver or DriverModel()
+        self.cont_driver = cont_driver or self.driver
         self.vio = vio
         self.modes = list(modes or [])
+        self.flash_modes = [m for m in self.modes if m.is_flash]
+        if len(self.flash_modes) > 1:
+            raise ValueError("at most one flash (pulse) mode is supported")
         self.base_cfg = copy.deepcopy(base_cfg)
         if clear_base:
             self.base_cfg['custom_groups'] = []
@@ -370,19 +408,46 @@ class Problem:
         """
         scene = self.build_scene(cfg)
         active = scene.active_leds
-        currents = self.driver.led_currents(active)
-        n_drivers = self.driver.n_drivers(len(active))
-        total_current = float(currents.sum()) if len(active) else 0.0
-        penalties = self._geometry_penalties(active, n_drivers, total_current)
+        flash_mode = self.flash_modes[0] if self.flash_modes else None
+        by_role = split_by_role(active)
+        flight_leds = by_role['vio'] + by_role['both']
+        pulse_leds = by_role['flash'] + by_role['both']
+        electrical = {}
+        if flash_mode is not None:
+            # Two driver classes: 'vio' LEDs on continuous drivers, flash/both on pulse drivers.
+            cont_current = float(self.cont_driver.led_currents(flight_leds).sum()) if flight_leds else 0.0
+            vio_current = float(self.cont_driver.led_currents(by_role['vio']).sum()) if by_role['vio'] else 0.0
+            peak_current = vio_current + len(pulse_leds) * float(flash_mode.current_a)
+            n_pulse_drv = self.driver.n_drivers(len(pulse_leds))
+            n_cont_drv = self.cont_driver.n_drivers(len(by_role['vio']))
+            n_drivers = n_pulse_drv + n_cont_drv
+            total_current = cont_current
+            electrical = {'n_pulse_drivers': n_pulse_drv, 'n_cont_drivers': n_cont_drv,
+                          'peak_current_a': peak_current, 'n_vio': len(by_role['vio']),
+                          'n_flash': len(by_role['flash']), 'n_both': len(by_role['both'])}
+        else:
+            flight_leds = active  # no pulse mode: every LED is continuous, roles are irrelevant
+            currents = self.driver.led_currents(active)
+            n_drivers = self.driver.n_drivers(len(active))
+            total_current = float(currents.sum()) if len(active) else 0.0
+            peak_current = total_current
+        penalties = self._geometry_penalties(active, n_drivers, total_current, electrical, peak_current)
 
         if not active:
             return Evaluation(score=10.0 + sum(penalties.values()), uniformity_pct=0.0, coverage=0.0,
                               e_avg=0.0, n_active=0, penalties=penalties)
 
+        flash_lumens = self.driver.lumens(flash_mode.current_a) if flash_mode is not None else None
+        m = self.objective.metric
+
+        def _score_of(metrics):
+            return {'u0': 1.0 - metrics.u0, 'u1': 1.0 - metrics.u1, 'cv': metrics.cv}[m]
+
         scores, unis, e_avgs, covs, grids, last_metrics = [], [], [], [], [], None
+        flash_scores, flash_unis, flash_e_avgs, flash_grids = [], [], [], []
         tilt_scores, tilt_unis = [], {'up': [], 'down': []}
         for wi, (wall, fov_mask) in enumerate(zip(self.walls, self._fov_masks)):
-            grid = self._trace(scene, wall)
+            grid, flash_grid = self._trace_modes(scene, wall, active, by_role, flash_lumens)
             fov = grid[fov_mask]
             coverage = float(np.count_nonzero(fov > 0) / max(1, fov.size))
             metrics = uniformity_metrics(fov, self.objective.min_percentile)
@@ -391,13 +456,18 @@ class Problem:
                 unis.append(0.0)
                 e_avgs.append(0.0)
             else:
-                m = self.objective.metric
-                scores.append({'u0': 1.0 - metrics.u0, 'u1': 1.0 - metrics.u1, 'cv': metrics.cv}[m])
+                scores.append(_score_of(metrics))
                 unis.append(metrics.uniformity_pct)
                 e_avgs.append(metrics.e_avg)
                 last_metrics = metrics
             covs.append(coverage)
             grids.append(grid)
+            if flash_grid is not None:
+                fm = uniformity_metrics(flash_grid[fov_mask], self.objective.min_percentile)
+                flash_scores.append(5.0 if fm is None else _score_of(fm))
+                flash_unis.append(0.0 if fm is None else fm.uniformity_pct)
+                flash_e_avgs.append(0.0 if fm is None else fm.e_avg)
+                flash_grids.append(flash_grid)
             if self._tilt_masks is not None:
                 for key, mask in zip(('up', 'down'), self._tilt_masks[wi]):
                     if not np.any(mask):
@@ -407,12 +477,11 @@ class Problem:
                         tilt_scores.append(1.0)  # cells exist but none are lit
                         tilt_unis[key].append(0.0)
                     else:
-                        m = self.objective.metric
-                        tilt_scores.append({'u0': 1.0 - tm.u0, 'u1': 1.0 - tm.u1, 'cv': tm.cv}[m])
+                        tilt_scores.append(_score_of(tm))
                         tilt_unis[key].append(tm.uniformity_pct)
         self.n_evals += 1
 
-        score = float(np.mean(scores))
+        score = float(self.objective.flight_weight) * float(np.mean(scores))
         uniformity_pct = float(np.mean(unis))
         e_avg = float(np.mean(e_avgs))
         coverage = float(min(covs))
@@ -431,21 +500,29 @@ class Problem:
         if self.modes:
             vio_lit = None
             if self._vio_room:
-                vio_grid = self._trace_room(scene, len(active))
-                vio_lit = np.concatenate([vio_grid[n][m] for n, m in self._vio_masks.items() if n in vio_grid])
+                vio_grid = self._trace_room(scene, flight_leds, len(active))
+                vio_lit = np.concatenate([vio_grid[n][mk] for n, mk in self._vio_masks.items() if n in vio_grid])
             elif self._needs_vio:
-                vio_grid = self._trace(scene, self._vio_wall)
+                vio_grid = self._trace_leds(flight_leds, self._vio_wall, 1.0, scene)
                 vio_lit = vio_grid[self._vio_mask]
-            design_current = float(currents.mean())
             for mode in self.modes:
-                modes[mode.name] = self._mode_penalties(mode, design_current, e_avgs, vio_lit, penalties)
+                if mode.is_flash:
+                    info = self._flash_mode_penalties(mode, flash_scores, flash_unis, flash_e_avgs, penalties)
+                    info['n_leds'] = len(pulse_leds)
+                else:
+                    info = self._flight_mode_penalties(mode, e_avgs, unis, vio_lit, penalties)
+                    info['n_leds'] = len(flight_leds)
+                modes[mode.name] = info
 
         score += sum(penalties.values())
         return Evaluation(score=score, uniformity_pct=uniformity_pct, coverage=coverage,
                           e_avg=e_avg, n_active=len(active), penalties=penalties, metrics=last_metrics,
                           grid=(grids[0] if len(grids) == 1 else grids) if keep_grid else None,
                           vio_grid=vio_grid if keep_grid else None,
-                          n_drivers=n_drivers, total_current_a=total_current, modes=modes, tilt=tilt)
+                          n_drivers=n_drivers, total_current_a=total_current, modes=modes, tilt=tilt,
+                          electrical=electrical,
+                          flash_grid=((flash_grids[0] if len(flash_grids) == 1 else flash_grids)
+                                      if (keep_grid and flash_grids) else None))
 
     def __call__(self, x):
         return self.evaluate(x).score
@@ -454,35 +531,65 @@ class Problem:
         return build_scene_from_config(cfg, default_lumens=self.emission.default_lumens,
                                        stl_mesh=self.stl_mesh, diffuser=self.diffuser)
 
-    def _trace(self, scene, wall):
-        grid = compute_wall_intensity(scene.leds, wall, self.emission, absorbers=scene.absorbers,
+    def _trace_leds(self, leds, wall, budget_frac, scene):
+        """Trace a subset of LEDs with ``budget_frac`` of the wall's ray budget (zeros if empty)."""
+        if not leds:
+            return np.zeros((wall.grid_size, wall.grid_size))
+        settings = wall if budget_frac >= 1.0 else replace(wall, rays_per_pixel=max(1, int(round(
+            wall.rays_per_pixel * budget_frac))))
+        grid = compute_wall_intensity(leds, settings, self.emission, absorbers=scene.absorbers,
                                       stl_mesh_data=scene.stl_mesh_data, use_gpu=self.use_gpu,
                                       verbose=False, parallel=False)
         return np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _trace_room(self, scene, n_active):
-        """VIO room trace with roughly the same total ray budget as one main-wall trace."""
+    def _trace_modes(self, scene, wall, active, by_role, flash_lumens):
+        """(flight grid, flash grid or None) for one wall.
+
+        With a flash mode the three role sets are traced separately, sharing the wall's
+        ray budget in proportion to their LED counts, and superposed:
+        flight = vio + both, flash = vio + (flash + both at the pulse flux).
+        """
+        if flash_lumens is None:
+            return self._trace_leds(active, wall, 1.0, scene), None
+        n = max(1, len(active))
+        g_vio = self._trace_leds(by_role['vio'], wall, len(by_role['vio']) / n, scene)
+        g_both = self._trace_leds(by_role['both'], wall, len(by_role['both']) / n, scene)
+        pulse = by_role['flash'] + by_role['both']
+        pulse_leds = []
+        for p in pulse:  # copies so the scene's continuous flux is untouched
+            p2 = copy.copy(p)
+            p2.led = copy.copy(p.led)
+            p2.led.lumens = float(flash_lumens)
+            pulse_leds.append(p2)
+        g_pulse = self._trace_leds(pulse_leds, wall, len(pulse) / n, scene)
+        return g_vio + g_both, g_vio + g_pulse
+
+    def _trace(self, scene, wall):
+        return self._trace_leds(scene.leds, wall, 1.0, scene)
+
+    def _trace_room(self, scene, leds, n_active):
+        """VIO room trace (flight LEDs) with roughly the ray budget of one main-wall trace."""
         w = self.walls[0]
         room_cells = int(self.vio.room_grid_size) ** 2
         rpp = max(1, int(round(w.rays_per_pixel * w.grid_size ** 2 / max(1, n_active * room_cells))))
-        grids, _ = compute_room_intensity(scene.leds, self.vio.room_settings(rpp), self.emission,
+        if not leds:
+            return {name: np.zeros(mask.shape) for name, mask in self._vio_masks.items()}
+        grids, _ = compute_room_intensity(leds, self.vio.room_settings(rpp), self.emission,
                                           absorbers=scene.absorbers, stl_mesh_data=scene.stl_mesh_data,
                                           use_gpu=self.use_gpu, verbose=False)
         return {n: np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for n, g in grids.items()}
 
-    def _mode_penalties(self, mode: ModeSpec, design_current, e_avgs, vio_lit, penalties):
-        """Lux / VIO targets of one operating point; flux scales linearly with current."""
-        if mode.current_a is not None:
-            scale = mode.current_a / design_current if design_current > 0 else 0.0
-        else:
-            scale = float(mode.lumens_scale)
-        info = {'scale': scale, 'e_avg': 0.0, 'vio_fraction': None}
+    def _pick_wall(self, mode, values):
         if mode.min_avg_lux_dist is not None:
             i = int(np.argmin([abs(w.wall_dist - mode.min_avg_lux_dist) for w in self.walls]))
-            e_ref = e_avgs[i]
-        else:
-            e_ref = min(e_avgs)
-        info['e_avg'] = e_ref * scale
+            return values[i]
+        return min(values)
+
+    def _flight_mode_penalties(self, mode: ModeSpec, e_avgs, unis, vio_lit, penalties):
+        """Continuous operating point: 'vio' + 'both' LEDs at their flux (× ``lumens_scale``)."""
+        scale = float(mode.lumens_scale)
+        info = {'scale': scale, 'e_avg': self._pick_wall(mode, e_avgs) * scale, 'vio_fraction': None,
+                'uniformity_pct': float(np.mean(unis)) if unis else None}
         if mode.min_avg_lux:
             short = max(0.0, (mode.min_avg_lux - info['e_avg']) / mode.min_avg_lux)
             if short > 0:
@@ -499,10 +606,24 @@ class Problem:
                 penalties[f'{mode.name}.vio'] = mode.vio_weight * short
         return info
 
-    def _geometry_penalties(self, active, n_drivers=0, total_current=0.0):
+    def _flash_mode_penalties(self, mode: ModeSpec, flash_scores, flash_unis, flash_e_avgs, penalties):
+        """Pulse operating point: traced grid of 'vio' (continuous) + 'flash'/'both' (pulse flux)."""
+        info = {'scale': None, 'e_avg': self._pick_wall(mode, flash_e_avgs) if flash_e_avgs else 0.0,
+                'vio_fraction': None,
+                'uniformity_pct': float(np.mean(flash_unis)) if flash_unis else None}
+        if mode.min_avg_lux:
+            short = max(0.0, (mode.min_avg_lux - info['e_avg']) / mode.min_avg_lux)
+            if short > 0:
+                penalties[f'{mode.name}.lux'] = mode.lux_weight * short
+        if mode.uniformity_weight and flash_scores:
+            penalties[f'{mode.name}.uniformity'] = mode.uniformity_weight * float(np.mean(flash_scores))
+        return info
+
+    def _geometry_penalties(self, active, n_drivers=0, total_current=0.0, electrical=None, peak_current=0.0):
         c = self.constraints
         pen = {}
         n = len(active)
+        el = electrical or {}
         if c.led_cost:
             pen['led_cost'] = c.led_cost * n
         if c.max_leds is not None and n > c.max_leds:
@@ -511,8 +632,19 @@ class Problem:
             pen['driver_cost'] = c.driver_cost * n_drivers
         if c.max_drivers is not None and n_drivers > c.max_drivers:
             pen['max_drivers'] = c.max_drivers_weight * (n_drivers - c.max_drivers)
+        if el:
+            if c.pulse_driver_cost:
+                pen['pulse_driver_cost'] = c.pulse_driver_cost * el['n_pulse_drivers']
+            if c.max_pulse_drivers is not None and el['n_pulse_drivers'] > c.max_pulse_drivers:
+                pen['max_pulse_drivers'] = c.max_drivers_weight * (el['n_pulse_drivers'] - c.max_pulse_drivers)
+            if c.cont_driver_cost:
+                pen['cont_driver_cost'] = c.cont_driver_cost * el['n_cont_drivers']
+            if c.max_cont_drivers is not None and el['n_cont_drivers'] > c.max_cont_drivers:
+                pen['max_cont_drivers'] = c.max_drivers_weight * (el['n_cont_drivers'] - c.max_cont_drivers)
         if c.max_total_current_a and total_current > c.max_total_current_a:
             pen['current'] = c.current_weight * (total_current - c.max_total_current_a) / c.max_total_current_a
+        if c.max_peak_current_a and peak_current > c.max_peak_current_a:
+            pen['peak_current'] = c.peak_current_weight * (peak_current - c.max_peak_current_a) / c.max_peak_current_a
         if n and c.min_beam_angle_deg:
             dirs = np.array([led.direction for led in active], dtype=float)
             dirs /= np.maximum(np.linalg.norm(dirs, axis=1, keepdims=True), 1e-12)
@@ -582,6 +714,7 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     constraints = ConstraintSpec(**spec.get('constraints', {}))
     clear_base = bool(spec.get('clear_base', False))
     driver = DriverModel(**spec.get('driver', {}))
+    cont_driver = DriverModel(**{**spec.get('driver', {}), **spec['cont_driver']}) if spec.get('cont_driver') else None
     vio = VioSpec(**spec['vio']) if spec.get('vio') else None
     modes = [ModeSpec(**m) for m in spec.get('modes', [])]
 
@@ -598,7 +731,7 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     return Problem(base_cfg, variables, wall, camera, emission, objective, constraints,
                    clear_base=clear_base, name=spec.get('name', default_name),
                    wall_dists=wall_dists, wall_sizes=wall_sizes, driver=driver, vio=vio, modes=modes,
-                   **problem_kwargs)
+                   cont_driver=cont_driver, **problem_kwargs)
 
 
 def load_spec(path):

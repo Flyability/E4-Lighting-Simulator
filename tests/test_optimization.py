@@ -161,7 +161,16 @@ def test_requirements_spec_modes_drivers_and_report(tmp_path):
     assert g['lumens_value'] == pytest.approx(g['drive_current_a'] * 6.0 * 180.0)
     assert ev.total_current_a == pytest.approx(12 * g['drive_current_a'])
     assert set(ev.modes) == {"normal", "flash"}
-    assert ev.modes['flash']['scale'] == pytest.approx(13.0 / g['drive_current_a'])
+    # All LEDs default to role 'both': the flash image is the flight image at 13 A instead of I_design
+    scale = 13.0 / g['drive_current_a']
+    evg = problem.evaluate(x, keep_grid=True)
+    grids = evg.grid if isinstance(evg.grid, list) else [evg.grid]
+    fgrids = evg.flash_grid if isinstance(evg.flash_grid, list) else [evg.flash_grid]
+    for gf, gg in zip(fgrids, grids):
+        assert float(gf.sum()) == pytest.approx(float(gg.sum()) * scale, rel=0.1)
+    assert ev.modes['flash']['n_leds'] == ev.modes['normal']['n_leds'] == 12
+    assert ev.electrical['n_pulse_drivers'] == 3 and ev.electrical['n_cont_drivers'] == 0
+    assert ev.electrical['peak_current_a'] == pytest.approx(12 * 13.0)
     assert 0.0 <= ev.modes['normal']['vio_fraction'] <= 1.0
 
     summary, best = run(problem, OptimizerSpec(method="random_search", max_evals=8, population=4, log_every=0),

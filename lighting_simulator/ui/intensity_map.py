@@ -32,6 +32,8 @@ def build(ctx):
     _absorber_config = ctx._absorber_config
     _expand_mirror_configs = ctx._expand_mirror_configs
     _panel_slot_data = ctx._panel_slot_data
+    apply_view_mode = ctx.apply_view_mode
+    view_mode_dropdown = ctx.view_mode_dropdown
     bw_scale_chk = ctx.bw_scale_chk
     calibration_factor_slider = ctx.calibration_factor_slider
     camera_fov_h = ctx.camera_fov_h
@@ -348,6 +350,14 @@ def build(ctx):
             "Denominator is FOV-covered wall cells, not empty space.</div></div>"
         )
 
+    def _mode_banner_html():
+        mode = view_mode_dropdown.value
+        flash = mode.startswith("Flash")
+        color = "#FF8C00" if flash else "#4CAF50"
+        return (f"<div style='font-size:11px;margin:6px 0 -4px;color:{color};'>Operating mode: <b>{mode}</b>"
+                + (" — Flash + Both LEDs at the flash current, VIO LEDs continuous" if flash
+                   else " — VIO + Both LEDs continuous, Flash-only LEDs off") + "</div>")
+
     def _wall_metrics_html(grid, wall_size_cm, wall_dist):
         _trap = _camera_fov_wall_trapezoid(
             wall_dist - camera_pos_x.value, camera_pitch.value,
@@ -361,6 +371,7 @@ def build(ctx):
         )
         if not html:
             html = _empty_fov_html()
+        html = _mode_banner_html() + html
         for title, pitch in _tilt_fov_pitches():
             trap = (*_camera_fov_wall_trapezoid(wall_dist - camera_pos_x.value, pitch,
                                                 camera_fov_h.value, camera_fov_v.value), camera_pos_y.value)
@@ -382,6 +393,7 @@ def build(ctx):
             html = (_compute_uniformity_html(fov_lux.reshape(1, -1),
                                              min_percentile=float(uniformity_percentile_slider.value))
                     or _empty_fov_html())
+        html = _mode_banner_html() + html
         for title, pitch in _tilt_fov_pitches():
             lux = _collect_room_fov_lux(_last_room_cache, pitch=pitch)
             html += (_compute_uniformity_html(lux.reshape(1, -1), min_percentile=float(uniformity_percentile_slider.value),
@@ -443,6 +455,7 @@ def build(ctx):
                 'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
+                'led_roles': group.get('led_roles') or [],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
             if group.get('is_dynamic', False):
@@ -469,6 +482,7 @@ def build(ctx):
             config = {
                 'enabled': led['enable'].value,
                 'led_on': led.get('led_on', True),
+                'role': led.get('role', 'both'),
                 'pos_x': led['pos_x'].value, 'pos_y': led['pos_y'].value, 'pos_z': led['pos_z'].value,
                 'rot_x': led['rot_x'].value, 'rot_y': led['rot_y'].value, 'rot_z': led['rot_z'].value,
                 'size': led['size'].value, 'viewing_angle': led['viewing_angle'].value,
@@ -503,6 +517,7 @@ def build(ctx):
             individual_leds_configs=individual_leds_configs,
             create_base_groups=any(led_states[:48]),
         )
+        apply_view_mode(leds)
 
         _g_rot_z_deg = float(global_rotation_z_slider.value)
         apply_global_transform(

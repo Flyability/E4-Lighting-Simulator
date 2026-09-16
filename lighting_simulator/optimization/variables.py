@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from lighting_simulator.domain.geometry import euler_xyz_matrix, normalize, rodrigues_rotation
+from lighting_simulator.domain.led import CODE_ROLES, ROLE_CODES, normalize_roles
 from lighting_simulator.domain.mirroring import mirror_group_config_xz
 from lighting_simulator.scene.builder import euler_applies
 
@@ -134,6 +135,9 @@ class DuctRingLayout(VariableGroup):
     shared_beam_angle: bool = True
     default_beam_angle: float = 120.0
     optimize_enabled: bool = False
+    optimize_roles: bool = False
+    """Per-LED role variable (0 off, 1 vio, 2 flash, 3 both); supersedes ``optimize_enabled``."""
+    default_role: str = "both"
     current_range: tuple | None = None
     """Shared drive current (A); converted to lumens with ``driver``."""
     driver: DriverModel = field(default_factory=DriverModel)
@@ -199,7 +203,10 @@ class DuctRingLayout(VariableGroup):
             for i in range(n_beam):
                 self._add(f"beam[{i}]" if n_beam > 1 else "beam", *self.beam_angle_range,
                           x0=min(max(self.default_beam_angle, self.beam_angle_range[0]), self.beam_angle_range[1]))
-        if self.optimize_enabled:
+        if self.optimize_roles:
+            for i in range(self.n_leds):
+                self._add(f"role[{i}]", 0, 3, integer=True, x0=ROLE_CODES.get(self.default_role, 3))
+        elif self.optimize_enabled:
             for i in range(self.n_leds):
                 self._add(f"on[{i}]", 0, 1, integer=True, x0=1)
         if self.current_range is not None:
@@ -255,7 +262,13 @@ class DuctRingLayout(VariableGroup):
             beams = [next(it) for _ in range(1 if self.shared_beam_angle else self.n_leds)]
         else:
             beams = [self.default_beam_angle]
-        states = [bool(round(next(it))) for _ in range(self.n_leds)] if self.optimize_enabled else [True] * self.n_leds
+        if self.optimize_roles:
+            codes = [int(round(next(it))) for _ in range(self.n_leds)]
+            states = [c != 0 for c in codes]
+            roles = [CODE_ROLES.get(c, self.default_role) if c else self.default_role for c in codes]
+        else:
+            states = [bool(round(next(it))) for _ in range(self.n_leds)] if self.optimize_enabled else [True] * self.n_leds
+            roles = [self.default_role] * self.n_leds
         current_a = float(next(it)) if self.current_range is not None else None
 
         positions, directions, row_dirs = [], [], []
@@ -284,6 +297,7 @@ class DuctRingLayout(VariableGroup):
             'led_viewing_angles': [float(beams[i if len(beams) > 1 else 0]) for i in range(n_out)],
             'led_beam_tilts': [0.0] * n_out,
             'led_states': states[:n_out],
+            'led_roles': roles[:n_out],
             'led_rows': rows,
             'led_euler_angles': [],
             'led_lumens': [],
@@ -396,6 +410,35 @@ class LedStates(VariableGroup):
 
 
 @dataclass
+class LedRoles(VariableGroup):
+    """Per-LED operating role of an existing group: 0 off, 1 vio, 2 flash, 3 both (supersedes on/off)."""
+
+    group_index: int = 0
+    names: list = field(default_factory=list, init=False)
+    bounds: list = field(default_factory=list, init=False)
+    integrality: list = field(default_factory=list, init=False)
+    x0: list = field(default_factory=list, init=False)
+    _n: int = field(default=0, init=False)
+
+    def bind(self, base_cfg):
+        g = base_cfg['custom_groups'][self.group_index]
+        states = g.get('led_states', [True] * g.get('num_leds', 12))
+        roles = normalize_roles(g.get('led_roles'), len(states))
+        self._n = len(states)
+        self.names = [f"group{self.group_index}.role[{i}]" for i in range(self._n)]
+        self.bounds = [(0, 3)] * self._n
+        self.integrality = [True] * self._n
+        self.x0 = [float(ROLE_CODES[r]) if s else 0.0 for s, r in zip(states, roles)]
+        return self
+
+    def apply(self, x, cfg):
+        codes = [int(round(v)) for v in x]
+        g = cfg['custom_groups'][self.group_index]
+        g['led_states'] = [c != 0 for c in codes]
+        g['led_roles'] = [CODE_ROLES.get(c, 'both') if c else 'both' for c in codes]
+
+
+@dataclass
 class BeamAngle(VariableGroup):
     """Viewing angle (deg) shared by all LEDs of a group, or of the base rig (``None``)."""
 
@@ -481,6 +524,7 @@ VARIABLE_TYPES = {
     'duct_ring': DuctRingLayout,
     'panel_pose': PanelPose,
     'led_states': LedStates,
+    'led_roles': LedRoles,
     'beam_angle': BeamAngle,
     'beam_tilts': BeamTilts,
     'group_current': GroupCurrent,

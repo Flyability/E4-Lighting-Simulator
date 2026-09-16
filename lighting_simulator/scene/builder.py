@@ -85,6 +85,7 @@ def group_config_to_factory(group_cfg, owner=None, row_enabled=None):
         'rotation_y': group_cfg.get('rotation_y', 0.0),
         'rotation_z': group_cfg.get('rotation_z', 0.0),
         'led_states': list(group_cfg.get('led_states', [True] * 12)),
+        'led_roles': list(group_cfg.get('led_roles') or []),
         'row_enabled': list(row_enabled or DEFAULT_ROWS),
         'lumens_override': _lumens_override(group_cfg),
         'owner': owner,
@@ -116,6 +117,7 @@ def individual_led_config_to_factory(led_cfg, owner=None):
         'viewing_angle': led_cfg.get('viewing_angle', 120),
         'square_roll': led_cfg.get('square_roll', 0.0),
         'beam_tilt': led_cfg.get('beam_tilt', 0.0),
+        'role': led_cfg.get('role', 'both'),
         'lumens_override': _lumens_override(led_cfg),
         'owner': owner,
     }

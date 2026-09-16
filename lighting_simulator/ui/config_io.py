@@ -12,6 +12,7 @@ from lighting_simulator.domain.guides import (
     bake_and_disable_guide, enable_circular_guide, guide_is_enabled as _guide_is_enabled,
     restore_group_guide, serialize_guide,
 )
+from lighting_simulator.ui.panels import _copy_roles
 
 
 def build(ctx):
@@ -138,6 +139,7 @@ def build(ctx):
                 'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0.0,
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0.0,
                 'led_states': group['led_states'][:],
+                'led_roles': list(group.get('led_roles') or ['both'] * len(group['led_states'])),
                 'template_name': group.get('template_name'),  # Save template association
                 'initial_pos': group.get('initial_pos', [0.0, 0.0, 0.0]),  # Save initial position
                 'initial_rot': group.get('initial_rot', [0, 0, 0]),  # Save initial rotation
@@ -196,6 +198,7 @@ def build(ctx):
             led_sizes = [led['size'].value for led in leds_list_sorted]
             led_viewing_angles = [led['viewing_angle'].value for led in leds_list_sorted]
             group_led_states = [led['led_on'] for led in leds_list_sorted]
+            group_led_roles = [led.get('role', 'both') for led in leds_list_sorted]
             
             # Convert rotation angles to direction vectors
             led_rotations = []
@@ -303,6 +306,7 @@ def build(ctx):
                 'rotation_y': group_rot[1],
                 'rotation_z': group_rot[2],
                 'led_states': group_led_states,
+                'led_roles': group_led_roles,
                 'is_dynamic': True,
                 'num_leds': num_leds,
                 'led_positions': led_positions_relative,
@@ -347,6 +351,7 @@ def build(ctx):
                 'viewing_angle': led['viewing_angle'].value,
                 'square_roll': led['square_roll'].value,
                 'beam_tilt': led['beam_tilt'].value,
+                'role': led.get('role', 'both'),
                 'lumens_override_enabled': led.get('lumens_override') and led['lumens_override'].value,
                 'lumens_value': led['lumens_value'].value if led.get('lumens_value') else 100,
                 'ext_lens_enabled': led.get('ext_lens_enable') and led['ext_lens_enable'].value,
@@ -619,6 +624,7 @@ def build(ctx):
             for i, state in enumerate(led_states_cfg):
                 if i < len(group_data['led_states']):
                     group_data['led_states'][i] = state
+            _copy_roles(group_data, group_cfg.get('led_roles'))
             
             # Update button colors to match loaded LED states
             if 'update_button_colors' in group_data and group_data['update_button_colors']:
@@ -713,6 +719,7 @@ def build(ctx):
                 for i, state in enumerate(led_states_cfg):
                     if i < len(group_data['led_states']):
                         group_data['led_states'][i] = state
+                _copy_roles(group_data, group_cfg.get('led_roles'))
                 
                 # Update button colors
                 if 'update_button_colors' in group_data and group_data['update_button_colors']:
@@ -1197,6 +1204,7 @@ def build(ctx):
             led_data['viewing_angle'].value = led_cfg.get('viewing_angle', 120)
             led_data['square_roll'].value = led_cfg.get('square_roll', 0)
             led_data['beam_tilt'].value = led_cfg.get('beam_tilt', 0)
+            led_data['role'] = led_cfg.get('role', 'both')
             # Restore lumens override settings for individual LED
             if led_data.get('lumens_override') and led_cfg.get('lumens_override_enabled'):
                 led_data['lumens_override'].value = True

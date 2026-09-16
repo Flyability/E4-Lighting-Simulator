@@ -13,7 +13,13 @@ from lighting_simulator.domain.guides import (
     bake_and_disable_guide, enable_circular_guide, guide_is_enabled as _guide_is_enabled,
     restore_group_guide, serialize_guide,
 )
+from lighting_simulator.domain.led import normalize_roles
 from lighting_simulator.domain.mirroring import expand_mirror_configs
+
+
+def _copy_roles(group_data, roles):
+    """Write saved per-LED roles into a live group dict (length follows led_states)."""
+    group_data['led_roles'] = normalize_roles(roles, len(group_data['led_states']))
 
 
 def build(ctx):
@@ -137,6 +143,7 @@ def build(ctx):
             for i, state in enumerate(led_states_cfg):
                 if i < len(group_data['led_states']):
                     group_data['led_states'][i] = state
+            _copy_roles(group_data, group_cfg.get('led_roles'))
             
             # Update button colors to match loaded LED states
             if 'update_button_colors' in group_data and group_data['update_button_colors']:
@@ -307,6 +314,7 @@ def build(ctx):
             for i, state in enumerate(initial_led_states):
                 if i < len(group_data['led_states']):
                     group_data['led_states'][i] = state
+            _copy_roles(group_data, [led.get('role', 'both') for led in sorted_leds])
             
             # Update button colors
             if 'update_button_colors' in group_data and group_data['update_button_colors']:
@@ -800,6 +808,7 @@ def build(ctx):
             'lumens_value': group_lumens_slider,
             'remove_btn': remove_btn,
             'led_states': led_states,
+            'led_roles': ['both'] * num_leds,  # 'vio' | 'flash' | 'both' operating role per LED
             'led_rows': led_rows,  # Store row organization
             'num_leds': num_leds,  # Store total LED count
             'all_btn': all_btn,
@@ -1469,6 +1478,7 @@ def build(ctx):
                 for i, state in enumerate(led_states_cfg):
                     if i < len(group_data['led_states']):
                         group_data['led_states'][i] = state
+                _copy_roles(group_data, grp_cfg.get('led_roles'))
                 if 'update_button_colors' in group_data and group_data['update_button_colors']:
                     group_data['update_button_colors']()
 
@@ -1992,6 +2002,7 @@ def build(ctx):
             'folder': led_folder,
             'enable': enable_chk,
             'led_on': True,  # LED state (on/off)
+            'role': 'both',  # 'vio' | 'flash' | 'both' operating role
             'led_on_btn': led_on_btn,
             'pos_x': pos_x,
             'pos_y': pos_y,

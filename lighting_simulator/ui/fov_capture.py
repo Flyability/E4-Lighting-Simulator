@@ -22,6 +22,7 @@ from lighting_simulator.scene.stl import _rot4_x, _rot4_y, _rot4_z
 def build(ctx):
     _expand_mirror_configs = ctx._expand_mirror_configs
     _panel_slot_data = ctx._panel_slot_data
+    apply_view_mode = ctx.apply_view_mode
     abs0_off_x = ctx.abs0_off_x
     abs0_off_y = ctx.abs0_off_y
     abs0_off_z = ctx.abs0_off_z
@@ -165,6 +166,7 @@ def build(ctx):
                 'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
+                'led_roles': group.get('led_roles') or [],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
             # Add dynamic group info if present
@@ -194,6 +196,7 @@ def build(ctx):
             config = {
                 'enabled': led['enable'].value,
                 'led_on': led.get('led_on', True),
+                'role': led.get('role', 'both'),
                 'pos_x': led['pos_x'].value,
                 'pos_y': led['pos_y'].value,
                 'pos_z': led['pos_z'].value,
@@ -241,6 +244,7 @@ def build(ctx):
             individual_leds_configs=individual_leds_configs,
             create_base_groups=any(led_states[:48]),
         )
+        apply_view_mode(leds)
         
         # ── Apply diffuser lens effect (FOV camera) ──
         if diffuser_enable_chk.value:

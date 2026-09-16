@@ -19,6 +19,7 @@ from lighting_simulator.domain.guides import (
     dynamic_group_world_geometry as _dynamic_group_world_geometry, enable_circular_guide,
     guide_is_enabled as _guide_is_enabled,
 )
+from lighting_simulator.domain.led import ROLES, led_role
 from lighting_simulator.domain.led_factory import create_leds
 from lighting_simulator.domain.optics import effective_lambertian_exponent as _get_effective_n
 from lighting_simulator.raytracing.mesh import ray_mesh_intersection as _ray_mesh_intersection
@@ -63,6 +64,7 @@ def build(ctx):
     abs3_rot_z = ctx.abs3_rot_z
     absorber_handles = ctx.absorber_handles
     absorbers_enable = ctx.absorbers_enable
+    apply_view_mode = ctx.apply_view_mode
     camera_fov_h = ctx.camera_fov_h
     camera_fov_handles = ctx.camera_fov_handles
     camera_fov_v = ctx.camera_fov_v
@@ -189,6 +191,10 @@ def build(ctx):
     update_room_intensity_map = ctx.update_room_intensity_map
     update_stl_mesh = ctx.update_stl_mesh
     update_ui_visibility = ctx.update_ui_visibility
+    view_mode_dropdown = ctx.view_mode_dropdown
+    flash_current_input = ctx.flash_current_input
+    led_voltage_input = ctx.led_voltage_input
+    led_efficacy_input = ctx.led_efficacy_input
     viewing_angle_slider = ctx.viewing_angle_slider
     vio_cam1_pitch = ctx.vio_cam1_pitch
     vio_cam1_yaw = ctx.vio_cam1_yaw
@@ -204,6 +210,14 @@ def build(ctx):
     vio_pos_z = ctx.vio_pos_z
     wall_dist_slider = ctx.wall_dist_slider
     wall_view_size = ctx.wall_view_size
+
+    # Inspector LED-button behaviour: 'toggle' on/off, or assign a role ('vio' | 'flash' | 'both')
+    _inspector_click_action = ['toggle']
+    _ROLE_COLORS = {'vio': "#00BFFF", 'flash': "#FF8C00", 'both': "#FF00FF"}
+    _ROLE_LABELS = {'vio': "VIO (continuous)", 'flash': "Flash (pulse only)", 'both': "Both"}
+
+    def _led_button_color(on, role):
+        return _ROLE_COLORS.get(role, "#FF00FF") if on else "#444444"
 
     def _clear_inspector():
         for h in _inspector_handles:
@@ -250,10 +264,13 @@ def build(ctx):
         return chk
 
     def _inspector_led_matrix(group):
-        """ALL / Row / LED on-off buttons that write into group['led_states']."""
+        """ALL / Row / LED buttons: toggle on/off or assign a role, per the click-action dropdown."""
         led_states_g = group['led_states']
         led_rows = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
         num_leds = group.get('num_leds', len(led_states_g))
+        if not group.get('led_roles') or len(group['led_roles']) != len(led_states_g):
+            group['led_roles'] = ['both'] * len(led_states_g)
+        roles_g = group['led_roles']
 
         def _refresh_hidden_colors():
             if callable(group.get('update_button_colors')):
@@ -264,55 +281,62 @@ def build(ctx):
                     if callable(uf):
                         uf()
 
-        _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
-        all_btn = _inspector_add(server.gui.add_button(
-            "ALL LEDs", color="#FF00FF" if any(led_states_g) else "#666666"
-        ))
-
-        def _on_all(_):
-            new_state = not all(led_states_g)
-            for i in range(len(led_states_g)):
-                led_states_g[i] = new_state
+        def _apply(indices):
+            action = _inspector_click_action[0]
+            idx = [i for i in indices if i < len(led_states_g)]
+            if action == 'toggle':
+                new_state = not all(led_states_g[i] for i in idx)
+                for i in idx:
+                    led_states_g[i] = new_state
+            else:
+                for i in idx:
+                    roles_g[i] = action
+                    led_states_g[i] = True
             _refresh_hidden_colors()
             update_scene()
             populate_inspector(selected_owner[0])
 
-        all_btn.on_click(_on_all)
+        _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
+        action_dd = _inspector_add(server.gui.add_dropdown(
+            "LED button action",
+            options=["Toggle on / off", "Set role: VIO", "Set role: Flash", "Set role: Both"],
+            initial_value={'toggle': "Toggle on / off", 'vio': "Set role: VIO", 'flash': "Set role: Flash",
+                           'both': "Set role: Both"}[_inspector_click_action[0]],
+            hint="Roles: VIO = on in flight only, Flash = photogrammetry pulse only, Both = always on.",
+        ))
+
+        @action_dd.on_update
+        def _(_):
+            _inspector_click_action[0] = {"Toggle on / off": 'toggle', "Set role: VIO": 'vio',
+                                          "Set role: Flash": 'flash', "Set role: Both": 'both'}[action_dd.value]
+
+        n_on = sum(1 for s in led_states_g if s)
+        counts = {r: sum(1 for s, ro in zip(led_states_g, roles_g) if s and ro == r) for r in ROLES}
+        _inspector_add(server.gui.add_html(
+            "<div style='font-size:11px;color:#bbb;margin:-2px 0 4px;'>"
+            f"{n_on} on: <span style='color:{_ROLE_COLORS['vio']};'>■ VIO {counts['vio']}</span> &nbsp;"
+            f"<span style='color:{_ROLE_COLORS['flash']};'>■ Flash {counts['flash']}</span> &nbsp;"
+            f"<span style='color:{_ROLE_COLORS['both']};'>■ Both {counts['both']}</span></div>"
+        ))
+        all_btn = _inspector_add(server.gui.add_button(
+            "ALL LEDs", color="#FF00FF" if any(led_states_g) else "#666666"
+        ))
+        all_btn.on_click(lambda _: _apply(range(len(led_states_g))))
 
         for row_idx, led_indices in enumerate(led_rows):
             any_on = any(led_states_g[i] for i in led_indices if i < len(led_states_g))
             row_btn = _inspector_add(server.gui.add_button(
                 f"Row {row_idx + 1}", color="#FF00FF" if any_on else "#666666"
             ))
-
-            def _make_row(indices):
-                def _on(_):
-                    new_state = not all(led_states_g[i] for i in indices if i < len(led_states_g))
-                    for i in indices:
-                        if i < len(led_states_g):
-                            led_states_g[i] = new_state
-                    _refresh_hidden_colors()
-                    update_scene()
-                    populate_inspector(selected_owner[0])
-                return _on
-
-            row_btn.on_click(_make_row(list(led_indices)))
+            row_btn.on_click(lambda _, idx=list(led_indices): _apply(idx))
 
         for led_idx in range(num_leds):
             if led_idx >= len(led_states_g):
                 break
-            color = "#FF00FF" if led_states_g[led_idx] else "#444444"
-            led_btn = _inspector_add(server.gui.add_button(f"L{led_idx + 1}", color=color))
-
-            def _make_led(idx):
-                def _on(_):
-                    led_states_g[idx] = not led_states_g[idx]
-                    _refresh_hidden_colors()
-                    update_scene()
-                    populate_inspector(selected_owner[0])
-                return _on
-
-            led_btn.on_click(_make_led(led_idx))
+            led_btn = _inspector_add(server.gui.add_button(
+                f"L{led_idx + 1}", color=_led_button_color(led_states_g[led_idx], roles_g[led_idx])
+            ))
+            led_btn.on_click(lambda _, i=led_idx: _apply([i]))
 
     def _inspector_mirror_checkbox(owner):
         """Checkbox making `owner` the mirror primary (XZ reflection).
@@ -712,6 +736,7 @@ def build(ctx):
         group['original_led_row_directions'] = list(rows)
         group['led_euler_angles'] = [(led['rx'], led['ry'], led['rz']) for led in leds]
         group['led_beam_tilts'] = [0.0] * len(leds)
+        group['led_roles'] = [led.get('role', 'both') for led in leds]
         group['led_sizes'] = [led['size'] for led in leds]
         group['led_viewing_angles'] = [led['view_angle'] for led in leds]
         group['led_lumens'] = [led['lumens'] if led['custom_lumens'] else None for led in leds]
@@ -752,6 +777,7 @@ def build(ctx):
                 item['size'].value, item['viewing_angle'].value = led['size'], led['view_angle']
                 item['lumens_override'].value = led['custom_lumens']
                 item['lumens_value'].value = led['lumens']
+                item['role'] = led.get('role', 'both')
         if state['editing_owner'] is None:
             group = create_custom_group(skip_update_scene=True, num_leds=max(1, len(state['leds'])),
                                         led_rows=[list(range(len(state['leds'])))] if state['leds'] else [[0]],
@@ -858,7 +884,7 @@ def build(ctx):
                 state['leds'].append({
                     'x': 0.0, 'y': 0.0, 'z': 0.0, 'rx': 0.0, 'ry': 0.0, 'rz': 0.0,
                     'size': 0.5, 'view_angle': 120.0, 'custom_lumens': False,
-                    'lumens': 100.0, '_group': state.get('target_group'),
+                    'lumens': 100.0, 'role': 'both', '_group': state.get('target_group'),
                 })
                 state['selected_led'] = len(state['leds']) - 1
                 update_designer_scene(full_rebuild=True)
@@ -943,6 +969,13 @@ def build(ctx):
                 ))
                 lumens_check.on_update(lambda _: led.__setitem__('custom_lumens', lumens_check.value))
                 lumens_value.on_update(lambda _: led.__setitem__('lumens', float(lumens_value.value)))
+                role_dd = _inspector_add(server.gui.add_dropdown(
+                    "Role", options=[_ROLE_LABELS[r] for r in ROLES],
+                    initial_value=_ROLE_LABELS.get(led.get('role', 'both'), _ROLE_LABELS['both']),
+                    hint="VIO: on in flight only. Flash: photogrammetry pulse only. Both: always on.",
+                ))
+                role_dd.on_update(lambda _: led.__setitem__(
+                    'role', next(r for r, lab in _ROLE_LABELS.items() if lab == role_dd.value)))
 
             _inspector_add(server.gui.add_html("<hr style='margin:8px 0;'>"))
             save_btn = _inspector_add(server.gui.add_button("Save", color="green"))
@@ -968,6 +1001,7 @@ def build(ctx):
             sizes = group.get('led_sizes', [])
             view_angles = group.get('led_viewing_angles', [])
             lumens_list = group.get('led_lumens', [])
+            roles_list = group.get('led_roles') or []
             for i, pos in enumerate(positions):
                 euler = eulers[i] if i < len(eulers) else _designer_euler_from_axes(
                     directions[i] if i < len(directions) else (1, 0, 0),
@@ -980,6 +1014,7 @@ def build(ctx):
                     'view_angle': float(view_angles[i]) if i < len(view_angles) else 120.0,
                     'custom_lumens': i < len(lumens_list) and lumens_list[i] is not None,
                     'lumens': float(lumens_list[i]) if i < len(lumens_list) and lumens_list[i] is not None else 100.0,
+                    'role': roles_list[i] if i < len(roles_list) else 'both',
                     '_group': group,
                 })
             state['target_group'] = state['target_group'] or group
@@ -990,7 +1025,7 @@ def build(ctx):
                 'rx': item['rot_x'].value, 'ry': item['rot_y'].value, 'rz': item['rot_z'].value,
                 'size': item['size'].value, 'view_angle': item['viewing_angle'].value,
                 'custom_lumens': item['lumens_override'].value,
-                'lumens': item['lumens_value'].value, '_individual': item,
+                'lumens': item['lumens_value'].value, 'role': item.get('role', 'both'), '_individual': item,
             })
         if owner is not None and not state['leds']:
             print("Panel Designer requires a dynamic panel or individual LEDs.")
@@ -1319,6 +1354,7 @@ def build(ctx):
                 'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
+                'led_roles': group.get('led_roles') or [],
                 'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
             # Add dynamic group info if present
@@ -1349,6 +1385,7 @@ def build(ctx):
             config = {
                 'enabled': led['enable'].value,
                 'led_on': led.get('led_on', True),  # Default to True if not set
+                'role': led.get('role', 'both'),
                 'pos_x': led['pos_x'].value,
                 'pos_y': led['pos_y'].value,
                 'pos_z': led['pos_z'].value,
@@ -1396,6 +1433,7 @@ def build(ctx):
             individual_leds_configs=individual_leds_configs,
             create_base_groups=any(led_states[:48]),
         )
+        apply_view_mode(leds)
         
         # ── Apply global Z rotation to all LEDs ──
         global_rot_z_deg = global_rotation_z_slider.value
@@ -1708,8 +1746,11 @@ def build(ctx):
                 square_thickness = 0.0002  # Very thin (0.2mm)
                 dims = (square_thickness, square_size, square_size)
                 
-                # White color: bright if enabled, dim if disabled; cyan if this panel is selected
-                square_color = (1.0, 1.0, 1.0) if led_enabled else (0.3, 0.3, 0.3)
+                # White (Both) / light blue (VIO) / orange (Flash): bright if lit in this operating mode,
+                # dim otherwise; cyan when the owning panel is selected
+                _role = led_role(led)
+                _tint = {'vio': (0.55, 0.85, 1.0), 'flash': (1.0, 0.65, 0.2)}.get(_role, (1.0, 1.0, 1.0))
+                square_color = _tint if led_enabled else tuple(c * 0.3 for c in _tint)
                 _owner = getattr(led, 'owner', None)
                 if selected_owner[0] is not None and _owner == selected_owner[0]:
                     square_color = (0.15, 1.0, 1.0) if led_enabled else (0.08, 0.45, 0.45)
@@ -2474,6 +2515,26 @@ def build(ctx):
         update_scene()
 
     wall_dist_slider.on_update(on_wall_dist_change)
+
+    def on_view_mode_change(_):
+        """Operating mode / flash electrical changed: redraw markers and flag the intensity map as stale."""
+        update_scene()
+        if room_mode_enable.value:
+            stale = _last_room_cache['grids'] is not None
+        else:
+            stale = _last_intensity_cache['grid'] is not None
+        if stale:
+            legend_html.content = (
+                "<div style='font-family: sans-serif;'>"
+                "<div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                f"<div style='color:#F0AD4E;font-size:12px;'>⚠ Operating mode is now <b>{view_mode_dropdown.value}</b>."
+                "<br>Click 'Update Intensity Map' / 'Update Room Intensity' to recalculate.</div></div>"
+            )
+
+    view_mode_dropdown.on_update(on_view_mode_change)
+    flash_current_input.on_update(on_view_mode_change)
+    led_voltage_input.on_update(on_view_mode_change)
+    led_efficacy_input.on_update(on_view_mode_change)
     
     # Register LED control button callbacks
     # Group buttons

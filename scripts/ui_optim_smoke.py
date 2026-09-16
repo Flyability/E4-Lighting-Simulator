@@ -88,7 +88,10 @@ find("Group").value = groups[0]
 find("Move / rotate the panel").value = True
 find("LED on / off").value = True
 find("Drive current (→ lumens)").value = True
-find("Require flash lux target").value = True
+find("Enable flash mode").value = True
+fire_update(find("Enable flash mode"))
+find("LED roles (off / VIO / flash / both)").value = True
+find("Max peak current in flash (A, 0 = off)").value = 60
 find("Require VIO FOV coverage").value = True
 find("Wall distances (cm)").value = "50, 150"
 find("Wall size").value = "Auto: fit camera FOV at each distance"
@@ -127,6 +130,8 @@ assert find("Design mode").value == MODE_DUCTS
 
 # --- mode 2: ducts -----------------------------------------------------------
 find("± duct centre shift (cm)").value = (2.0, 2.0, 0.0)
+find("Optimise LED roles (VIO / flash / both)").value = True
+find("Optimise for").value = "Flash image only"
 find("Max evaluations").value = 30
 find("Method").value = "random_search"
 find("Rays per pixel").value = 50

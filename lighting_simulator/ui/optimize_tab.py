@@ -28,6 +28,9 @@ def build(ctx):
     camera_fov_v = ctx.camera_fov_v
     camera_pitch = ctx.camera_pitch
     tilt_fov_deg = ctx.tilt_fov_deg
+    flash_current_input = ctx.flash_current_input
+    led_voltage_input = ctx.led_voltage_input
+    led_efficacy_input = ctx.led_efficacy_input
     camera_pos_x = ctx.camera_pos_x
     camera_pos_y = ctx.camera_pos_y
     config_dir = ctx.config_dir
@@ -96,6 +99,9 @@ def build(ctx):
     _MODE_PRESET = "3 · Run a preset spec file"
     _VIO_GEOM_ROOM = "Room (6 walls around the rig)"
     _VIO_GEOM_WALL = "Single far wall"
+    _OBJ_BOTH = "Flight + flash (weighted)"
+    _OBJ_FLIGHT = "Flight image only"
+    _OBJ_FLASH = "Flash image only"
 
     with tab_optim:
         server.gui.add_html(
@@ -132,8 +138,13 @@ def build(ctx):
         optim_beam_range = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
                                                        initial_value=(90, 130))
         optim_var_states = server.gui.add_checkbox("LED on / off", initial_value=False)
+        optim_var_roles = server.gui.add_checkbox(
+            "LED roles (off / VIO / flash / both)", initial_value=False,
+            hint="Lets the optimiser decide which LEDs flash and which stay on for VIO; needs flash mode below. "
+                 "Replaces 'LED on / off'.",
+        )
         optim_var_current = server.gui.add_checkbox("Drive current (→ lumens)", initial_value=False,
-                                                    hint="Shared per-LED current; lumens = I · V · efficacy")
+                                                    hint="Shared continuous per-LED current; lumens = I · V · efficacy")
         optim_current_range = server.gui.add_multi_slider("Current range (A)", min=0.1, max=13.0, step=0.1,
                                                           initial_value=(0.5, 3.0))
 
@@ -242,6 +253,8 @@ def build(ctx):
         duct_current = server.gui.add_multi_slider("Drive current range (A)", min=0.1, max=13.0, step=0.1,
                                                    initial_value=(0.3, 3.0))
         duct_on_off = server.gui.add_checkbox("Optimise per-LED on/off", initial_value=False)
+        duct_roles = server.gui.add_checkbox("Optimise LED roles (VIO / flash / both)", initial_value=False,
+                                             hint="Needs flash mode enabled below; replaces on/off")
         duct_led_size = server.gui.add_number("LED size (cm)", 1.0, min=0.2, max=3.0, step=0.1)
 
     _DUCT_AXES = {"Z (vertical)": ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
@@ -286,6 +299,7 @@ def build(ctx):
             'beam_angle_range': [float(v) for v in duct_beam.value], 'shared_beam_angle': True,
             'current_range': [float(v) for v in duct_current.value],
             'optimize_enabled': bool(duct_on_off.value),
+            'optimize_roles': bool(duct_roles.value and optim_flash_enable.value),
             'led_size': float(duct_led_size.value),
             'mirror_xz': bool(duct_mirror.value),
         }
@@ -391,22 +405,50 @@ def build(ctx):
     with _optim_elec_folder:
         server.gui.add_html(
             "<div style='color:#888;font-size:12px;margin-bottom:6px;'>LED flux is linear in current. "
-            "Modes share the geometry: <b>normal</b> = design current, <b>flash</b> = pulse current.</div>"
+            "Two operating points share the geometry: <b>flight</b> = VIO + Both LEDs at their continuous current, "
+            "<b>flash</b> = Flash + Both LEDs at the pulse current (VIO LEDs stay continuous).</div>"
         )
-        optim_drv_voltage = server.gui.add_number("LED forward voltage (V)", 6.0, min=1.0, max=60.0, step=0.1)
-        optim_drv_efficacy = server.gui.add_number("Efficacy (lm/W)", 180.0, min=10.0, max=400.0, step=5.0)
+        optim_drv_voltage = led_voltage_input  # shared with the Display tab ("Electrical")
+        optim_drv_efficacy = led_efficacy_input
+        server.gui.add_html("<div style='color:#888;font-size:11px;'>Forward voltage / efficacy / flash current are "
+                            "taken from the Display tab → Electrical.</div>")
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>Pulse driver (Flash / Both LEDs)</div>")
         optim_drv_max_current = server.gui.add_number("Max current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1)
-        optim_leds_per_driver = server.gui.add_number("LEDs per driver", 4, min=1, max=64, step=1)
-        optim_max_drivers = server.gui.add_number("Max drivers (0 = no limit)", 0, min=0, step=1)
-        optim_driver_cost = server.gui.add_slider("Cost per driver", min=0.0, max=0.2, step=0.005, initial_value=0.0)
-        optim_max_current = server.gui.add_number("Max total current (A, 0 = off)", 0.0, min=0.0, step=1.0)
-        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>Flash (photogrammetry)</div>")
-        optim_flash_enable = server.gui.add_checkbox("Require flash lux target", initial_value=False)
-        optim_flash_current = server.gui.add_number("Flash current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1)
-        optim_flash_lux = server.gui.add_number("Flash avg lux in FOV", 41000, min=0, step=1000)
+        optim_leds_per_driver = server.gui.add_number("LEDs per pulse driver", 4, min=1, max=64, step=1)
+        optim_max_pulse_drivers = server.gui.add_number("Max pulse drivers (0 = no limit)", 0, min=0, step=1)
+        optim_pulse_driver_cost = server.gui.add_slider("Cost per pulse driver", min=0.0, max=0.2, step=0.005,
+                                                        initial_value=0.0)
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>Continuous driver (VIO LEDs)</div>")
+        optim_cont_max_current = server.gui.add_number("Max current per LED (A)", 3.0, min=0.1, max=50.0, step=0.1)
+        optim_cont_leds_per_driver = server.gui.add_number("LEDs per continuous driver", 8, min=1, max=64, step=1)
+        optim_max_cont_drivers = server.gui.add_number("Max continuous drivers (0 = no limit)", 0, min=0, step=1)
+        optim_cont_driver_cost = server.gui.add_slider("Cost per continuous driver", min=0.0, max=0.2, step=0.005,
+                                                       initial_value=0.0)
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>Budgets (all drivers)</div>")
+        optim_max_drivers = server.gui.add_number("Max drivers total (0 = no limit)", 0, min=0, step=1)
+        optim_driver_cost = server.gui.add_slider("Cost per driver (any class)", min=0.0, max=0.2, step=0.005,
+                                                  initial_value=0.0)
+        optim_max_current = server.gui.add_number("Max continuous current (A, 0 = off)", 0.0, min=0.0, step=1.0,
+                                                  hint="Sum over the LEDs lit in flight")
+        optim_max_peak_current = server.gui.add_number("Max peak current in flash (A, 0 = off)", 0.0, min=0.0,
+                                                       step=5.0, hint="VIO continuous + (Flash + Both) × flash current")
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>Flash mode (photogrammetry pulse)</div>")
+        optim_flash_enable = server.gui.add_checkbox(
+            "Enable flash mode", initial_value=False,
+            hint="Off: every LED is continuous and roles are ignored (single operating point). "
+                 "On: LED roles decide which LEDs pulse; the flash image is scored too.",
+        )
+        optim_objective_mode = server.gui.add_dropdown(
+            "Optimise for", options=[_OBJ_BOTH, _OBJ_FLIGHT, _OBJ_FLASH], initial_value=_OBJ_BOTH,
+            hint="Which operating point's uniformity drives the score (constraints always apply to both)",
+        )
+        optim_flash_current = flash_current_input  # shared with the Display tab
+        optim_flash_uni_w = server.gui.add_slider("Flash uniformity weight", min=0.0, max=5.0, step=0.1,
+                                                  initial_value=1.0)
+        optim_flash_lux = server.gui.add_number("Flash avg lux in FOV (0 = off)", 41000, min=0, step=1000)
         optim_flash_dist = server.gui.add_number("… at wall distance (cm)", 50, min=10, max=1500, step=5,
                                                  hint="Must be one of the wall distances above (nearest is used)")
-        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>VIO coverage (normal mode)</div>")
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>VIO coverage (flight mode)</div>")
         optim_vio_enable = server.gui.add_checkbox("Require VIO FOV coverage", initial_value=False,
                                                    hint="Uses the VIO camera poses from the FOV tab")
         optim_vio_lux = server.gui.add_number("Min lux on VIO surfaces", 120, min=0, step=10)
@@ -429,6 +471,16 @@ def build(ctx):
             h.visible = room
         for h in (optim_vio_dist, optim_vio_wall_size, optim_vio_grid):
             h.visible = not room
+
+    def _optim_flash_changed(_=None):
+        on = bool(optim_flash_enable.value)
+        for h in (optim_objective_mode, optim_flash_uni_w, optim_flash_lux, optim_flash_dist,
+                  optim_cont_max_current, optim_cont_leds_per_driver, optim_max_cont_drivers, optim_cont_driver_cost,
+                  optim_max_pulse_drivers, optim_pulse_driver_cost, optim_max_peak_current, optim_var_roles, duct_roles):
+            h.visible = on
+
+    optim_flash_enable.on_update(_optim_flash_changed)
+    _optim_flash_changed()
 
     optim_vio_geometry.on_update(_optim_vio_geometry_changed)
     _optim_vio_geometry_changed()
@@ -584,11 +636,20 @@ def build(ctx):
         optim_max_drivers.value = int(con.get('max_drivers') or 0)
         optim_driver_cost.value = float(con.get('driver_cost', 0.0))
         optim_max_current.value = float(con.get('max_total_current_a') or 0.0)
+        optim_max_peak_current.value = float(con.get('max_peak_current_a') or 0.0)
+        optim_max_pulse_drivers.value = int(con.get('max_pulse_drivers') or 0)
+        optim_pulse_driver_cost.value = float(con.get('pulse_driver_cost', 0.0))
+        optim_max_cont_drivers.value = int(con.get('max_cont_drivers') or 0)
+        optim_cont_driver_cost.value = float(con.get('cont_driver_cost', 0.0))
         drv = spec.get('driver', {})
         optim_drv_voltage.value = float(drv.get('voltage_v', 6.0))
         optim_drv_efficacy.value = float(drv.get('efficacy_lm_per_w', 180.0))
         optim_drv_max_current.value = float(drv.get('max_current_a', 13.0))
         optim_leds_per_driver.value = int(drv.get('leds_per_driver', 1))
+        cdrv = spec.get('cont_driver') or {}
+        optim_cont_max_current.value = float(cdrv.get('max_current_a', 3.0))
+        optim_cont_leds_per_driver.value = int(cdrv.get('leds_per_driver', 8))
+        optim_objective_mode.value = (_OBJ_FLASH if float(obj.get('flight_weight', 1.0)) == 0.0 else _OBJ_BOTH)
         vio = spec.get('vio') or {}
         optim_vio_geometry.value = _VIO_GEOM_ROOM if vio.get('geometry') == 'room' else _VIO_GEOM_WALL
         optim_vio_room_dist.value = int(vio.get('room_dist', 300))
@@ -599,15 +660,20 @@ def build(ctx):
         optim_flash_enable.value = False
         optim_vio_enable.value = False
         for m in spec.get('modes', []):
-            if m.get('min_avg_lux'):
+            is_flash = m.get('flash') if m.get('flash') is not None else m.get('current_a') is not None
+            if is_flash:
                 optim_flash_enable.value = True
                 optim_flash_current.value = float(m.get('current_a') or optim_flash_current.value)
-                optim_flash_lux.value = int(m['min_avg_lux'])
+                optim_flash_lux.value = int(m.get('min_avg_lux') or 0)
                 optim_flash_dist.value = int(m.get('min_avg_lux_dist') or optim_flash_dist.value)
+                optim_flash_uni_w.value = float(m.get('uniformity_weight', 0.0))
+                if float(obj.get('flight_weight', 1.0)) > 0 and not m.get('uniformity_weight'):
+                    optim_objective_mode.value = _OBJ_FLIGHT
             if m.get('vio_min_lux'):
                 optim_vio_enable.value = True
                 optim_vio_lux.value = int(m['vio_min_lux'])
                 optim_vio_fraction.value = int(round(100 * float(m.get('vio_min_fraction', 0.5))))
+        _optim_flash_changed()
         n_keep = len(con.get('keep_out', []))
         optim_keepout_html.content = (
             f"<div style='color:#888;font-size:12px;'>Keep-out boxes: {n_keep} (from preset spec)</div>"
@@ -661,6 +727,7 @@ def build(ctx):
             duct_beam.value = tuple(float(b) for b in v.get('beam_angle_range', (90, 130)))
             duct_current.value = tuple(float(c) for c in v.get('current_range', (0.3, 3.0)))
             duct_on_off.value = bool(v.get('optimize_enabled', False))
+            duct_roles.value = bool(v.get('optimize_roles', False))
             duct_led_size.value = float(v.get('led_size', 1.0))
             optim_mode.value = _MODE_DUCTS
         else:
@@ -674,6 +741,7 @@ def build(ctx):
             optim_var_tilts.value = 'beam_tilts' in types
             optim_var_beam.value = 'beam_angle' in types
             optim_var_states.value = 'led_states' in types
+            optim_var_roles.value = 'led_roles' in types
             optim_var_current.value = 'group_current' in types
             for v in variables:
                 if v.get('type') == 'panel_pose':
@@ -768,7 +836,9 @@ def build(ctx):
         if optim_var_beam.value:
             lo, hi = optim_beam_range.value
             variables.append({'type': 'beam_angle', 'group_index': gi, 'angle_range': [float(lo), float(hi)]})
-        if optim_var_states.value:
+        if optim_var_roles.value and optim_flash_enable.value:
+            variables.append({'type': 'led_roles', 'group_index': gi})
+        elif optim_var_states.value:
             variables.append({'type': 'led_states', 'group_index': gi})
         if optim_var_current.value:
             lo, hi = optim_current_range.value
@@ -804,6 +874,7 @@ def build(ctx):
         work['objective'] = {
             'metric': optim_metric.value,
             'min_percentile': float(optim_min_pct.value),
+            'flight_weight': 0.0 if (optim_flash_enable.value and optim_objective_mode.value == _OBJ_FLASH) else 1.0,
             'coverage_weight': float(optim_cov_w.value),
             'min_avg_lux': float(optim_min_lux.value) or None,
             'lux_weight': float(optim_lux_w.value),
@@ -817,6 +888,11 @@ def build(ctx):
             'max_drivers': int(optim_max_drivers.value) or None,
             'driver_cost': float(optim_driver_cost.value),
             'max_total_current_a': float(optim_max_current.value) or None,
+            'max_peak_current_a': (float(optim_max_peak_current.value) or None) if optim_flash_enable.value else None,
+            'max_pulse_drivers': (int(optim_max_pulse_drivers.value) or None) if optim_flash_enable.value else None,
+            'pulse_driver_cost': float(optim_pulse_driver_cost.value) if optim_flash_enable.value else 0.0,
+            'max_cont_drivers': (int(optim_max_cont_drivers.value) or None) if optim_flash_enable.value else None,
+            'cont_driver_cost': float(optim_cont_driver_cost.value) if optim_flash_enable.value else 0.0,
             'min_led_spacing_cm': float(optim_spacing.value) or None,
             'spacing_weight': float(optim_spacing_w.value),
             'min_beam_angle_deg': float(optim_min_beam_angle.value) or None,
@@ -831,7 +907,12 @@ def build(ctx):
             'max_current_a': float(optim_drv_max_current.value),
             'leds_per_driver': int(optim_leds_per_driver.value),
         }
-        modes = [{'name': 'normal'}]
+        if optim_flash_enable.value:
+            work['cont_driver'] = {'max_current_a': float(optim_cont_max_current.value),
+                                   'leds_per_driver': int(optim_cont_leds_per_driver.value)}
+        else:
+            work.pop('cont_driver', None)
+        modes = [{'name': 'flight'}]
         if optim_vio_enable.value:
             modes[0].update({'vio_min_lux': float(optim_vio_lux.value),
                              'vio_min_fraction': float(optim_vio_fraction.value) / 100.0})
@@ -848,9 +929,12 @@ def build(ctx):
         else:
             work.pop('vio', None)
         if optim_flash_enable.value:
+            flash_only = optim_objective_mode.value == _OBJ_FLASH
+            flight_only = optim_objective_mode.value == _OBJ_FLIGHT
             modes.append({'name': 'flash', 'current_a': float(optim_flash_current.value),
-                          'min_avg_lux': float(optim_flash_lux.value),
-                          'min_avg_lux_dist': float(optim_flash_dist.value)})
+                          'min_avg_lux': float(optim_flash_lux.value) or None,
+                          'min_avg_lux_dist': float(optim_flash_dist.value),
+                          'uniformity_weight': 0.0 if flight_only else (1.0 if flash_only else float(optim_flash_uni_w.value))})
         work['modes'] = modes if (optim_vio_enable.value or optim_flash_enable.value) else []
 
     def _optim_build():
