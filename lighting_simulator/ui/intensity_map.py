@@ -88,6 +88,8 @@ def build(ctx):
     row3_chk = ctx.row3_chk
     row4_chk = ctx.row4_chk
     server = ctx.server
+    show_tilt_fovs = ctx.show_tilt_fovs
+    tilt_fov_deg = ctx.tilt_fov_deg
     show_intensity_map = ctx.show_intensity_map
     stl_absorber_enable = ctx.stl_absorber_enable
     stl_mesh_data = ctx.stl_mesh_data
@@ -228,23 +230,32 @@ def build(ctx):
         html_lines.append("</div>")
         return "".join(html_lines)
 
-    def _empty_fov_html():
+    def _empty_fov_html(title="Pattern Uniformity"):
         return (
             "<div style='font-family:sans-serif;margin-top:10px;padding:8px;border-top:1px solid #444;'>"
-            "<div style='font-weight:600;margin-bottom:4px;'>Pattern Uniformity</div>"
+            f"<div style='font-weight:600;margin-bottom:4px;'>{title}</div>"
             "<div style='color:#888;font-size:12px;'>No intensity data inside camera FOV</div></div>"
         )
+
+    def _tilt_fov_pitches():
+        """[(title, pitch_deg)] for the up/down tilted copies of the main camera, or []."""
+        if not show_tilt_fovs.value:
+            return []
+        t = float(tilt_fov_deg.value)
+        p = float(camera_pitch.value)
+        return [(f"Uniformity ↑ camera +{t:g}°", p + t), (f"Uniformity ↓ camera −{t:g}°", p - t)]
 
     def _wall_grid_cell_centers_cm(grid, wall_size_cm, wall_dist):
         return wall_grid_cell_centers_cm(grid.shape, wall_size_cm, wall_dist)
 
-    def _collect_room_fov_lux(cache):
-        """Lux values of room-wall cells that fall inside the main-camera FOV."""
+    def _collect_room_fov_lux(cache, pitch=None):
+        """Lux values of room-wall cells that fall inside the main-camera FOV (optionally re-pitched)."""
         grids = cache.get('grids')
         specs = cache.get('wall_specs')
         if not grids or not specs:
             return np.array([])
         cam_pos = np.array([camera_pos_x.value, camera_pos_y.value, 0.0], dtype=float)
+        pitch = camera_pitch.value if pitch is None else pitch
         parts = []
         for name, grid in grids.items():
             spec = specs.get(name)
@@ -256,7 +267,7 @@ def build(ctx):
                 cache['top_bottom_dist'], cache['back_dist'],
             )
             mask = points_in_pinhole_fov(
-                cam_pos, camera_pitch.value,
+                cam_pos, pitch,
                 camera_fov_h.value, camera_fov_v.value, pts,
             )
             if np.any(mask):
@@ -348,6 +359,13 @@ def build(ctx):
         )
         if not html:
             html = _empty_fov_html()
+        for title, pitch in _tilt_fov_pitches():
+            trap = _camera_fov_wall_trapezoid(wall_dist - camera_pos_x.value, pitch,
+                                              camera_fov_h.value, camera_fov_v.value)
+            html += _compute_uniformity_html(
+                grid, fov_trapezoid=(*trap, camera_pos_y.value), wall_size_cm=wall_size_cm,
+                min_percentile=float(uniformity_percentile_slider.value), title=title, compact=True,
+            ) or _empty_fov_html(title)
         return html + _compute_vio_occupancy_html()
 
     def _room_metrics_html():
@@ -358,6 +376,10 @@ def build(ctx):
             html = (_compute_uniformity_html(fov_lux.reshape(1, -1),
                                              min_percentile=float(uniformity_percentile_slider.value))
                     or _empty_fov_html())
+        for title, pitch in _tilt_fov_pitches():
+            lux = _collect_room_fov_lux(_last_room_cache, pitch=pitch)
+            html += (_compute_uniformity_html(lux.reshape(1, -1), min_percentile=float(uniformity_percentile_slider.value),
+                                              title=title, compact=True) if lux.size else "") or _empty_fov_html(title)
         return html + _compute_vio_occupancy_html()
 
     def _refresh_uniformity():

@@ -27,6 +27,7 @@ def build(ctx):
     camera_fov_h = ctx.camera_fov_h
     camera_fov_v = ctx.camera_fov_v
     camera_pitch = ctx.camera_pitch
+    tilt_fov_deg = ctx.tilt_fov_deg
     camera_pos_x = ctx.camera_pos_x
     camera_pos_y = ctx.camera_pos_y
     config_dir = ctx.config_dir
@@ -445,6 +446,12 @@ def build(ctx):
         optim_cov_w = server.gui.add_slider("Coverage penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
         optim_min_lux = server.gui.add_number("Min average lux, normal mode (0 = off)", 0, min=0, step=10)
         optim_lux_w = server.gui.add_slider("Lux penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        optim_tilt_enable = server.gui.add_checkbox(
+            "Add ±tilt FOV uniformity", initial_value=False,
+            hint="Also score the camera pitched up and down by the FOV tab's 'Tilt FOV angle' (mean 1−U of both, "
+                 "penalty 'tilt_uniformity').",
+        )
+        optim_tilt_w = server.gui.add_slider("Tilt uniformity weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
         optim_max_leds = server.gui.add_number("Max active LEDs (0 = no limit)", 0, min=0, step=1)
         optim_max_leds_w = server.gui.add_slider("Penalty per LED over limit", min=0.0, max=1.0, step=0.01,
                                                  initial_value=0.05)
@@ -561,6 +568,10 @@ def build(ctx):
         optim_cov_w.value = float(obj.get('coverage_weight', 1.0))
         optim_min_lux.value = int(obj.get('min_avg_lux') or 0)
         optim_lux_w.value = float(obj.get('lux_weight', 1.0))
+        optim_tilt_enable.value = bool(obj.get('tilt_fov_deg'))
+        if obj.get('tilt_fov_deg'):
+            tilt_fov_deg.value = int(round(float(obj['tilt_fov_deg']) / 5) * 5)
+        optim_tilt_w.value = float(obj.get('tilt_fov_weight', 1.0))
         con = spec.get('constraints', {})
         optim_max_leds.value = int(con.get('max_leds') or 0)
         optim_max_leds_w.value = float(con.get('max_leds_weight', 0.05))
@@ -796,6 +807,8 @@ def build(ctx):
             'coverage_weight': float(optim_cov_w.value),
             'min_avg_lux': float(optim_min_lux.value) or None,
             'lux_weight': float(optim_lux_w.value),
+            'tilt_fov_deg': float(tilt_fov_deg.value) if optim_tilt_enable.value else None,
+            'tilt_fov_weight': float(optim_tilt_w.value),
         }
         work['constraints'] = {
             'max_leds': int(optim_max_leds.value) or None,

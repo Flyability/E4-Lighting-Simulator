@@ -200,6 +200,24 @@ def rasterize_fisheye_fov_on_plane(
     return mask, us, vs
 
 
+def rasterize_pinhole_fov_on_plane(
+    cam_pos, pitch_deg, hfov_deg, vfov_deg,
+    axis, plane_coord, u_min, u_max, v_min, v_max, n_grid=100,
+):
+    """Pinhole-camera counterpart of :func:`rasterize_fisheye_fov_on_plane` (yaw = 0)."""
+    n_grid = int(n_grid)
+    us = np.linspace(u_min, u_max, n_grid, endpoint=False) + (u_max - u_min) / (2 * n_grid)
+    vs = np.linspace(v_min, v_max, n_grid, endpoint=False) + (v_max - v_min) / (2 * n_grid)
+    uu, vv = np.meshgrid(us, vs, indexing="ij")
+    u_axis, v_axis = _PLANE_UV_AXES[axis]
+    pts = np.empty(uu.shape + (3,), dtype=float)
+    pts[..., axis] = float(plane_coord)
+    pts[..., u_axis] = uu
+    pts[..., v_axis] = vv
+    mask = points_in_pinhole_fov(cam_pos, pitch_deg, hfov_deg, vfov_deg, pts)
+    return mask, us, vs
+
+
 def fov_plane_mask_to_quads_and_contour(mask, us, vs, axis, plane_m):
     """Build plane quads (metres) and silhouette segments from a U×V occupancy mask.
 

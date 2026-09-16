@@ -11,7 +11,7 @@ import numpy as np
 import trimesh
 from lighting_simulator.camera.fov import (
     camera_fov_wall_trapezoid as _camera_fov_wall_trapezoid, fov_plane_mask_to_quads_and_contour,
-    rasterize_fisheye_fov_on_plane, vio_hfov_vfov_deg, vio_optical_axis,
+    rasterize_fisheye_fov_on_plane, rasterize_pinhole_fov_on_plane, vio_hfov_vfov_deg, vio_optical_axis,
 )
 from lighting_simulator.domain.geometry import as_vec3 as _as_vec3
 from lighting_simulator.domain.guides import (
@@ -166,6 +166,7 @@ def build(ctx):
     show_rays_output = ctx.show_rays_output
     show_room_intensity = ctx.show_room_intensity
     show_room_walls = ctx.show_room_walls
+    show_tilt_fovs = ctx.show_tilt_fovs
     show_vio_fov = ctx.show_vio_fov
     static_scene_handles = ctx.static_scene_handles
     stl_absorber_enable = ctx.stl_absorber_enable
@@ -179,6 +180,7 @@ def build(ctx):
     stl_rot_z = ctx.stl_rot_z
     stl_scale = ctx.stl_scale
     template_dropdown = ctx.template_dropdown
+    tilt_fov_deg = ctx.tilt_fov_deg
     uniformity_percentile_slider = ctx.uniformity_percentile_slider
     update_all_led_buttons = ctx.update_all_led_buttons
     update_intensity_button = ctx.update_intensity_button
@@ -2053,33 +2055,64 @@ def build(ctx):
             )
             camera_fov_handles.append(cam_axis_h)
 
+        # Wall patches shared by the tilted-camera and VIO overlays:
+        # (axis, plane_coord_cm, u_min, u_max, v_min, v_max, inward_sign); axis 0=x, 1=y, 2=z,
+        # (u, v) are the two remaining axes in ascending order, inward_sign offsets the overlay into the room.
+        if room_mode_enable.value:
+            _fd = room_front_dist.value
+            _sd = room_side_dist.value
+            _td = room_top_bottom_dist.value
+            # Same extent as draw_room_walls: 2.5x depth behind the front wall
+            _x_back_edge = _fd - (_fd - circle_center_slider.value) * 2.5
+            if show_back_wall.value:
+                _x_back_edge = max(_x_back_edge, -room_back_dist.value)
+            overlay_walls = [
+                (0, _fd, -_sd, _sd, -_td, _td, -1.0),   # front
+                (1, -_sd, _x_back_edge, _fd, -_td, _td, +1.0),  # left
+                (1, _sd, _x_back_edge, _fd, -_td, _td, -1.0),   # right
+                (2, _td, _x_back_edge, _fd, -_sd, _sd, -1.0),   # top
+                (2, -_td, _x_back_edge, _fd, -_sd, _sd, +1.0),  # bottom
+            ]
+            if show_back_wall.value:
+                overlay_walls.append((0, -room_back_dist.value, -_sd, _sd, -_td, _td, +1.0))
+        else:
+            _half = wall_view_size.value / 2.0
+            overlay_walls = [(0, wall_dist_slider.value, -_half, _half, -_half, _half, -1.0)]
+
+        # Up / down copies of the main camera (separate uniformity metrics in the legend)
+        if show_camera_fov.value and show_tilt_fovs.value:
+            t = float(tilt_fov_deg.value)
+            cam_pos = np.array([camera_pos_x.value, camera_pos_y.value, 0.0], dtype=float)
+            for tag, pitch, color in (('up', camera_pitch.value + t, (0.65, 1.0, 0.25)),
+                                      ('down', camera_pitch.value - t, (0.0, 0.8, 0.55))):
+                all_segs = []
+                for w_axis, plane_cm, u_min, u_max, v_min, v_max, inward in overlay_walls:
+                    if (cam_pos[w_axis] - plane_cm) * inward <= 1e-6:
+                        continue
+                    mask, us, vs = rasterize_pinhole_fov_on_plane(
+                        cam_pos, pitch, camera_fov_h.value, camera_fov_v.value,
+                        w_axis, plane_cm, u_min, u_max, v_min, v_max, n_grid=90,
+                    )
+                    _, _, segs = fov_plane_mask_to_quads_and_contour(mask, us, vs, w_axis, plane_cm / 100.0 + inward * 0.006)
+                    if len(segs) > 0:
+                        all_segs.append(segs)
+                if all_segs:
+                    camera_fov_handles.append(server.scene.add_line_segments(
+                        f"/camera/tilt_{tag}/fov_border", points=np.concatenate(all_segs, axis=0),
+                        colors=color, line_width=3.0,
+                    ))
+                axis = vio_optical_axis(pitch, 0.0)
+                camera_fov_handles.append(server.scene.add_line_segments(
+                    f"/camera/tilt_{tag}/axis",
+                    points=np.array([[cam_pos / 100.0, (cam_pos + axis * 6.0) / 100.0]]),
+                    colors=color, line_width=3.0,
+                ))
+
         # Draw VIO fisheye FOV footprints on the wall(s).
         # In room mode the footprint is projected on ALL room walls (front,
         # left, right, top, bottom, and back if shown), not just the front one.
         if show_vio_fov.value:
-            # Wall patches: (axis, plane_coord_cm, u_min, u_max, v_min, v_max, inward_sign)
-            # axis 0=x, 1=y, 2=z; (u, v) are the two remaining axes in
-            # ascending order; inward_sign offsets the overlay into the room.
-            if room_mode_enable.value:
-                _fd = room_front_dist.value
-                _sd = room_side_dist.value
-                _td = room_top_bottom_dist.value
-                # Same extent as draw_room_walls: 2.5x depth behind the front wall
-                _x_back_edge = _fd - (_fd - circle_center_slider.value) * 2.5
-                if show_back_wall.value:
-                    _x_back_edge = max(_x_back_edge, -room_back_dist.value)
-                vio_walls = [
-                    (0, _fd, -_sd, _sd, -_td, _td, -1.0),   # front
-                    (1, -_sd, _x_back_edge, _fd, -_td, _td, +1.0),  # left
-                    (1, _sd, _x_back_edge, _fd, -_td, _td, -1.0),   # right
-                    (2, _td, _x_back_edge, _fd, -_sd, _sd, -1.0),   # top
-                    (2, -_td, _x_back_edge, _fd, -_sd, _sd, +1.0),  # bottom
-                ]
-                if show_back_wall.value:
-                    vio_walls.append((0, -room_back_dist.value, -_sd, _sd, -_td, _td, +1.0))
-            else:
-                _half = wall_view_size.value / 2.0
-                vio_walls = [(0, wall_dist_slider.value, -_half, _half, -_half, _half, -1.0)]
+            vio_walls = overlay_walls
 
             vio_hfov, vio_vfov = vio_hfov_vfov_deg(vio_long_fov.value, vio_landscape.value)
             cam_pos = np.array([vio_pos_x.value, vio_pos_y.value, vio_pos_z.value], dtype=float)
@@ -2304,6 +2337,8 @@ def build(ctx):
     camera_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pos_y.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_pitch.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    show_tilt_fovs.on_update(lambda _: (update_scene(), _refresh_uniformity()))
+    tilt_fov_deg.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     show_vio_fov.on_update(lambda _: update_scene())
     vio_fill_fov.on_update(lambda _: update_scene())
     vio_pos_x.on_update(lambda _: (update_scene(), _refresh_uniformity()))

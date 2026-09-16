@@ -1104,6 +1104,12 @@ def main():
         camera_pitch = server.gui.add_slider(
             "Camera pitch (°)", min=-60, max=60, step=1, initial_value=0
         )
+        show_tilt_fovs = server.gui.add_checkbox(
+            "Show ±tilt FOVs (up / down uniformity)", initial_value=False,
+            hint="Two copies of this camera pitched up and down by the angle below. Their footprints are drawn "
+                 "and the legend gains a separate uniformity for each.",
+        )
+        tilt_fov_deg = server.gui.add_slider("Tilt FOV angle (°)", min=5, max=85, step=5, initial_value=45)
         capture_fov_btn = server.gui.add_button("Capture FOV Image", color="green")
 
     # VIO cameras (2× VD66GY equidistant fisheye)
@@ -1762,6 +1768,7 @@ def main():
         row4_chk=row4_chk,
         server=server,
         show_intensity_map=show_intensity_map,
+        show_tilt_fovs=show_tilt_fovs,
         stl_absorber_enable=stl_absorber_enable,
         stl_mesh_data=stl_mesh_data,
         stl_pos_x=stl_pos_x,
@@ -1771,6 +1778,7 @@ def main():
         stl_rot_y=stl_rot_y,
         stl_rot_z=stl_rot_z,
         stl_scale=stl_scale,
+        tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
         viewing_angle_slider=viewing_angle_slider,
         vio_cam1_pitch=vio_cam1_pitch,
@@ -2102,6 +2110,7 @@ def main():
         show_rays_output=show_rays_output,
         show_room_intensity=show_room_intensity,
         show_room_walls=show_room_walls,
+        show_tilt_fovs=show_tilt_fovs,
         show_vio_fov=show_vio_fov,
         static_scene_handles=static_scene_handles,
         stl_absorber_enable=stl_absorber_enable,
@@ -2115,6 +2124,7 @@ def main():
         stl_rot_z=stl_rot_z,
         stl_scale=stl_scale,
         template_dropdown=template_dropdown,
+        tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
         update_all_led_buttons=update_all_led_buttons,
         update_intensity_button=update_intensity_button,
@@ -2169,6 +2179,7 @@ def main():
         stl_absorber_enable=stl_absorber_enable,
         stl_mesh_data=stl_mesh_data,
         tab_optim=tab_optim,
+        tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
         update_intensity_map=update_intensity_map,
         vio_cam1_pitch=vio_cam1_pitch,

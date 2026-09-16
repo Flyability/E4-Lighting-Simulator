@@ -43,8 +43,8 @@ class CameraSpec:
     fov_h: float = 75.0
     fov_v: float = 60.0
 
-    def trapezoid(self, wall_dist):
-        trap = camera_fov_wall_trapezoid(wall_dist - self.pos_x, self.pitch, self.fov_h, self.fov_v)
+    def trapezoid(self, wall_dist, pitch_offset=0.0):
+        trap = camera_fov_wall_trapezoid(wall_dist - self.pos_x, self.pitch + pitch_offset, self.fov_h, self.fov_v)
         return (*trap, self.pos_y)
 
     def fit_wall_size(self, wall_dist, margin=1.15, step=10.0):
@@ -66,6 +66,10 @@ class ObjectiveSpec:
     min_avg_lux: float | None = None
     lux_weight: float = 1.0
     """Penalty weight for (min_avg_lux − Eavg)/min_avg_lux when below target."""
+    tilt_fov_deg: float | None = None
+    """Also score the same camera pitched ±this many degrees (looking up / down); None = off."""
+    tilt_fov_weight: float = 1.0
+    """Weight of the mean (1 − U) of the two tilted footprints, added as penalty 'tilt_uniformity'."""
 
 
 @dataclass
@@ -198,11 +202,15 @@ class Evaluation:
     total_current_a: float = 0.0
     modes: dict = field(default_factory=dict)
     """Per-mode diagnostics: ``{name: {'e_avg', 'vio_fraction', 'scale'}}``."""
+    tilt: dict = field(default_factory=dict)
+    """±tilt FOV uniformity (%): ``{'up': .., 'down': ..}`` when ``objective.tilt_fov_deg`` is set."""
 
     def summary(self):
         pen = ", ".join(f"{k}={v:.3f}" for k, v in self.penalties.items() if v)
         s = (f"score={self.score:.4f} U={self.uniformity_pct:.1f}% cov={self.coverage*100:.0f}% "
              f"Eavg={self.e_avg:.0f}lx LEDs={self.n_active}")
+        if self.tilt:
+            s += f" tilt[↑{self.tilt.get('up', 0):.0f}% ↓{self.tilt.get('down', 0):.0f}%]"
         if self.n_drivers:
             s += f" drv={self.n_drivers} I={self.total_current_a:.1f}A"
         for name, m in self.modes.items():
@@ -233,6 +241,7 @@ class Evaluation:
             n_active=self.n_active, penalties=pen, metrics=self.metrics, grid=self.grid,
             vio_grid=self.vio_grid, n_drivers=self.n_drivers, total_current_a=self.total_current_a,
             modes=modes,
+            tilt={k: 0.5 * (v + other.tilt.get(k, v)) for k, v in self.tilt.items()},
         )
 
 
@@ -288,6 +297,13 @@ class Problem:
             trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist))
             for w in self.walls
         ]
+        # Same camera pitched up / down: (mask_up, mask_down) per wall, or None
+        t = self.objective.tilt_fov_deg
+        self._tilt_masks = [
+            tuple(trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist, s * t))
+                  for s in (+1.0, -1.0))
+            for w in self.walls
+        ] if t else None
         self._needs_vio = self.vio is not None and any(m.vio_min_lux for m in self.modes)
         self._vio_room = self._needs_vio and self.vio.geometry == "room"
         if self._vio_room:
@@ -356,7 +372,8 @@ class Problem:
                               e_avg=0.0, n_active=0, penalties=penalties)
 
         scores, unis, e_avgs, covs, grids, last_metrics = [], [], [], [], [], None
-        for wall, fov_mask in zip(self.walls, self._fov_masks):
+        tilt_scores, tilt_unis = [], {'up': [], 'down': []}
+        for wi, (wall, fov_mask) in enumerate(zip(self.walls, self._fov_masks)):
             grid = self._trace(scene, wall)
             fov = grid[fov_mask]
             coverage = float(np.count_nonzero(fov > 0) / max(1, fov.size))
@@ -373,6 +390,18 @@ class Problem:
                 last_metrics = metrics
             covs.append(coverage)
             grids.append(grid)
+            if self._tilt_masks is not None:
+                for key, mask in zip(('up', 'down'), self._tilt_masks[wi]):
+                    if not np.any(mask):
+                        continue  # footprint entirely off this wall: nothing to judge
+                    tm = uniformity_metrics(grid[mask], self.objective.min_percentile)
+                    if tm is None:
+                        tilt_scores.append(1.0)  # cells exist but none are lit
+                        tilt_unis[key].append(0.0)
+                    else:
+                        m = self.objective.metric
+                        tilt_scores.append({'u0': 1.0 - tm.u0, 'u1': 1.0 - tm.u1, 'cv': tm.cv}[m])
+                        tilt_unis[key].append(tm.uniformity_pct)
         self.n_evals += 1
 
         score = float(np.mean(scores))
@@ -383,6 +412,11 @@ class Problem:
             short = max(0.0, (self.objective.min_avg_lux - min(e_avgs)) / self.objective.min_avg_lux)
             penalties['lux'] = self.objective.lux_weight * short
         penalties['coverage'] = self.objective.coverage_weight * (1.0 - coverage)
+        tilt = {}
+        if self._tilt_masks is not None:
+            if tilt_scores:
+                penalties['tilt_uniformity'] = self.objective.tilt_fov_weight * float(np.mean(tilt_scores))
+            tilt = {k: float(np.mean(v)) if v else 0.0 for k, v in tilt_unis.items()}
 
         modes = {}
         vio_grid = None
@@ -403,7 +437,7 @@ class Problem:
                           e_avg=e_avg, n_active=len(active), penalties=penalties, metrics=last_metrics,
                           grid=(grids[0] if len(grids) == 1 else grids) if keep_grid else None,
                           vio_grid=vio_grid if keep_grid else None,
-                          n_drivers=n_drivers, total_current_a=total_current, modes=modes)
+                          n_drivers=n_drivers, total_current_a=total_current, modes=modes, tilt=tilt)
 
     def __call__(self, x):
         return self.evaluate(x).score

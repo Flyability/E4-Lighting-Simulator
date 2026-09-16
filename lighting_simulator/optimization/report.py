@@ -220,6 +220,10 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
                 f"{e.metrics.e_min:,.0f} / {e.metrics.e_max:,.0f} lx" if e.metrics else "—" for e in evs]],
             ["ΔEV (stops)", *[f"{e.metrics.delta_ev:.2f}" if e.metrics else "—" for e in evs]],
         ]
+    if problem.objective.tilt_fov_deg:
+        t = problem.objective.tilt_fov_deg
+        rows.append([f"U0, camera pitched +{t:g}° (up)", *[f"{e.tilt.get('up', 0):.1f} %" for e in evs]])
+        rows.append([f"U0, camera pitched −{t:g}° (down)", *[f"{e.tilt.get('down', 0):.1f} %" for e in evs]])
     for mode in problem.modes:
         rows.append([f"{mode.name}: E_avg", *[
             f"{e.modes.get(mode.name, {}).get('e_avg', 0):,.0f} lx" for e in evs]])
