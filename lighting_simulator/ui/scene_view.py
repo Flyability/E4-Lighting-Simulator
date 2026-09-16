@@ -213,11 +213,16 @@ def build(ctx):
 
     # Inspector LED-button behaviour: 'toggle' on/off, or assign a role ('vio' | 'flash' | 'both')
     _inspector_click_action = ['toggle']
-    _ROLE_COLORS = {'vio': "#00BFFF", 'flash': "#FF8C00", 'both': "#FF00FF"}
+    _ROLE_COLORS = {'vio': "#1E90FF", 'flash': "#FF8C00", 'both': "#FFFFFF"}
     _ROLE_LABELS = {'vio': "VIO (continuous)", 'flash': "Flash (pulse only)", 'both': "Both"}
+    # 3-D marker colours (0-1 RGB), matching _ROLE_COLORS: lit / idle in this operating mode / off / selected
+    _MARKER_LIT = {'vio': (0.12, 0.56, 1.0), 'flash': (1.0, 0.55, 0.0), 'both': (1.0, 1.0, 1.0)}
+    _MARKER_IDLE = {'vio': (0.05, 0.2, 0.4), 'flash': (0.45, 0.22, 0.0), 'both': (0.4, 0.4, 0.4)}
+    _MARKER_OFF = (0.16, 0.16, 0.16)
+    _MARKER_SELECTED, _MARKER_SELECTED_DIM = (1.0, 0.95, 0.1), (0.45, 0.42, 0.05)
 
     def _led_button_color(on, role):
-        return _ROLE_COLORS.get(role, "#FF00FF") if on else "#444444"
+        return _ROLE_COLORS.get(role, "#FFFFFF") if on else "#444444"
 
     def _clear_inspector():
         for h in _inspector_handles:
@@ -319,14 +324,14 @@ def build(ctx):
             f"<span style='color:{_ROLE_COLORS['both']};'>■ Both {counts['both']}</span></div>"
         ))
         all_btn = _inspector_add(server.gui.add_button(
-            "ALL LEDs", color="#FF00FF" if any(led_states_g) else "#666666"
+            "ALL LEDs", color="#BBBBBB" if any(led_states_g) else "#666666"
         ))
         all_btn.on_click(lambda _: _apply(range(len(led_states_g))))
 
         for row_idx, led_indices in enumerate(led_rows):
             any_on = any(led_states_g[i] for i in led_indices if i < len(led_states_g))
             row_btn = _inspector_add(server.gui.add_button(
-                f"Row {row_idx + 1}", color="#FF00FF" if any_on else "#666666"
+                f"Row {row_idx + 1}", color="#BBBBBB" if any_on else "#666666"
             ))
             row_btn.on_click(lambda _, idx=list(led_indices): _apply(idx))
 
@@ -1746,14 +1751,19 @@ def build(ctx):
                 square_thickness = 0.0002  # Very thin (0.2mm)
                 dims = (square_thickness, square_size, square_size)
                 
-                # White (Both) / light blue (VIO) / orange (Flash): bright if lit in this operating mode,
-                # dim otherwise; cyan when the owning panel is selected
+                # Role colour when lit; dim role colour when idle in this operating mode;
+                # neutral dark grey when the user switched it off; yellow when its panel is selected
                 _role = led_role(led)
-                _tint = {'vio': (0.55, 0.85, 1.0), 'flash': (1.0, 0.65, 0.2)}.get(_role, (1.0, 1.0, 1.0))
-                square_color = _tint if led_enabled else tuple(c * 0.3 for c in _tint)
+                _idle = bool(getattr(led, 'mode_idle', False))
+                if led_enabled:
+                    square_color = _MARKER_LIT[_role]
+                elif _idle:
+                    square_color = _MARKER_IDLE[_role]
+                else:
+                    square_color = _MARKER_OFF
                 _owner = getattr(led, 'owner', None)
                 if selected_owner[0] is not None and _owner == selected_owner[0]:
-                    square_color = (0.15, 1.0, 1.0) if led_enabled else (0.08, 0.45, 0.45)
+                    square_color = _MARKER_SELECTED if led_enabled else _MARKER_SELECTED_DIM
                 
                 # Draw square base with rotation
                 handle = server.scene.add_box(
@@ -1776,8 +1786,8 @@ def build(ctx):
                 if led_enabled:
                     handle = server.scene.add_icosphere(
                         f"/leds/led_{led_idx}_source",
-                        radius=0.001,  # Very small 1mm source
-                        color=led.color,
+                        radius=0.0012,
+                        color=_MARKER_LIT[_role],
                         position=tuple(led.position / 100.0),
                     )
                     led_handles.append(handle)

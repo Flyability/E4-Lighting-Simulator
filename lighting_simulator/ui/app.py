@@ -544,6 +544,15 @@ def main():
                  "Flash: Flash + Both LEDs at the flash current (Display tab), VIO LEDs continuous. "
                  "Set roles per LED in the Selected panel or the Panel Designer.",
         )
+        server.gui.add_html(
+            "<div style='font-size:10px;color:#aaa;margin:-4px 0 6px;line-height:1.6;'>3-D LED markers: "
+            "<span style='color:#FFFFFF;'>■</span> Both &nbsp;"
+            "<span style='color:#1E90FF;'>■</span> VIO &nbsp;"
+            "<span style='color:#FF8C00;'>■</span> Flash &nbsp;"
+            "<span style='color:#666;'>■</span> dim = idle in this mode &nbsp;"
+            "<span style='color:#2a2a2a;background:#555;'>■</span> dark grey = off &nbsp;"
+            "<span style='color:#FFF21A;'>■</span> selected panel</div>"
+        )
         show_intensity_map = server.gui.add_checkbox(
             "Show intensity on wall", initial_value=False
         )

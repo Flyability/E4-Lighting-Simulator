@@ -37,16 +37,19 @@ def split_by_role(leds):
 def apply_operating_mode(leds, flash_on, flash_lumens=None):
     """Set ``enabled`` / ``lumens`` of each LED for one operating point (in place).
 
-    flight (``flash_on=False``): 'flash'-only LEDs are switched off.
+    flight (``flash_on=False``): 'flash'-only LEDs are switched off (flagged ``mode_idle``
+    so the viewer can tell them from LEDs the user turned off).
     flash  (``flash_on=True``): 'flash' + 'both' LEDs run at ``flash_lumens`` (when given).
     """
     for led in leds:
+        led.mode_idle = False
         if not getattr(led, 'enabled', True):
             continue
         role = led_role(led)
         if not flash_on:
             if role == 'flash':
                 led.enabled = False
+                led.mode_idle = True
         elif role != 'vio' and flash_lumens is not None:
             led.lumens = float(flash_lumens)
     return leds
