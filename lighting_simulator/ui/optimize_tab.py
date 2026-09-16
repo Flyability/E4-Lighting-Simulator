@@ -507,7 +507,8 @@ def build(ctx):
         optim_tilt_enable = server.gui.add_checkbox(
             "Add ±tilt FOV uniformity", initial_value=False,
             hint="Also score the camera pitched up and down by the FOV tab's 'Tilt FOV angle' (mean 1−U of both, "
-                 "penalty 'tilt_uniformity').",
+                 "penalty 'tilt_uniformity'). With VIO geometry = Room the tilted footprints are measured on the "
+                 "room ceiling / floor / walls; otherwise on the (enlarged) flat wall.",
         )
         optim_tilt_w = server.gui.add_slider("Tilt uniformity weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
         optim_max_leds = server.gui.add_number("Max active LEDs (0 = no limit)", 0, min=0, step=1)
@@ -535,6 +536,8 @@ def build(ctx):
         optim_method = server.gui.add_dropdown(
             "Method", options=["differential_evolution", "nelder_mead", "random_search"],
             initial_value="differential_evolution",
+            hint="differential_evolution: global, handles integer variables (rows/cols, on-off, roles) — use this "
+                 "for layouts. nelder_mead: local polish of a continuous design only. random_search: quick scan.",
         )
         optim_max_evals = server.gui.add_number("Max evaluations", 3000, min=10, max=200000, step=10)
         optim_population = server.gui.add_number("Population", 60, min=4, max=2000, step=1,

@@ -313,7 +313,9 @@ def _page_problem(w: _Writer, problem, designs):
     w.heading("Objective")
     o = problem.objective
     w.line(f"metric = {o.metric}, E_min percentile = {o.min_percentile:g} %, coverage weight = {o.coverage_weight:g}"
-           + (f", min average lux = {o.min_avg_lux:,.0f} (w={o.lux_weight:g})" if o.min_avg_lux else ""))
+           + (f", min average lux = {o.min_avg_lux:,.0f} (w={o.lux_weight:g})" if o.min_avg_lux else "")
+           + (f"; ±{o.tilt_fov_deg:g}° tilt FOVs (w={o.tilt_fov_weight:g}) on the "
+              + ("VIO room walls" if getattr(problem, '_tilt_room', False) else "flat wall") if o.tilt_fov_deg else ""))
 
     w.heading("Constraints (active)")
     cs = asdict(problem.constraints)

@@ -22,7 +22,9 @@ from pathlib import Path
 import numpy as np
 
 from lighting_simulator.analysis.uniformity import trapezoid_mask, uniformity_metrics
-from lighting_simulator.camera.fov import camera_fov_wall_trapezoid, points_in_fisheye_fov, vio_hfov_vfov_deg
+from lighting_simulator.camera.fov import (
+    camera_fov_wall_trapezoid, points_in_fisheye_fov, points_in_pinhole_fov, vio_hfov_vfov_deg,
+)
 from lighting_simulator.domain.led import split_by_role
 from lighting_simulator.scene.builder import build_scene_from_config, load_config
 from lighting_simulator.simulation.room import compute_room_intensity
@@ -79,6 +81,10 @@ class ObjectiveSpec:
     """Also score the same camera pitched ±this many degrees (looking up / down); None = off."""
     tilt_fov_weight: float = 1.0
     """Weight of the mean (1 − U) of the two tilted footprints, added as penalty 'tilt_uniformity'."""
+    tilt_geometry: str = "auto"
+    """'room': tilted footprints fall on the VIO room walls (ceiling / floor — what a 45° camera really sees);
+    'wall': on the flat evaluation wall (footprint stretches to ~3.7× the distance); 'auto' = room when
+    ``vio.geometry == 'room'`` else wall."""
 
 
 @dataclass
@@ -324,10 +330,12 @@ class Problem:
         self.constraints = constraints or ConstraintSpec()
         dists = [float(d) for d in (wall_dists or [wall.wall_dist])]
         t = self.objective.tilt_fov_deg
+        room_geom = self.vio is not None and self.vio.geometry == "room"
+        self._tilt_room = bool(t) and room_geom and self.objective.tilt_geometry != "wall"
         if isinstance(wall_sizes, str) and wall_sizes == "auto":
-            offs = (0.0, float(t), -float(t)) if t else (0.0,)
+            offs = (0.0, float(t), -float(t)) if (t and not self._tilt_room) else (0.0,)
             sizes = [camera.fit_wall_size(d, pitch_offsets=offs) for d in dists]
-            if t:
+            if len(offs) > 1:
                 print("[optim] auto wall sizes include the ±%g° tilt footprints: %s cm (cell %s cm)" % (
                     t, ", ".join(f"{s:g}" for s in sizes), ", ".join(f"{s / wall.grid_size:.1f}" for s in sizes)))
         elif wall_sizes is None:
@@ -349,14 +357,28 @@ class Problem:
             tuple(trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist, s * t))
                   for s in (+1.0, -1.0))
             for w in self.walls
-        ] if t else None
+        ] if (t and not self._tilt_room) else None
+        # Tilted footprints on the VIO room walls: {'up': {wall: mask}, 'down': {...}}
+        self._tilt_room_masks = None
+        if self._tilt_room:
+            cam_pos = np.array([camera.pos_x, camera.pos_y, 0.0])
+            specs = self.vio.room_wall_specs()
+            s = self.vio.room_settings()
+            self._tilt_room_masks = {}
+            for key, sign in (('up', 1.0), ('down', -1.0)):
+                masks = {}
+                for name, spec in specs.items():
+                    pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
+                    masks[name] = points_in_pinhole_fov(cam_pos, camera.pitch + sign * t, camera.fov_h, camera.fov_v, pts)
+                self._tilt_room_masks[key] = masks
+            print(f"[optim] ±{t:g}° tilt FOVs are evaluated on the VIO room walls ({2 * self.vio.room_dist / 100:g} m room)")
         self._needs_vio = self.vio is not None and any(m.vio_min_lux for m in self.modes)
-        self._vio_room = self._needs_vio and self.vio.geometry == "room"
-        if self._vio_room:
+        self._vio_room = self._needs_vio and room_geom
+        if self._vio_room or self._tilt_room:
             self._vio_wall = None
             self._vio_masks = self.vio.room_masks()
             self._vio_mask = self._vio_masks['front']
-            if not any(np.any(m) for m in self._vio_masks.values()):
+            if self._vio_room and not any(np.any(m) for m in self._vio_masks.values()):
                 raise ValueError("VIO cameras do not see the VIO room walls: check the poses")
         elif self._needs_vio:
             self._vio_wall = self.vio.wall_settings(wall.rays_per_pixel)
@@ -497,10 +519,24 @@ class Problem:
 
         modes = {}
         vio_grid = None
+        room_grid = None
+        if self._vio_room or self._tilt_room:
+            room_grid = self._trace_room(scene, flight_leds, len(active))
+        if self._tilt_room:
+            for key in ('up', 'down'):
+                lit = np.concatenate([room_grid[n][mk] for n, mk in self._tilt_room_masks[key].items() if n in room_grid])
+                if lit.size == 0:
+                    continue
+                tm = uniformity_metrics(lit, self.objective.min_percentile)
+                tilt_scores.append(1.0 if tm is None else _score_of(tm))
+                tilt_unis[key].append(0.0 if tm is None else tm.uniformity_pct)
+            if tilt_scores:
+                penalties['tilt_uniformity'] = self.objective.tilt_fov_weight * float(np.mean(tilt_scores))
+            tilt = {k: float(np.mean(v)) if v else 0.0 for k, v in tilt_unis.items()}
         if self.modes:
             vio_lit = None
             if self._vio_room:
-                vio_grid = self._trace_room(scene, flight_leds, len(active))
+                vio_grid = room_grid
                 vio_lit = np.concatenate([vio_grid[n][mk] for n, mk in self._vio_masks.items() if n in vio_grid])
             elif self._needs_vio:
                 vio_grid = self._trace_leds(flight_leds, self._vio_wall, 1.0, scene)
@@ -518,7 +554,7 @@ class Problem:
         return Evaluation(score=score, uniformity_pct=uniformity_pct, coverage=coverage,
                           e_avg=e_avg, n_active=len(active), penalties=penalties, metrics=last_metrics,
                           grid=(grids[0] if len(grids) == 1 else grids) if keep_grid else None,
-                          vio_grid=vio_grid if keep_grid else None,
+                          vio_grid=(vio_grid if vio_grid is not None else room_grid) if keep_grid else None,
                           n_drivers=n_drivers, total_current_a=total_current, modes=modes, tilt=tilt,
                           electrical=electrical,
                           flash_grid=((flash_grids[0] if len(flash_grids) == 1 else flash_grids)

@@ -234,9 +234,25 @@ def _run_method(problem, opt, logger, x0, lo, hi, rng, optimize):
             callback=stop, tol=0.0, atol=0.0,
         )
     elif opt.method == "nelder_mead":
+        ints = problem.integrality
+        if ints.any():
+            print("[optim] WARNING: nelder_mead is a local continuous method; integer variables "
+                  f"({int(ints.sum())}: rows/cols, on-off, roles) will only change by whole steps of the initial "
+                  "simplex. Prefer differential_evolution or random_search for layouts with counts or roles.")
+        # SciPy's default simplex is 5 % of x0 (0.00025 when x0 == 0): variables starting at 0 (tilts,
+        # offsets) or integers would never move. Use a quarter of each variable's range instead.
+        n = problem.dim
+        simplex = np.tile(x0, (n + 1, 1))
+        for i in range(n):
+            step = max(0.25 * (hi[i] - lo[i]), 1.0 if ints[i] else 0.0)
+            if step <= 0:
+                continue
+            simplex[i + 1, i] = x0[i] + step if x0[i] + step <= hi[i] else x0[i] - step
+        simplex = np.clip(simplex, lo, hi)
         optimize.minimize(
             lambda x: logger(_snap_integers(problem, np.clip(x, lo, hi))), x0, method="Nelder-Mead",
-            options={"maxfev": opt.max_evals, "xatol": 1e-3, "fatol": 1e-5, "adaptive": True},
+            options={"maxfev": opt.max_evals, "xatol": 1e-3, "fatol": 1e-5, "adaptive": True,
+                     "initial_simplex": simplex},
         )
     elif opt.method == "random_search":
         n_explore = max(1, min(opt.max_evals, opt.population))
