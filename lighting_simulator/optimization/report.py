@@ -496,21 +496,39 @@ def _page_convergence(pdf, problem, records, designs):
     pdf.savefig(fig)
 
 
-def _fov_polygon(problem, wall_dist):
-    z_bot, z_top, w_bot, w_top, y_c = problem.camera.trapezoid(wall_dist)
+TILT_UP_COLOR, TILT_DOWN_COLOR, VIO_COLOR = "#ffb74d", "#f06292", "cyan"
+
+
+def _fov_polygon(problem, wall_dist, pitch_offset=0.0, color="white", ls="--"):
+    z_bot, z_top, w_bot, w_top, y_c = problem.camera.trapezoid(wall_dist, pitch_offset)
     return Polygon([(y_c - w_bot, z_bot), (y_c + w_bot, z_bot), (y_c + w_top, z_top), (y_c - w_top, z_top)],
-                   closed=True, fill=False, edgecolor="white", lw=1.2, ls="--")
+                   closed=True, fill=False, edgecolor=color, lw=1.2, ls=ls)
+
+
+def _add_fov_outlines(ax, problem, wall_dist):
+    """Main-camera footprint plus the ±tilt footprints when they are scored on this wall."""
+    ax.add_patch(_fov_polygon(problem, wall_dist))
+    if getattr(problem, "_tilt_masks", None) is not None:
+        t = problem.objective.tilt_fov_deg
+        ax.add_patch(_fov_polygon(problem, wall_dist, +t, TILT_UP_COLOR, ":"))
+        ax.add_patch(_fov_polygon(problem, wall_dist, -t, TILT_DOWN_COLOR, ":"))
+
+
+def _fov_footer(problem, extra=""):
+    s = "Dashed white: main-camera FOV footprint (metrics are computed inside it). "
+    if getattr(problem, "_tilt_masks", None) is not None:
+        t = problem.objective.tilt_fov_deg
+        s += f"Dotted orange / pink: same camera tilted +{t:g}° / −{t:g}° (tilt uniformity). "
+    return s + extra
 
 
 def _page_heatmaps(pdf, problem, designs):
     labels = list(designs.keys())
     n_rows = len(labels)
     cols = [(f"wall {wl.wall_dist:g} cm", wl.wall_size, i) for i, wl in enumerate(problem.walls)]
-    has_vio = any(designs[l][1].vio_grid is not None for l in labels)
-    vio_room = has_vio and getattr(problem, "_vio_room", False)
-    if vio_room:
-        cols.append((f"VIO room, front wall {problem.vio.room_dist:g} cm", 2 * problem.vio.room_dist, "vio"))
-    elif has_vio:
+    # A flat VIO wall is shown as an extra column; a VIO room gets its own unfolded page.
+    has_vio = any(isinstance(designs[l][1].vio_grid, np.ndarray) for l in labels)
+    if has_vio:
         cols.append((f"VIO wall {problem.vio.wall_dist:g} cm", problem.vio.wall_size, "vio"))
     n_cols = len(cols)
     fig = Figure(figsize=A4, dpi=110)
@@ -524,7 +542,7 @@ def _page_heatmaps(pdf, problem, designs):
         for l in labels:
             ev = designs[l][1]
             if key == "vio":
-                g = ev.vio_grid.get('front') if isinstance(ev.vio_grid, dict) else ev.vio_grid
+                g = ev.vio_grid if isinstance(ev.vio_grid, np.ndarray) else None
             else:
                 g = _as_grid_list(ev)[key] if _as_grid_list(ev) else None
             grids.append(g)
@@ -539,7 +557,7 @@ def _page_heatmaps(pdf, problem, designs):
             im = ax.imshow(g, origin="lower", extent=[-half, half, -half, half], cmap="inferno", vmin=0, vmax=vmax,
                            aspect="equal")
             if key != "vio":
-                ax.add_patch(_fov_polygon(problem, problem.walls[key].wall_dist))
+                _add_fov_outlines(ax, problem, problem.walls[key].wall_dist)
                 fov = g[problem._fov_masks[key]]
                 lit = fov[fov > 0]
                 if lit.size:
@@ -551,14 +569,10 @@ def _page_heatmaps(pdf, problem, designs):
                     sub = "unlit"
             else:
                 mask = problem._vio_mask
-                if vio_room:
-                    n_all = sum(int(np.count_nonzero(m)) for m in problem._vio_masks.values())
-                    sub = f"{np.count_nonzero(mask)} VIO cells on front wall ({n_all} over 6 walls)"
-                else:
-                    sub = f"{np.count_nonzero(mask)} VIO cells"
+                sub = f"{np.count_nonzero(mask)} VIO cells"
                 if mask.size and not mask.all():
                     ax.contour(np.linspace(-half, half, g.shape[1]), np.linspace(-half, half, g.shape[0]),
-                               mask.astype(float), levels=[0.5], colors="cyan", linewidths=0.8)
+                               mask.astype(float), levels=[0.5], colors=VIO_COLOR, linewidths=0.8)
             ax.invert_xaxis()  # +Y is to the viewer's left when facing the wall
             ax.set_title((title + "\n" if i == 0 else "") + sub, fontsize=7)
             ax.tick_params(labelsize=6)
@@ -569,9 +583,124 @@ def _page_heatmaps(pdf, problem, designs):
         if im is not None:
             cb = fig.colorbar(im, ax=axs[:, j].tolist(), orientation="horizontal", fraction=0.025, pad=0.06)
             cb.ax.tick_params(labelsize=6); cb.set_label("lux", fontsize=7)
-    fig.text(MARGIN, 0.02, f"Dashed white: main-camera FOV footprint (metrics are computed inside it). "
-             f"Cyan: VIO camera footprint. Colour scale is shared per column. Images use {VERIFY_RAY_FACTOR}× the "
-             "run's rays per pixel.", fontsize=7.5, color="#444")
+    fig.text(MARGIN, 0.02, textwrap.fill(_fov_footer(
+        problem, ("Cyan: VIO camera footprint. " if has_vio else "") + "Colour scale is shared per column. "
+        f"Images use {VERIFY_RAY_FACTOR}× the run's rays per pixel."), 150), fontsize=7.5, color="#444", va="bottom")
+    pdf.savefig(fig)
+
+
+def _unfolded_room(problem):
+    """Place the five VIO-room walls around the front wall (cube net, seen from inside).
+
+    Returns ``{wall: (transform, extent, H, V, valid)}``: ``transform`` reorients a wall grid
+    for ``imshow`` with ``extent`` (net coordinates, cm), ``H``/``V`` are the cell-centre net
+    coordinates in the grid's own indexing, ``valid`` masks cells behind the back wall.
+    """
+    from lighting_simulator.simulation.room_geometry import room_wall_cell_centers
+    s = problem.vio.room_settings()
+    specs = problem.vio.room_wall_specs()
+    hy, hz = specs['front']['size_y'] / 2, specs['front']['size_z'] / 2
+    fd = s.front_dist
+    out = {}
+    for name, spec in specs.items():
+        if name == 'back':
+            continue
+        pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
+        x, y, z = pts[..., 0], pts[..., 1], pts[..., 2]
+        valid = x >= -s.back_dist - 1e-6
+        depth = spec.get('size_x', 0.0)
+        if name == 'front':      # grid [Z, Y]
+            tf, H, V, ext = (lambda g: g), y, z, [-hy, hy, -hz, hz]
+        elif name == 'top':      # grid [Y, X] -> rows X, x = front_dist adjacent to the front wall
+            tf, H, V, ext = (lambda g: g.T[::-1]), y, hz + (fd - x), [-hy, hy, hz, hz + depth]
+        elif name == 'bottom':
+            tf, H, V, ext = (lambda g: g.T), y, -hz - (fd - x), [-hy, hy, -hz - depth, -hz]
+        elif name == 'left':     # y = -side_dist; grid [Z, X]
+            tf, H, V, ext = (lambda g: g), -(hy + (fd - x)), z, [-hy - depth, -hy, -hz, hz]
+        else:                    # right, y = +side_dist
+            tf, H, V, ext = (lambda g: g[:, ::-1]), hy + (fd - x), z, [hy, hy + depth, -hz, hz]
+        out[name] = (tf, ext, H, V, valid)
+    return out
+
+
+def _page_vio_room(pdf, problem, designs):
+    """Unfolded VIO room (flight mode) with the VIO footprints and the main / tilted camera FOVs."""
+    labels = [l for l in designs if isinstance(designs[l][1].vio_grid, dict)]
+    if not labels or not (getattr(problem, "_vio_room", False) or getattr(problem, "_tilt_room", False)):
+        return
+    from lighting_simulator.camera.fov import points_in_pinhole_fov
+    from lighting_simulator.simulation.room_geometry import room_wall_cell_centers
+    net = _unfolded_room(problem)
+    s = problem.vio.room_settings()
+    specs = problem.vio.room_wall_specs()
+    cam = problem.camera
+    cam_pos = np.array([cam.pos_x, cam.pos_y, 0.0])
+    t = problem.objective.tilt_fov_deg
+    outlines = []  # (label, colour, ls, {wall: mask})
+    main = {}
+    for name, spec in specs.items():
+        if name in net:
+            pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
+            main[name] = points_in_pinhole_fov(cam_pos, cam.pitch, cam.fov_h, cam.fov_v, pts)
+    outlines.append(("main camera FOV", "white", "--", main))
+    if getattr(problem, "_tilt_room_masks", None):
+        outlines.append((f"camera tilted +{t:g}° (tilt uniformity)", TILT_UP_COLOR, ":", problem._tilt_room_masks['up']))
+        outlines.append((f"camera tilted −{t:g}°", TILT_DOWN_COLOR, ":", problem._tilt_room_masks['down']))
+    if getattr(problem, "_vio_room", False):
+        outlines.append(("VIO fisheyes footprint (coverage metric)", VIO_COLOR, "-", problem._vio_masks))
+    flight_modes = [m for m in problem.modes if not m.is_flash]
+    flight = flight_modes[0] if flight_modes else None
+
+    fig = Figure(figsize=A4, dpi=110)
+    fig.suptitle(f"VIO room — unfolded walls, flight mode ({2 * problem.vio.room_dist / 100:g} m cube)",
+                 fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
+    axs = fig.subplots(2, 2).ravel()
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.12, hspace=0.3, wspace=0.25)
+    grids = {l: designs[l][1].vio_grid for l in labels}
+    vmax = max([float(np.nanmax(np.where(net[n][4], g[n], np.nan)))
+                for g in grids.values() for n in net if n in g] + [1e-9])
+    im = None
+    for ax, l in zip(axs, labels):
+        ev = designs[l][1]
+        for name, (tf, ext, H, V, valid) in net.items():
+            g = grids[l].get(name)
+            if g is None:
+                continue
+            im = ax.imshow(tf(np.where(valid, g, np.nan)), origin="lower", extent=ext, cmap="inferno", vmin=0,
+                           vmax=vmax, aspect="equal", interpolation="nearest")
+            ax.add_patch(Polygon([(ext[0], ext[2]), (ext[1], ext[2]), (ext[1], ext[3]), (ext[0], ext[3])],
+                                 closed=True, fill=False, edgecolor="#888", lw=0.5))
+            ax.text((ext[0] + ext[1]) / 2, (ext[2] + ext[3]) / 2, name, ha="center", va="center", fontsize=6,
+                    color="#bbb", alpha=0.8)
+            for _, color, ls, masks in outlines:
+                m = masks.get(name)
+                if m is not None and m.any() and not m.all():
+                    ax.contour(H, V, m.astype(float), levels=[0.5], colors=color, linewidths=0.9, linestyles=ls)
+        span = max(abs(v) for e in (e for _, e, *_ in net.values()) for v in e)
+        ax.set_xlim(-span, span); ax.set_ylim(-span, span); ax.invert_xaxis()
+        ax.set_facecolor("#f2f2f2")
+        sub = []
+        if flight is not None and flight.name in ev.modes and flight.vio_min_lux:
+            sub.append(f"VIO {ev.modes[flight.name].get('vio_fraction', 0) * 100:.0f} % of cells ≥ {flight.vio_min_lux:g} lx")
+        if ev.tilt:
+            sub.append(f"tilt U0 ↑{ev.tilt.get('up', 0):.0f} % ↓{ev.tilt.get('down', 0):.0f} %")
+        ax.set_title(f"{l}" + ("\n" + "  ·  ".join(sub) if sub else ""), fontsize=8, weight="bold")
+        ax.tick_params(labelsize=6)
+        ax.set_xlabel("Y (cm, unfolded)", fontsize=7); ax.set_ylabel("Z (cm, unfolded)", fontsize=7)
+    for ax in axs[len(labels):]:
+        ax.axis("off")
+    if im is not None:
+        cb = fig.colorbar(im, ax=axs.tolist(), orientation="horizontal", fraction=0.02, pad=0.06)
+        cb.ax.tick_params(labelsize=6); cb.set_label("lux (flight mode)", fontsize=7)
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], color=c if c != "white" else "#555", ls=ls, lw=1.2, label=lbl) for lbl, c, ls, _ in outlines]
+    (axs[len(labels)] if len(labels) < len(axs) else fig).legend(
+        handles=handles, fontsize=7, loc="center" if len(labels) < len(axs) else "lower right", frameon=False)
+    fig.text(MARGIN, 0.02, textwrap.fill(
+        "Cube net seen from inside the room: side / top / bottom walls fold out around the front wall; the back "
+        "wall is omitted and cells behind it are blanked. +Y is to the viewer's left. "
+        "Wall grids are coarse (VIO room resolution), so footprints look blocky.", 150),
+        fontsize=7.5, color="#444", va="bottom")
     pdf.savefig(fig)
 
 
@@ -609,7 +738,7 @@ def _page_flash_heatmaps(pdf, problem, designs):
                     ax.axis("off"); continue
                 im = ax.imshow(g, origin="lower", extent=[-half, half, -half, half], cmap="inferno", vmin=0, vmax=vmax,
                                aspect="equal")
-                ax.add_patch(_fov_polygon(problem, wl.wall_dist))
+                _add_fov_outlines(ax, problem, wl.wall_dist)
                 fov = g[problem._fov_masks[wi]]
                 lit = fov[fov > 0]
                 if lit.size:
@@ -629,8 +758,9 @@ def _page_flash_heatmaps(pdf, problem, designs):
             if im is not None:
                 cb = fig.colorbar(im, ax=axs[:, j].tolist(), orientation="horizontal", fraction=0.025, pad=0.06)
                 cb.ax.tick_params(labelsize=6); cb.set_label("lux", fontsize=7)
-        fig.text(MARGIN, 0.02, "Each column has its own colour scale (the flash image is typically 10–100× brighter). "
-                 "Dashed white: main-camera FOV footprint.", fontsize=7.5, color="#444")
+        fig.text(MARGIN, 0.02, textwrap.fill(_fov_footer(
+            problem, "Each column has its own colour scale (the flash image is typically 10–100× brighter)."), 150),
+            fontsize=7.5, color="#444", va="bottom")
         pdf.savefig(fig)
 
 
@@ -823,6 +953,7 @@ def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=F
         w.close()
         _page_convergence(pdf, problem, records, designs)
         _page_heatmaps(pdf, problem, designs)
+        _page_vio_room(pdf, problem, designs)
         _page_flash_heatmaps(pdf, problem, designs)
         _page_layouts(pdf, problem, designs)
         _page_variable_bounds(pdf, problem, designs)
