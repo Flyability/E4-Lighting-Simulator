@@ -28,6 +28,7 @@ from .variables import (
     BeamAngle,
     BeamTilts,
     Duct,
+    DuctPanelPose,
     DuctRingLayout,
     GroupCurrent,
     LedStates,
@@ -36,7 +37,8 @@ from .variables import (
 )
 
 __all__ = [
-    "BeamAngle", "BeamTilts", "CameraSpec", "ConstraintSpec", "DriverModel", "Duct", "DuctRingLayout",
+    "BeamAngle", "BeamTilts", "CameraSpec", "ConstraintSpec", "DriverModel", "Duct", "DuctPanelPose",
+    "DuctRingLayout",
     "Evaluation", "GroupCurrent", "LedStates", "ModeSpec", "ObjectiveSpec", "OptimizationStopped",
     "OptimizerSpec", "PanelPose", "Problem", "VioSpec",
     "load_spec", "problem_from_spec", "run", "run_spec", "variable_from_spec",

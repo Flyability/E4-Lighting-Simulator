@@ -85,7 +85,8 @@ click("🔄 Refresh group list")
 groups = find("Group").options
 print("[smoke] groups:", groups)
 find("Group").value = groups[0]
-find("Move / rotate the panel").value = True
+find("Panel movement").value = "Free (± position / rotation)"
+fire_update(find("Panel movement"))
 find("LED on / off").value = True
 find("Drive current (→ lumens)").value = True
 find("Enable flash mode").value = True
@@ -108,6 +109,23 @@ find("Show intensity on wall").value = True
 find("Rays per pixel (↑quality, ↓speed)").value = 20
 run_and_wait("refine")
 print("[smoke] Project Name field:", find("Project Name").value)
+
+# --- mode 1 on a duct: the existing panel slides over a cylinder, mirror partner follows ------
+find("Panel movement").value = "On a duct surface"
+fire_update(find("Panel movement"))
+find("± around the duct (cm along circumference)").value = 8.0
+fire_update(find("± around the duct (cm along circumference)"))
+find("± swivel toward axis (°)").value = 20
+find("Mirror partner group").value = find("Mirror partner group").options[2] if len(groups) > 1 else "(none)"
+n_rd = sum(1 for n in server.scene._handle_from_node_name if n.startswith("/optim_refine_duct/"))
+print("[smoke] refine-duct preview nodes:", n_rd)
+assert n_rd >= 4
+find("LED on / off").value = False
+find("LED roles (off / VIO / flash / both)").value = False
+find("Max evaluations").value = 20
+run_and_wait("refine on duct")
+find("Panel movement").value = "Free (± position / rotation)"
+fire_update(find("Panel movement"))
 
 # --- mode 3: preset as written, then with overrides -------------------------
 find("Design mode").value = MODE_PRESET

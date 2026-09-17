@@ -104,7 +104,8 @@ def build(ctx):
             "<b>How it works</b> — the optimiser repeatedly ray-traces candidate LED layouts and keeps the one "
             "with the most uniform light inside the main-camera FOV (plus your constraints). Pick a design mode:"
             "<ul style='margin:4px 0 0 14px;padding:0;'>"
-            "<li><b>1 Refine</b>: keep the scene, nudge one existing panel (position, tilt, beam, on/off, current).</li>"
+            "<li><b>1 Refine</b>: keep the scene, nudge one existing panel (free deltas or sliding along a duct "
+            "surface; tilt, beam, on/off, roles, current).</li>"
             "<li><b>2 Ducts</b>: remove all LEDs and place a new symmetric lattice on the duct rings within tolerances.</li>"
             "<li><b>3 Preset</b>: run a JSON spec from <code>optimization_specs/</code> as-is (optionally overriding parts with the UI).</li>"
             "</ul>Camera, emission and VIO poses always come from the FOV / Intensity tabs. "
@@ -121,11 +122,35 @@ def build(ctx):
         optim_group_dropdown = server.gui.add_dropdown("Group", options=_optim_group_labels())
         optim_refresh_groups_btn = server.gui.add_button("🔄 Refresh group list")
         server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>What may change</div>")
-        optim_var_pose = server.gui.add_checkbox("Move / rotate the panel", initial_value=True)
+        _MOVE_FREE, _MOVE_DUCT, _MOVE_NONE = "Free (± position / rotation)", "On a duct surface", "Fixed"
+        optim_move_mode = server.gui.add_dropdown(
+            "Panel movement", options=[_MOVE_FREE, _MOVE_DUCT, _MOVE_NONE], initial_value=_MOVE_FREE,
+            hint="Free: rigid ± deltas. On a duct: the existing layout is anchored to a cylinder (where its LED "
+                 "centroid projects onto it) and slides / swivels along the surface, LEDs turning with the wall.")
         optim_pos_delta = server.gui.add_vector3("± position (cm)", (2.0, 2.0, 2.0),
                                                  min=(0.0, 0.0, 0.0), max=(50.0, 50.0, 50.0), step=0.5)
         optim_rot_delta = server.gui.add_vector3("± rotation (°)", (15.0, 15.0, 20.0),
                                                  min=(0.0, 0.0, 0.0), max=(180.0, 180.0, 180.0), step=1.0)
+        rd_center = server.gui.add_vector3("Duct centre (cm)", (6.3, 12.0, 0.0), step=0.1, visible=False)
+        rd_radius = server.gui.add_number("Duct radius (cm)", 8.5, min=1.0, max=50.0, step=0.1, visible=False)
+        rd_axis = server.gui.add_dropdown("Duct axis", options=["Z (vertical)", "Y (lateral)", "X (forward)"],
+                                          initial_value="Z (vertical)", visible=False)
+        rd_rot = server.gui.add_vector3("Duct rotation X/Y/Z (°)", (0.0, 0.0, 0.0), min=(-90.0, -90.0, -180.0),
+                                        max=(90.0, 90.0, 180.0), step=0.5, visible=False)
+        rd_tol_arc = server.gui.add_number("± around the duct (cm along circumference)", 10.0, min=0.0, max=100.0,
+                                           step=1.0, visible=False)
+        rd_tol_axial = server.gui.add_number("± along duct axis (cm)", 2.0, min=0.0, max=20.0, step=0.5, visible=False)
+        rd_tol_radial = server.gui.add_number("± stand-off from surface (cm)", 0.0, min=0.0, max=10.0, step=0.5,
+                                              visible=False)
+        rd_tilt = server.gui.add_slider("± swivel toward axis (°)", min=0, max=90, step=5, initial_value=0,
+                                        visible=False, hint="Whole panel pitches about its tangent line")
+        rd_spin = server.gui.add_slider("± spin about panel normal (°)", min=0, max=180, step=5, initial_value=0,
+                                        visible=False)
+        _RD_NO_MIRROR = "(none)"
+        rd_mirror = server.gui.add_dropdown("Mirror partner group", options=[_RD_NO_MIRROR] + _optim_group_labels(),
+                                            initial_value=_RD_NO_MIRROR, visible=False,
+                                            hint="This group is replaced by the XZ mirror of the moved panel")
+        rd_info = server.gui.add_html("", visible=False)
         optim_var_tilts = server.gui.add_checkbox("Per-LED beam tilt", initial_value=False,
                                                   hint="Dynamic (designer / template) groups only")
         optim_tilt_range = server.gui.add_slider("± beam tilt (°)", min=5, max=90, step=5, initial_value=45)
@@ -388,6 +413,81 @@ def build(ctx):
                duct_tol_axial, duct_theta0, duct_tol_arc, duct_span_cm, duct_tol_center):
         _h.on_update(_draw_duct_preview)
 
+    # -- ① refine on a duct: variable spec + preview ------------------------------
+    def _refine_duct_dict():
+        axis, ref = _DUCT_AXES[rd_axis.value]
+        rot = [float(v) for v in rd_rot.value]
+        return {'center': [float(v) for v in rd_center.value], 'axis': axis, 'radius': float(rd_radius.value),
+                'reference': ref, 'mount_offset': 0.0,
+                'rotation_deg': rot if any(abs(r) > 1e-9 for r in rot) else None}
+
+    def _refine_duct_variable(gi):
+        from lighting_simulator.optimization.variables import arc_cm_to_deg
+        d_theta = arc_cm_to_deg(rd_tol_arc.value, float(rd_radius.value))
+        var = {'type': 'duct_panel_pose', 'group_index': gi, 'duct': _refine_duct_dict(),
+               'theta_range': [-d_theta, d_theta] if d_theta > 0 else None,
+               'axial_range': [-float(rd_tol_axial.value), float(rd_tol_axial.value)] if rd_tol_axial.value > 0 else None,
+               'radial_range': [-float(rd_tol_radial.value), float(rd_tol_radial.value)] if rd_tol_radial.value > 0 else None,
+               'tilt_axial_range': [-float(rd_tilt.value), float(rd_tilt.value)] if rd_tilt.value > 0 else None,
+               'spin_range': [-float(rd_spin.value), float(rd_spin.value)] if rd_spin.value > 0 else None}
+        if rd_mirror.value != _RD_NO_MIRROR and ':' in rd_mirror.value:
+            mi = int(rd_mirror.value.split(':', 1)[0])
+            if mi == gi:
+                raise ValueError("The mirror partner must be a different group.")
+            var['mirror_group_index'] = mi
+        if all(var.get(k) is None for k in ('theta_range', 'axial_range', 'radial_range', 'tilt_axial_range', 'spin_range')):
+            raise ValueError("Every duct range is 0: nothing can move.")
+        return var
+
+    _refine_duct_handles = []
+
+    def _draw_refine_duct_preview(_=None):
+        from lighting_simulator.optimization.variables import DuctPanelPose, arc_cm_to_deg
+        for h in _refine_duct_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        _refine_duct_handles.clear()
+        on = optim_mode.value == _MODE_REFINE and optim_move_mode.value == _MOVE_DUCT
+        for h in (rd_center, rd_radius, rd_axis, rd_rot, rd_tol_arc, rd_tol_axial, rd_tol_radial, rd_tilt, rd_spin,
+                  rd_mirror, rd_info):
+            h.visible = on
+        for h in (optim_pos_delta, optim_rot_delta):
+            h.visible = optim_mode.value == _MODE_REFINE and optim_move_mode.value == _MOVE_FREE
+        if not on:
+            return
+        try:
+            gi = _optim_selected_group_index()
+            var = DuctPanelPose(group_index=gi, duct=_refine_duct_dict()).bind(get_current_config())
+        except Exception as exc:
+            rd_info.content = f"<div style='color:#ffaa00;font-size:12px;'>{exc}</div>"
+            return
+        r = float(rd_radius.value)
+        rd_info.content = ("<div style='color:#8bc34a;font-size:12px;'>Anchor: θ = %.1f° around the axis, %.1f cm along "
+                           "it, LED centroid %.1f cm %s the surface.</div>"
+                           % (var.theta0, var.axial0, abs(var.radial0), "outside" if var.radial0 >= 0 else "inside"))
+        d = _refine_duct_dict()
+        from lighting_simulator.optimization.variables import Duct
+        a, u, _v = Duct(**d).frame()
+        c = np.asarray(d['center'], float)
+        d_theta = arc_cm_to_deg(rd_tol_arc.value, r)
+        half = float(rd_tol_axial.value) + 2.0
+        for k, t in enumerate((-half, 0.0, half)):
+            _refine_duct_handles.append(server.scene.add_line_segments(
+                f"/optim_refine_duct/ring_{k}", points=_circle_line_segments_m(c + a * t, r, a, n_seg=64),
+                colors=(1.0, 0.55, 0.1), line_width=2.0))
+        r_lo = max(0.1, r + var.radial0 - float(rd_tol_radial.value))
+        r_hi = r + var.radial0 + float(rd_tol_radial.value) + 0.2
+        segs = _duct_sector_wireframe_m(c, a, u, var.theta0 - d_theta, var.theta0 + d_theta, r_lo, r_hi,
+                                        var.axial0 - float(rd_tol_axial.value), var.axial0 + float(rd_tol_axial.value))
+        _refine_duct_handles.append(server.scene.add_line_segments(
+            "/optim_refine_duct/tol_box", points=segs, colors=(1.0, 0.85, 0.2), line_width=2.5))
+
+    for _h in (optim_move_mode, optim_group_dropdown, rd_center, rd_radius, rd_axis, rd_rot, rd_tol_arc,
+               rd_tol_axial, rd_tol_radial):
+        _h.on_update(_draw_refine_duct_preview)
+
     def _optim_mode_changed(_=None):
         mode = optim_mode.value
         preset = mode == _MODE_PRESET
@@ -398,6 +498,7 @@ def build(ctx):
         _optim_obj_folder.visible = (not preset) or optim_preset_use_obj.value
         _optim_elec_folder.visible = (not preset) or optim_preset_use_obj.value
         _draw_duct_preview()
+        _draw_refine_duct_preview()
 
     optim_mode.on_update(_optim_mode_changed)
     optim_preset_use_wall.on_update(_optim_mode_changed)
@@ -734,7 +835,8 @@ def build(ctx):
                 label = next((l for l in optim_group_dropdown.options if l.startswith(f"{gi}:")), None)
                 if label:
                     optim_group_dropdown.value = label
-            optim_var_pose.value = 'panel_pose' in types
+            optim_move_mode.value = (_MOVE_DUCT if 'duct_panel_pose' in types
+                                     else _MOVE_FREE if 'panel_pose' in types else _MOVE_NONE)
             optim_var_tilts.value = 'beam_tilts' in types
             optim_var_beam.value = 'beam_angle' in types
             optim_var_states.value = 'led_states' in types
@@ -744,6 +846,26 @@ def build(ctx):
                 if v.get('type') == 'panel_pose':
                     optim_pos_delta.value = tuple(float(x) for x in v.get('pos_delta', (2, 2, 2)))
                     optim_rot_delta.value = tuple(float(x) for x in v.get('rot_delta', (10, 10, 10)))
+                elif v.get('type') == 'duct_panel_pose':
+                    import math as _math
+                    d = v.get('duct', {})
+                    r = float(d.get('radius', rd_radius.value))
+                    rd_center.value = tuple(float(c) for c in d.get('center', rd_center.value))
+                    rd_radius.value = r
+                    ax = np.asarray(d.get('axis', [0, 0, 1]), float)
+                    rd_axis.value = max(_DUCT_AXES, key=lambda k: abs(np.dot(_DUCT_AXES[k][0], ax)))
+                    rd_rot.value = tuple(float(c) for c in (d.get('rotation_deg') or (0.0, 0.0, 0.0)))
+
+                    def _half(rng):
+                        return max(abs(rng[0]), abs(rng[1])) if rng else 0.0
+                    rd_tol_arc.value = round(r * _math.radians(_half(v.get('theta_range'))), 1)
+                    rd_tol_axial.value = _half(v.get('axial_range'))
+                    rd_tol_radial.value = _half(v.get('radial_range'))
+                    rd_tilt.value = int(_half(v.get('tilt_axial_range')))
+                    rd_spin.value = int(_half(v.get('spin_range')))
+                    mi = v.get('mirror_group_index')
+                    label = next((l for l in rd_mirror.options if l.startswith(f"{mi}:")), None) if mi is not None else None
+                    rd_mirror.value = label or _RD_NO_MIRROR
                 elif v.get('type') == 'beam_tilts':
                     t = v.get('tilt_range', (-20, 20))
                     optim_tilt_range.value = int(max(abs(t[0]), abs(t[1])))
@@ -807,6 +929,10 @@ def build(ctx):
         optim_group_dropdown.options = _optim_group_labels()
         if cur_g in optim_group_dropdown.options:
             optim_group_dropdown.value = cur_g
+        cur_m = rd_mirror.value
+        rd_mirror.options = [_RD_NO_MIRROR] + _optim_group_labels()
+        rd_mirror.value = cur_m if cur_m in rd_mirror.options else _RD_NO_MIRROR
+        _draw_refine_duct_preview()
 
     def _optim_selected_group_index():
         label = optim_group_dropdown.value or ""
@@ -821,10 +947,14 @@ def build(ctx):
         gi = _optim_selected_group_index()
         group = custom_groups[gi]
         variables = []
-        if optim_var_pose.value:
+        if optim_move_mode.value == _MOVE_FREE:
             variables.append({'type': 'panel_pose', 'group_index': gi,
                               'pos_delta': [float(v) for v in optim_pos_delta.value],
                               'rot_delta': [float(v) for v in optim_rot_delta.value]})
+        elif optim_move_mode.value == _MOVE_DUCT:
+            if not group.get('is_dynamic'):
+                raise ValueError("Mounting on a duct needs a dynamic (designer / template) group.")
+            variables.append(_refine_duct_variable(gi))
         if optim_var_tilts.value:
             if not group.get('is_dynamic'):
                 raise ValueError("Per-LED beam tilt needs a dynamic (designer / template) group.")

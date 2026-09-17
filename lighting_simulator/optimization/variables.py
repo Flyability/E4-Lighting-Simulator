@@ -15,9 +15,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from lighting_simulator.domain.geometry import euler_xyz_matrix, normalize, rodrigues_rotation
+from lighting_simulator.domain.guides import dynamic_group_world_geometry
 from lighting_simulator.domain.led import CODE_ROLES, ROLE_CODES, normalize_roles
 from lighting_simulator.domain.mirroring import mirror_group_config_xz
-from lighting_simulator.scene.builder import euler_applies
+from lighting_simulator.scene.builder import euler_applies, group_runtime_state
 
 from .electrical import DriverModel
 
@@ -433,6 +434,123 @@ class PanelPose(VariableGroup):
 
 
 @dataclass
+class DuctPanelPose(VariableGroup):
+    """Slide / swivel an EXISTING dynamic group over a duct surface, keeping its internal layout.
+
+    Refine-mode counterpart of ``DuctRingLayout``: instead of generating a lattice, the panel's
+    current LEDs are expressed in the duct frame at their anchor (the LED centroid projected on
+    the cylinder: ``theta0`` around the axis, ``axial0`` along it, ``radial0`` stand-off beyond
+    ``radius + mount_offset``). The variables move that anchor along the surface and the whole
+    panel turns with it, so every LED keeps its orientation relative to the duct wall.
+    All ranges are ``(lo, hi)`` deltas about the anchor; ``None`` freezes that degree of freedom.
+    """
+
+    group_index: int
+    duct: Duct = field(default_factory=Duct)
+    theta_range: tuple | None = (-30.0, 30.0)
+    """± degrees around the duct axis."""
+    axial_range: tuple | None = (-2.0, 2.0)
+    """± cm along the duct axis."""
+    radial_range: tuple | None = None
+    """± cm stand-off from the surface."""
+    tilt_axial_range: tuple | None = None
+    """± degrees swivel of the panel about the local tangent (toward / away from the axis)."""
+    spin_range: tuple | None = None
+    """± degrees rotation of the panel about its own (radial) normal."""
+    mirror_group_index: int | None = None
+    """Replace this other group with the XZ mirror of the moved panel (symmetric pair)."""
+    names: list = field(default_factory=list, init=False)
+    bounds: list = field(default_factory=list, init=False)
+    integrality: list = field(default_factory=list, init=False)
+    x0: list = field(default_factory=list, init=False)
+
+    def __post_init__(self):
+        if isinstance(self.duct, dict):
+            self.duct = Duct(**self.duct)
+        self._keys = [k for k, r in (('theta', self.theta_range), ('axial', self.axial_range),
+                                     ('radial', self.radial_range), ('tilt', self.tilt_axial_range),
+                                     ('spin', self.spin_range)) if r is not None]
+        self._bound = False
+
+    def bind(self, base_cfg):
+        group = base_cfg['custom_groups'][self.group_index]
+        if not group.get('is_dynamic'):
+            raise ValueError("duct_panel_pose needs a dynamic (designer / template) group")
+        positions, directions, row_dirs = dynamic_group_world_geometry(group_runtime_state(group))
+        if not positions:
+            raise ValueError(f"group {self.group_index} has no LEDs")
+        P = np.asarray(positions, float)
+        a, u, v = self.duct.frame()
+        rel = P.mean(axis=0) - np.asarray(self.duct.center, float)
+        axial0 = float(np.dot(rel, a))
+        rv = rel - axial0 * a
+        self.theta0 = math.degrees(math.atan2(float(np.dot(rv, v)), float(np.dot(rv, u))))
+        self.axial0 = axial0
+        self.radial0 = float(np.linalg.norm(rv)) - self.duct.radius - self.duct.mount_offset
+        B = self._basis(self.theta0, 0.0, 0.0)
+        anchor = self._anchor(self.theta0, self.axial0, self.radial0)
+        self._local_pos = (P - anchor) @ B
+        self._local_dir = np.asarray(directions, float) @ B
+        self._local_row = np.asarray(row_dirs, float) @ B if row_dirs else None
+        start = {'theta': self.theta0, 'axial': self.axial0, 'radial': self.radial0, 'tilt': 0.0, 'spin': 0.0}
+        ranges = {'theta': self.theta_range, 'axial': self.axial_range, 'radial': self.radial_range,
+                  'tilt': self.tilt_axial_range, 'spin': self.spin_range}
+        self.names, self.bounds, self.integrality, self.x0 = [], [], [], []
+        for k in self._keys:
+            lo, hi = (float(r) for r in ranges[k])
+            self.names.append(f"group{self.group_index}.duct_{k}")
+            self.bounds.append((start[k] + lo, start[k] + hi))
+            self.integrality.append(False)
+            self.x0.append(start[k])
+        self._bound = True
+        return self
+
+    def _anchor(self, theta_deg, axial, radial):
+        a, u, v = self.duct.frame()
+        th = math.radians(theta_deg)
+        n = math.cos(th) * u + math.sin(th) * v
+        return (np.asarray(self.duct.center, float) + (self.duct.radius + self.duct.mount_offset + radial) * n
+                + axial * a)
+
+    def _basis(self, theta_deg, tilt_deg, spin_deg):
+        """Columns (normal, tangent, axis) of the panel frame at ``theta`` after tilt and spin."""
+        a, u, v = self.duct.frame()
+        th = math.radians(theta_deg)
+        n = math.cos(th) * u + math.sin(th) * v
+        t = np.cross(a, n)
+        B = np.column_stack([n, t, a])
+        if abs(tilt_deg) > 1e-9:  # same convention as Duct.led_pose: positive tilts toward +axis
+            B = rodrigues_rotation(t, -math.radians(tilt_deg)) @ B
+        if abs(spin_deg) > 1e-9:
+            B = rodrigues_rotation(B[:, 0], math.radians(spin_deg)) @ B
+        return B
+
+    def apply(self, x, cfg):
+        if not self._bound:
+            raise RuntimeError("DuctPanelPose.bind(base_cfg) must be called first")
+        vals = {'theta': self.theta0, 'axial': self.axial0, 'radial': self.radial0, 'tilt': 0.0, 'spin': 0.0}
+        vals.update(zip(self._keys, (float(v) for v in x)))
+        B = self._basis(vals['theta'], vals['tilt'], vals['spin'])
+        anchor = self._anchor(vals['theta'], vals['axial'], vals['radial'])
+        group = cfg['custom_groups'][self.group_index]
+        group['position'] = [0.0, 0.0, 0.0]
+        group['rotation_x'] = group['rotation_y'] = group['rotation_z'] = 0.0
+        group['guide'] = None  # pose is fully baked into the LED arrays
+        group['led_positions'] = [[float(c) for c in anchor + B @ p] for p in self._local_pos]
+        group['led_rotations'] = [[float(c) for c in B @ d] for d in self._local_dir]
+        if self._local_row is not None:
+            group['led_row_directions'] = [[float(c) for c in B @ r] for r in self._local_row]
+        group['led_euler_angles'] = []
+        if self.mirror_group_index is not None:
+            old = cfg['custom_groups'][self.mirror_group_index]
+            m = mirror_group_config_xz(group)
+            m.pop('owner', None)
+            m['name'] = old.get('name', f"{group.get('name', 'panel')}_mirror")
+            m['panel_slot'] = old.get('panel_slot')
+            cfg['custom_groups'][self.mirror_group_index] = m
+
+
+@dataclass
 class LedStates(VariableGroup):
     """Binary on/off per LED of an existing group (``group_index``) or the base rig (``None``)."""
 
@@ -580,6 +698,7 @@ class GroupCurrent(VariableGroup):
 VARIABLE_TYPES = {
     'duct_ring': DuctRingLayout,
     'panel_pose': PanelPose,
+    'duct_panel_pose': DuctPanelPose,
     'led_states': LedStates,
     'led_roles': LedRoles,
     'beam_angle': BeamAngle,

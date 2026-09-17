@@ -86,6 +86,44 @@ def test_duct_ring_variable_counts_keep_per_led_variables_in_place():
     assert fixed.roles_allow_off and all(fixed.bounds[i] == (0.0, 3.0) for i, n in enumerate(fixed.names) if '.role[' in n)
 
 
+def test_duct_panel_pose_slides_existing_layout_over_the_duct():
+    """x0 reproduces the scene exactly; a theta step is a rigid rotation about the duct axis."""
+    from lighting_simulator.optimization import DuctPanelPose
+    from lighting_simulator.scene.builder import group_config_to_factory
+    cfg = load_config("configs/ludos_panels_n4.json")
+    gi = 0
+    duct = Duct(center=(6.3, 12.0, 0.0), axis=(0, 0, 1), radius=8.5, mount_offset=0.0)
+    var = DuctPanelPose(group_index=gi, duct=duct, theta_range=(-30, 30), axial_range=(-2, 2),
+                        tilt_axial_range=(-20, 20), mirror_group_index=1).bind(cfg)
+    assert var.names == [f"group{gi}.duct_theta", f"group{gi}.duct_axial", f"group{gi}.duct_tilt"]
+    assert var.x0[0] == pytest.approx(var.theta0) and var.x0[2] == 0.0
+
+    base = np.asarray(group_config_to_factory(cfg['custom_groups'][gi])['led_positions'], float)
+    base_dirs = np.asarray(group_config_to_factory(cfg['custom_groups'][gi])['led_rotations'], float)
+    problem = Problem(cfg, [var], WALL, CAM)
+    same = problem.decode(problem.x0)
+    out = np.asarray(group_config_to_factory(same['custom_groups'][gi])['led_positions'], float)
+    np.testing.assert_allclose(out, base, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(group_config_to_factory(same['custom_groups'][gi])['led_rotations'], float),
+                               base_dirs, atol=1e-6)
+    mirror = np.asarray(group_config_to_factory(same['custom_groups'][1])['led_positions'], float)
+    np.testing.assert_allclose(mirror, out * np.array([1.0, -1.0, 1.0]), atol=1e-6)
+
+    x = problem.x0.copy()
+    x[0] += 20.0  # rotate 20 deg around the duct
+    moved = np.asarray(group_config_to_factory(problem.decode(x)['custom_groups'][gi])['led_positions'], float)
+    r_before = np.linalg.norm((base - duct.center)[:, :2], axis=1)
+    r_after = np.linalg.norm((moved - duct.center)[:, :2], axis=1)
+    np.testing.assert_allclose(r_after, r_before, atol=1e-6)   # distance to the axis preserved
+    np.testing.assert_allclose(moved[:, 2], base[:, 2], atol=1e-6)  # nothing moved along the axis
+    d_before = np.linalg.norm(base[:, None] - base[None], axis=-1)
+    d_after = np.linalg.norm(moved[:, None] - moved[None], axis=-1)
+    np.testing.assert_allclose(d_after, d_before, atol=1e-6)   # rigid: pairwise distances kept
+    ang = np.degrees(np.arctan2(*(moved - duct.center)[0, [1, 0]]) - np.arctan2(*(base - duct.center)[0, [1, 0]]))
+    assert ang == pytest.approx(20.0, abs=1e-6)
+    assert len(build_scene_from_config(problem.decode(x)).active_leds) > 0
+
+
 def test_panel_pose_and_led_states_modify_base_groups():
     cfg = load_config("configs/Elios3.json")
     pose = PanelPose(group_index=0, pos_delta=(1, 0, 1), rot_delta=(0, 0, 5))
