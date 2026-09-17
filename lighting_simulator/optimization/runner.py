@@ -112,7 +112,8 @@ class RunLogger:
             "confirmations": self.n_confirmations,
             "elapsed_s": round(time.perf_counter() - self.t0, 2),
             "best_score": self.best.score if self.best else None,
-            "best": {k: v for k, v in asdict(self.best).items() if k not in ("metrics", "grid", "vio_grid")} if self.best else None,
+            "best": {k: v for k, v in asdict(self.best).items()
+                     if k not in ("metrics", "grid", "vio_grid", "flight_grid", "tilt_grids")} if self.best else None,
             "best_x": dict(zip(self.problem.names, map(float, self.best_x))) if self.best_x is not None else None,
         }
         if extra:

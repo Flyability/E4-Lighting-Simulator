@@ -43,6 +43,8 @@ class RoomSettings:
     grid_size: int = 20
     rays_per_pixel: int = 2
     led_x_center: float = -35.0
+    lateral_depth: float | None = None
+    """Depth (cm) of the side/top/bottom walls behind the front wall; None = 2.5× the rig-to-wall width."""
     max_bounces: int = 0
     wall_reflectance: float = 0.0
 

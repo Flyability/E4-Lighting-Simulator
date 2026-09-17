@@ -148,7 +148,7 @@ def compute_room_intensity(leds, settings: RoomSettings, emission: EmissionSetti
     absorbers = list(absorbers or [])
     wall_specs = build_wall_specs(
         settings.front_dist, settings.side_dist, settings.top_bottom_dist,
-        int(settings.grid_size), settings.led_x_center, settings.back_dist,
+        int(settings.grid_size), settings.led_x_center, settings.back_dist, settings.lateral_depth,
     )
     grids = empty_wall_grids(wall_specs)
     ray_hits = {name: 0 for name in wall_specs}

@@ -1,15 +1,24 @@
 """Optimisation problem: decision vector → config → scene → score.
 
-Score is minimised. It combines the uniformity metric inside the main-camera
-footprint with soft penalties for the configurable constraints. All knobs
-come from a JSON spec (see ``problem_from_spec`` and ``optimization_specs/``).
+Score is minimised. Every design is judged on three independent *test cases* plus
+geometry / electrical penalties (see ``Problem.evaluate_config``):
+
+* **T1 – inspection image**: flat wall at every ``wall_dists`` distance, main camera
+  untilted, U-metric + coverage + min-lux inside the FOV trapezoid. Uses the *flash*
+  image when a flash mode is defined (the flight image is then only reported), the
+  flight image otherwise. This is the base score (weight 1).
+* **T2 – VIO coverage**: 5-wall room (no back wall) ``vio.room_dist`` cm away, flight
+  image, the two fisheye VIO cameras only; fraction of visible cells ≥ ``vio_min_lux``.
+* **T3 – tilted inspection image**: 5-wall room at each ``wall_dists`` distance, same
+  image rule as T1, main camera pitched ±``tilt_fov_deg``; U-metric + coverage of the
+  cells inside each tilted FOV, computed analytically (``simulation.direct``) on those
+  cells only. Weight ``tilt_fov_weight`` (secondary objective).
 
 Operating modes (``ModeSpec``) share the geometry. Each LED has a *role*
 (``domain.led``): 'vio' LEDs are on continuously, 'flash' LEDs only fire during the
-photogrammetry pulse, 'both' do both. A flash mode (``current_a`` set) is traced as
-"vio LEDs at their continuous flux + flash/both LEDs at the pulse current", a flight
-mode as "vio + both at their continuous flux". Without roles (all 'both') this reduces
-to the older "rescale everything by I_mode / I_design" model.
+photogrammetry pulse, 'both' do both. The flash image is "vio LEDs at their continuous
+flux + flash/both LEDs at the pulse current", the flight image "vio + both at their
+continuous flux".
 """
 
 from __future__ import annotations
@@ -26,10 +35,13 @@ from lighting_simulator.camera.fov import (
     camera_fov_wall_trapezoid, points_in_fisheye_fov, points_in_pinhole_fov, vio_hfov_vfov_deg,
 )
 from lighting_simulator.domain.led import split_by_role
+from lighting_simulator.raytracing.mesh import prepare_mesh_ray_accelerator
 from lighting_simulator.scene.builder import build_scene_from_config, load_config
+from lighting_simulator.simulation.direct import direct_illuminance
+from lighting_simulator.simulation.emission import led_lumens
 from lighting_simulator.simulation.room import compute_room_intensity
 from lighting_simulator.simulation.room_geometry import (
-    build_wall_specs, room_wall_cell_centers, wall_grid_cell_centers_cm,
+    WALL_INWARD_NORMALS, build_wall_specs, room_wall_cell_centers,
 )
 from lighting_simulator.simulation.settings import EmissionSettings, RoomSettings, WallSettings
 from lighting_simulator.simulation.wall import compute_wall_intensity
@@ -52,14 +64,10 @@ class CameraSpec:
         trap = camera_fov_wall_trapezoid(wall_dist - self.pos_x, self.pitch + pitch_offset, self.fov_h, self.fov_v)
         return (*trap, self.pos_y)
 
-    def fit_wall_size(self, wall_dist, margin=1.15, step=10.0, pitch_offsets=(0.0,)):
-        """Smallest centred square wall (cm) containing the footprint(s) at ``wall_dist`` × ``margin``.
-
-        ``pitch_offsets`` lists extra camera pitches to include (e.g. ``(0, +45, -45)`` for the tilt FOVs)."""
-        extent = 0.0
-        for off in pitch_offsets:
-            z_bot, z_top, w_bot, w_top, y_c = self.trapezoid(wall_dist, off)
-            extent = max(extent, abs(z_bot), abs(z_top), abs(y_c) + max(w_bot, w_top))
+    def fit_wall_size(self, wall_dist, margin=1.15, step=10.0):
+        """Smallest centred square wall (cm) containing the footprint at ``wall_dist`` × ``margin``."""
+        z_bot, z_top, w_bot, w_top, y_c = self.trapezoid(wall_dist)
+        extent = max(abs(z_bot), abs(z_top), abs(y_c) + max(w_bot, w_top))
         size = 2.0 * extent * float(margin)
         return float(max(step, np.ceil(size / step) * step))
 
@@ -70,32 +78,27 @@ class ObjectiveSpec:
     """'u0' (Emin/Eavg), 'u1' (Emin/Emax) or 'cv' (σ/Eavg, minimised directly)."""
     min_percentile: float = 0.0
     """Use this percentile of lit FOV cells as Emin (0 = hard minimum, as in the UI)."""
-    flight_weight: float = 1.0
-    """Weight of the flight-mode (continuous LEDs) uniformity term; 0 = optimise the flash image only."""
     coverage_weight: float = 1.0
-    """Penalty weight for the fraction of FOV cells that receive no light."""
+    """Penalty weight for the fraction of FOV cells that receive no light (T1 and T3)."""
     min_avg_lux: float | None = None
     lux_weight: float = 1.0
-    """Penalty weight for (min_avg_lux − Eavg)/min_avg_lux when below target."""
+    """Penalty weight for (min_avg_lux − Eavg)/min_avg_lux when below target (T1 image)."""
     tilt_fov_deg: float | None = None
-    """Also score the same camera pitched ±this many degrees (looking up / down); None = off."""
-    tilt_fov_weight: float = 1.0
-    """Weight of the mean (1 − U) of the two tilted footprints, added as penalty 'tilt_uniformity'."""
-    tilt_geometry: str = "auto"
-    """'room': tilted footprints fall on the VIO room walls (ceiling / floor — what a 45° camera really sees);
-    'wall': on the flat evaluation wall (footprint stretches to ~3.7× the distance); 'auto' = room when
-    ``vio.geometry == 'room'`` else wall."""
+    """T3: also score the main camera pitched ±this many degrees inside a room at each wall distance; None = off."""
+    tilt_fov_weight: float = 0.3
+    """Weight of T3 (mean over distances × {up, down} of the U-metric + coverage term), penalty 'tilt_uniformity'."""
+    tilt_room_grid_size: int = 32
+    """T3 room grid per wall (independent of the VIO room resolution)."""
 
 
 @dataclass
 class VioSpec:
     """Two VD66GY fisheye VIO cameras (same convention as the UI 'VIO Cameras' folder).
 
-    ``geometry="wall"``: the footprint is evaluated on a dedicated far wall (``wall_dist`` cm).
-    ``geometry="room"``: on all six walls of a closed room ``room_dist`` cm from the rig in
-    every direction (coarse ``room_grid_size``² grid per wall), which is what the 170°
-    fisheyes at ±45° actually see. Either way the score uses the *fraction of VIO-visible
-    cells above a lux threshold*.
+    T2 evaluates the *flight* image on the five walls of a room ``room_dist`` cm from the rig
+    in every direction (front, left, right, top, bottom — no back wall; coarse
+    ``room_grid_size``² grid per wall). The score is the fraction of VIO-visible cells above
+    a lux threshold (``ModeSpec.vio_min_lux`` on the flight mode).
     """
 
     position: tuple = (10.0, 0.0, 0.0)
@@ -105,28 +108,15 @@ class VioSpec:
     cam2_yaw: float = 0.0
     long_fov: float = 170.0
     landscape: bool = True
-    geometry: str = "wall"
-    wall_dist: float = 300.0
-    wall_size: float = 1200.0
-    grid_size: int = 40
     room_dist: float = 300.0
-    """Distance (cm) to each of the six room walls (opposite walls are 2× this apart)."""
+    """Distance (cm) to each of the five room walls (opposite walls are 2× this apart)."""
     room_grid_size: int = 20
 
-    def wall_settings(self, rays_per_pixel):
-        return WallSettings(wall_dist=self.wall_dist, grid_size=self.grid_size, wall_size=self.wall_size,
-                            rays_per_pixel=rays_per_pixel)
-
     def room_settings(self, rays_per_pixel=1):
-        d = float(self.room_dist)
-        return RoomSettings(front_dist=d, side_dist=d, top_bottom_dist=d, back_dist=d,
-                            grid_size=int(self.room_grid_size), rays_per_pixel=int(rays_per_pixel),
-                            max_bounces=0, wall_reflectance=0.0)
+        return _room_settings(self.room_dist, self.room_grid_size, rays_per_pixel)
 
     def room_wall_specs(self):
-        s = self.room_settings()
-        return build_wall_specs(s.front_dist, s.side_dist, s.top_bottom_dist, s.grid_size,
-                                s.led_x_center, s.back_dist)
+        return _room_wall_specs(self.room_settings())
 
     def _fisheye_union(self, pts):
         hfov, vfov = vio_hfov_vfov_deg(self.long_fov, self.landscape)
@@ -135,19 +125,68 @@ class VioSpec:
         m2 = points_in_fisheye_fov(pos, self.cam2_pitch, self.cam2_yaw, hfov, vfov, pts)
         return m1 | m2
 
-    def mask(self):
-        """Union of both cameras' footprints on the VIO wall grid."""
-        pts = wall_grid_cell_centers_cm((self.grid_size, self.grid_size), self.wall_size, self.wall_dist)
-        return self._fisheye_union(pts)
-
     def room_masks(self):
-        """``{wall: bool grid}`` of VIO-visible cells; side/top/bottom cells behind the back wall are dropped."""
+        """``{wall: bool grid}`` of cells seen by at least one VIO camera."""
         s = self.room_settings()
-        masks = {}
-        for name, spec in self.room_wall_specs().items():
-            pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
-            masks[name] = self._fisheye_union(pts) & (pts[..., 0] >= -s.back_dist - 1e-6)
-        return masks
+        return {name: self._fisheye_union(room_wall_cell_centers(name, spec, s.front_dist, s.side_dist,
+                                                                 s.top_bottom_dist))
+                for name, spec in self.room_wall_specs().items()}
+
+
+def _room_settings(dist, grid_size, rays_per_pixel=1):
+    """Cube room ``dist`` cm from the rig in every direction, no bounces.
+
+    The back wall bounds the geometry (rays flying backwards stop there) but its grid is dropped
+    from every result: the optimiser only judges the front, side, top and bottom walls.
+    """
+    d = float(dist)
+    return RoomSettings(front_dist=d, side_dist=d, top_bottom_dist=d, back_dist=d, lateral_depth=2 * d,
+                        grid_size=int(grid_size), rays_per_pixel=int(rays_per_pixel),
+                        max_bounces=0, wall_reflectance=0.0)
+
+
+def _room_wall_specs(s: RoomSettings):
+    specs = build_wall_specs(s.front_dist, s.side_dist, s.top_bottom_dist, s.grid_size, s.led_x_center,
+                             s.back_dist, s.lateral_depth)
+    specs.pop('back', None)
+    return specs
+
+
+class TiltRoom:
+    """T3 geometry at one wall distance: the room cells and the ±tilt main-camera footprints on them.
+
+    ``pts`` / ``nrm`` are all cell centres (cm) and inward normals, concatenated wall by wall;
+    ``masks['up'|'down']`` are flat booleans over ``pts``; ``layout`` maps a wall to its slice + shape.
+    """
+
+    def __init__(self, dist, grid_size, camera: CameraSpec, tilt_deg):
+        self.dist = float(dist)
+        self.settings = _room_settings(dist, grid_size)
+        self.specs = _room_wall_specs(self.settings)
+        s = self.settings
+        cam_pos = np.array([camera.pos_x, camera.pos_y, 0.0])
+        pts, nrm, up, down, self.layout = [], [], [], [], {}
+        start = 0
+        for name, spec in self.specs.items():
+            p = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist)
+            flat = p.reshape(-1, 3)
+            self.layout[name] = (start, start + len(flat), p.shape[:2])
+            start += len(flat)
+            pts.append(flat)
+            nrm.append(np.tile(WALL_INWARD_NORMALS[name], (len(flat), 1)))
+            up.append(points_in_pinhole_fov(cam_pos, camera.pitch + tilt_deg, camera.fov_h, camera.fov_v, flat))
+            down.append(points_in_pinhole_fov(cam_pos, camera.pitch - tilt_deg, camera.fov_h, camera.fov_v, flat))
+        self.pts = np.concatenate(pts)
+        self.nrm = np.concatenate(nrm)
+        self.masks = {'up': np.concatenate(up), 'down': np.concatenate(down)}
+        self.scored = self.masks['up'] | self.masks['down']
+
+    def grids(self, flat):
+        """``{wall: grid}`` from a flat per-cell array."""
+        return {name: flat[a:b].reshape(shape) for name, (a, b, shape) in self.layout.items()}
+
+    def wall_masks(self, key):
+        return self.grids(self.masks[key])
 
 
 @dataclass
@@ -169,10 +208,8 @@ class ModeSpec:
     min_avg_lux_dist: float | None = None
     """Wall distance (cm) the lux target refers to; nearest entry of ``wall_dists`` is used."""
     lux_weight: float = 1.0
-    uniformity_weight: float = 0.0
-    """Adds ``w · (1 − U)`` of this mode's own FOV grid (e.g. the flash image) to the score."""
     vio_min_lux: float | None = None
-    """Lux threshold on the VIO wall (e.g. 120 at 3 m)."""
+    """T2: lux threshold on the VIO room walls (e.g. 120 at 3 m); flight modes only."""
     vio_min_fraction: float = 0.5
     """Required share of VIO-visible cells above ``vio_min_lux``."""
     vio_weight: float = 1.0
@@ -223,30 +260,38 @@ class ConstraintSpec:
 class Evaluation:
     score: float
     uniformity_pct: float
+    """T1 U-metric (%) of the scored image, mean over wall distances."""
     coverage: float
     e_avg: float
     n_active: int
     penalties: dict
     metrics: object = None
     grid: np.ndarray | None = None
+    """T1 image per wall (flash image when a flash mode exists, else flight): array or list."""
     vio_grid: np.ndarray | None = None
+    """T2 room grids ``{wall: grid}`` (flight image)."""
     n_drivers: int = 0
     total_current_a: float = 0.0
     """Summed continuous current (flight)."""
     modes: dict = field(default_factory=dict)
     """Per-mode diagnostics: ``{name: {'e_avg', 'vio_fraction', 'scale', 'uniformity_pct', 'n_leds'}}``."""
     tilt: dict = field(default_factory=dict)
-    """±tilt FOV uniformity (%): ``{'up': .., 'down': ..}`` when ``objective.tilt_fov_deg`` is set."""
+    """T3 U-metric (%) ``{'up': .., 'down': ..}``, mean over wall distances, when ``tilt_fov_deg`` is set."""
+    tilt_walls: list = field(default_factory=list)
+    """T3 per wall distance: ``[{'up': U%, 'down': U%, 'cov_up': f, 'cov_down': f}, ...]``."""
     electrical: dict = field(default_factory=dict)
     """``{'n_pulse_drivers', 'n_cont_drivers', 'peak_current_a', 'n_vio', 'n_flash', 'n_both'}`` with a flash mode."""
-    flash_grid: np.ndarray | None = None
+    flight_grid: np.ndarray | None = None
+    """Flight image per wall when a flash mode exists (reported, not scored)."""
+    tilt_grids: list | None = None
+    """T3 room grids per wall distance ``[{wall: grid}, ...]`` (analytic, full room) when kept."""
 
     def summary(self):
         pen = ", ".join(f"{k}={v:.3f}" for k, v in self.penalties.items() if v)
-        s = (f"score={self.score:.4f} U={self.uniformity_pct:.1f}% cov={self.coverage*100:.0f}% "
-             f"Eavg={self.e_avg:.0f}lx LEDs={self.n_active}")
+        s = (f"score={self.score:.4f} T1[U={self.uniformity_pct:.1f}% cov={self.coverage*100:.0f}% "
+             f"Eavg={self.e_avg:.0f}lx] LEDs={self.n_active}")
         if self.tilt:
-            s += f" tilt[↑{self.tilt.get('up', 0):.0f}% ↓{self.tilt.get('down', 0):.0f}%]"
+            s += f" T3[↑{self.tilt.get('up', 0):.0f}% ↓{self.tilt.get('down', 0):.0f}%]"
         if self.n_drivers:
             s += f" drv={self.n_drivers} I={self.total_current_a:.1f}A"
         el = self.electrical
@@ -259,7 +304,7 @@ class Evaluation:
             if m.get('uniformity_pct') is not None:
                 parts.append(f"U={m['uniformity_pct']:.0f}%")
             if m.get('vio_fraction') is not None:
-                parts.append(f"VIO={m['vio_fraction']*100:.0f}%")
+                parts.append(f"T2 VIO={m['vio_fraction']*100:.0f}%")
             s += f" {name}[{' '.join(parts)}]"
         return s + (f" [{pen}]" if pen else "")
 
@@ -284,7 +329,8 @@ class Evaluation:
             vio_grid=self.vio_grid, n_drivers=self.n_drivers, total_current_a=self.total_current_a,
             modes=modes,
             tilt={k: 0.5 * (v + other.tilt.get(k, v)) for k, v in self.tilt.items()},
-            electrical=dict(self.electrical), flash_grid=self.flash_grid,
+            tilt_walls=list(self.tilt_walls),  # T3 is analytic: identical in both evaluations
+            electrical=dict(self.electrical), flight_grid=self.flight_grid, tilt_grids=self.tilt_grids,
         )
 
 
@@ -330,14 +376,8 @@ class Problem:
         self.constraints = constraints or ConstraintSpec()
         dists = [float(d) for d in (wall_dists or [wall.wall_dist])]
         t = self.objective.tilt_fov_deg
-        room_geom = self.vio is not None and self.vio.geometry == "room"
-        self._tilt_room = bool(t) and room_geom and self.objective.tilt_geometry != "wall"
         if isinstance(wall_sizes, str) and wall_sizes == "auto":
-            offs = (0.0, float(t), -float(t)) if (t and not self._tilt_room) else (0.0,)
-            sizes = [camera.fit_wall_size(d, pitch_offsets=offs) for d in dists]
-            if len(offs) > 1:
-                print("[optim] auto wall sizes include the ±%g° tilt footprints: %s cm (cell %s cm)" % (
-                    t, ", ".join(f"{s:g}" for s in sizes), ", ".join(f"{s / wall.grid_size:.1f}" for s in sizes)))
+            sizes = [camera.fit_wall_size(d) for d in dists]
         elif wall_sizes is None:
             sizes = [float(wall.wall_size)] * len(dists)
         else:
@@ -346,45 +386,28 @@ class Problem:
                 sizes = sizes * len(dists)
             if len(sizes) != len(dists):
                 raise ValueError(f"wall_sizes has {len(sizes)} entries for {len(dists)} wall distances")
+        # T1: flat walls + main-camera footprint
         self.walls = [WallSettings(wall_dist=d, grid_size=wall.grid_size, wall_size=s,
                                    rays_per_pixel=wall.rays_per_pixel) for d, s in zip(dists, sizes)]
         self._fov_masks = [
             trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist))
             for w in self.walls
         ]
-        # Same camera pitched up / down: (mask_up, mask_down) per wall, or None
-        self._tilt_masks = [
-            tuple(trapezoid_mask((w.grid_size, w.grid_size), w.wall_size, camera.trapezoid(w.wall_dist, s * t))
-                  for s in (+1.0, -1.0))
-            for w in self.walls
-        ] if (t and not self._tilt_room) else None
-        # Tilted footprints on the VIO room walls: {'up': {wall: mask}, 'down': {...}}
-        self._tilt_room_masks = None
-        if self._tilt_room:
-            cam_pos = np.array([camera.pos_x, camera.pos_y, 0.0])
-            specs = self.vio.room_wall_specs()
-            s = self.vio.room_settings()
-            self._tilt_room_masks = {}
-            for key, sign in (('up', 1.0), ('down', -1.0)):
-                masks = {}
-                for name, spec in specs.items():
-                    pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
-                    masks[name] = points_in_pinhole_fov(cam_pos, camera.pitch + sign * t, camera.fov_h, camera.fov_v, pts)
-                self._tilt_room_masks[key] = masks
-            print(f"[optim] ±{t:g}° tilt FOVs are evaluated on the VIO room walls ({2 * self.vio.room_dist / 100:g} m room)")
-        self._needs_vio = self.vio is not None and any(m.vio_min_lux for m in self.modes)
-        self._vio_room = self._needs_vio and room_geom
-        if self._vio_room or self._tilt_room:
-            self._vio_wall = None
+        # T3: a room at every wall distance, main camera pitched ±t
+        self._tilt_rooms = []
+        if t:
+            self._tilt_rooms = [TiltRoom(d, self.objective.tilt_room_grid_size, camera, float(t)) for d in dists]
+            if not all(r.scored.any() for r in self._tilt_rooms):
+                raise ValueError("the ±tilt camera footprints miss the T3 room walls: check the camera pose")
+            print(f"[optim] T3: ±{t:g}° tilt FOVs on 5-wall rooms at {', '.join(f'{d:g}' for d in dists)} cm "
+                  f"({self.objective.tilt_room_grid_size}² cells/wall, analytic), w={self.objective.tilt_fov_weight:g}")
+        # T2: VIO room, flight image, fisheye footprints
+        self._needs_vio = self.vio is not None and any(m.vio_min_lux for m in self.modes if not m.is_flash)
+        self._vio_masks = None
+        if self._needs_vio:
             self._vio_masks = self.vio.room_masks()
-            self._vio_mask = self._vio_masks['front']
-            if self._vio_room and not any(np.any(m) for m in self._vio_masks.values()):
+            if not any(np.any(m) for m in self._vio_masks.values()):
                 raise ValueError("VIO cameras do not see the VIO room walls: check the poses")
-        elif self._needs_vio:
-            self._vio_wall = self.vio.wall_settings(wall.rays_per_pixel)
-            self._vio_mask = self.vio.mask()
-            if not np.any(self._vio_mask):
-                raise ValueError("VIO cameras do not see the VIO wall: enlarge vio.wall_size or check the poses")
         self.n_evals = 0
 
     # -- decision vector -------------------------------------------------
@@ -461,92 +484,87 @@ class Problem:
 
         flash_lumens = self.driver.lumens(flash_mode.current_a) if flash_mode is not None else None
         m = self.objective.metric
+        cov_w = float(self.objective.coverage_weight)
 
         def _score_of(metrics):
             return {'u0': 1.0 - metrics.u0, 'u1': 1.0 - metrics.u1, 'cv': metrics.cv}[m]
 
+        def _judge(values):
+            """(score term, U %, E_avg, coverage) of the cells inside one camera footprint."""
+            values = np.asarray(values)
+            cov = float(np.count_nonzero(values > 0) / max(1, values.size))
+            mt = uniformity_metrics(values, self.objective.min_percentile)
+            if mt is None:
+                return 5.0, 0.0, 0.0, cov, None
+            return _score_of(mt), mt.uniformity_pct, mt.e_avg, cov, mt
+
+        # ---- T1: flat wall × untilted main camera; the flash image is the one judged when it exists
         scores, unis, e_avgs, covs, grids, last_metrics = [], [], [], [], [], None
-        flash_scores, flash_unis, flash_e_avgs, flash_grids = [], [], [], []
-        tilt_scores, tilt_unis = [], {'up': [], 'down': []}
-        for wi, (wall, fov_mask) in enumerate(zip(self.walls, self._fov_masks)):
-            grid, flash_grid = self._trace_modes(scene, wall, active, by_role, flash_lumens)
-            fov = grid[fov_mask]
-            coverage = float(np.count_nonzero(fov > 0) / max(1, fov.size))
-            metrics = uniformity_metrics(fov, self.objective.min_percentile)
-            if metrics is None:
-                scores.append(5.0)
-                unis.append(0.0)
-                e_avgs.append(0.0)
+        fl_unis, fl_e_avgs, flight_grids = [], [], []
+        for wall, fov_mask in zip(self.walls, self._fov_masks):
+            flight_grid, flash_grid = self._trace_modes(scene, wall, active, by_role, flash_lumens)
+            primary = flash_grid if flash_grid is not None else flight_grid
+            sc, u, ea, cov, mt = _judge(primary[fov_mask])
+            scores.append(sc); unis.append(u); e_avgs.append(ea); covs.append(cov); grids.append(primary)
+            last_metrics = mt or last_metrics
+            if flash_grid is not None:  # flight image: diagnostics + flight-mode lux target only
+                _, fu, fe, _, _ = _judge(flight_grid[fov_mask])
+                fl_unis.append(fu); fl_e_avgs.append(fe); flight_grids.append(flight_grid)
             else:
-                scores.append(_score_of(metrics))
-                unis.append(metrics.uniformity_pct)
-                e_avgs.append(metrics.e_avg)
-                last_metrics = metrics
-            covs.append(coverage)
-            grids.append(grid)
-            if flash_grid is not None:
-                fm = uniformity_metrics(flash_grid[fov_mask], self.objective.min_percentile)
-                flash_scores.append(5.0 if fm is None else _score_of(fm))
-                flash_unis.append(0.0 if fm is None else fm.uniformity_pct)
-                flash_e_avgs.append(0.0 if fm is None else fm.e_avg)
-                flash_grids.append(flash_grid)
-            if self._tilt_masks is not None:
-                for key, mask in zip(('up', 'down'), self._tilt_masks[wi]):
-                    if not np.any(mask):
-                        continue  # footprint entirely off this wall: nothing to judge
-                    tm = uniformity_metrics(grid[mask], self.objective.min_percentile)
-                    if tm is None:
-                        tilt_scores.append(1.0)  # cells exist but none are lit
-                        tilt_unis[key].append(0.0)
-                    else:
-                        tilt_scores.append(_score_of(tm))
-                        tilt_unis[key].append(tm.uniformity_pct)
+                fl_unis.append(u); fl_e_avgs.append(ea)
         self.n_evals += 1
 
-        score = float(self.objective.flight_weight) * float(np.mean(scores))
+        score = float(np.mean(scores))
         uniformity_pct = float(np.mean(unis))
         e_avg = float(np.mean(e_avgs))
         coverage = float(min(covs))
         if self.objective.min_avg_lux and e_avg > 0:
             short = max(0.0, (self.objective.min_avg_lux - min(e_avgs)) / self.objective.min_avg_lux)
             penalties['lux'] = self.objective.lux_weight * short
-        penalties['coverage'] = self.objective.coverage_weight * (1.0 - coverage)
-        tilt = {}
-        if self._tilt_masks is not None:
-            if tilt_scores:
-                penalties['tilt_uniformity'] = self.objective.tilt_fov_weight * float(np.mean(tilt_scores))
-            tilt = {k: float(np.mean(v)) if v else 0.0 for k, v in tilt_unis.items()}
+        penalties['coverage'] = cov_w * (1.0 - coverage)
 
+        # ---- T3: rooms at the wall distances × main camera pitched ±t, same image rule as T1 (analytic)
+        tilt, tilt_walls, tilt_grids = {}, [], []
+        if self._tilt_rooms:
+            if flash_mode is not None:
+                t3_leds = by_role['vio'] + pulse_leds
+                t3_lumens = ([led_lumens(p, self.emission.default_lumens) for p in by_role['vio']]
+                             + [float(flash_lumens)] * len(pulse_leds))
+            else:
+                t3_leds, t3_lumens = flight_leds, None
+            accel = prepare_mesh_ray_accelerator(scene.stl_mesh_data) if scene.stl_mesh_data is not None else None
+            tilt_scores, tilt_unis = [], {'up': [], 'down': []}
+            for room in self._tilt_rooms:
+                sel = np.ones(len(room.pts), bool) if keep_grid else room.scored
+                e = np.zeros(len(room.pts))
+                e[sel] = direct_illuminance(room.pts[sel], room.nrm[sel], t3_leds, self.emission, lumens=t3_lumens,
+                                            absorbers=scene.absorbers, accel=accel)
+                rec = {}
+                for key in ('up', 'down'):
+                    sc, u, _, cov, _ = _judge(e[room.masks[key]])
+                    tilt_scores.append(sc + cov_w * (1.0 - cov))
+                    tilt_unis[key].append(u)
+                    rec[key], rec[f'cov_{key}'] = u, cov
+                tilt_walls.append(rec)
+                if keep_grid:
+                    tilt_grids.append(room.grids(e))
+            penalties['tilt_uniformity'] = self.objective.tilt_fov_weight * float(np.mean(tilt_scores))
+            tilt = {k: float(np.mean(v)) for k, v in tilt_unis.items()}
+
+        # ---- T2: VIO room (flight image) × fisheye footprints; per-mode lux / coverage targets
         modes = {}
-        vio_grid = None
         room_grid = None
-        if self._vio_room or self._tilt_room:
-            room_grid = self._trace_room(scene, flight_leds, len(active))
-        if self._tilt_room:
-            for key in ('up', 'down'):
-                lit = np.concatenate([room_grid[n][mk] for n, mk in self._tilt_room_masks[key].items() if n in room_grid])
-                if lit.size == 0:
-                    continue
-                tm = uniformity_metrics(lit, self.objective.min_percentile)
-                tilt_scores.append(1.0 if tm is None else _score_of(tm))
-                tilt_unis[key].append(0.0 if tm is None else tm.uniformity_pct)
-            if tilt_scores:
-                penalties['tilt_uniformity'] = self.objective.tilt_fov_weight * float(np.mean(tilt_scores))
-            tilt = {k: float(np.mean(v)) if v else 0.0 for k, v in tilt_unis.items()}
         if self.modes:
             vio_lit = None
-            if self._vio_room:
-                vio_grid = room_grid
-                vio_lit = np.concatenate([vio_grid[n][mk] for n, mk in self._vio_masks.items() if n in vio_grid])
-            elif self._needs_vio:
-                vio_grid = self._trace_leds(flight_leds, self._vio_wall, 1.0, scene)
-                vio_lit = vio_grid[self._vio_mask]
+            if self._needs_vio:
+                room_grid = self._trace_room(scene, flight_leds, len(active))
+                vio_lit = np.concatenate([room_grid[n][mk] for n, mk in self._vio_masks.items() if n in room_grid])
             for mode in self.modes:
                 if mode.is_flash:
-                    info = self._flash_mode_penalties(mode, flash_scores, flash_unis, flash_e_avgs, penalties)
+                    info = self._flash_mode_penalties(mode, unis, e_avgs, penalties)
                     info['n_leds'] = len(pulse_leds)
                 else:
-                    info = self._flight_mode_penalties(mode, e_avgs, unis, vio_lit, penalties)
+                    info = self._flight_mode_penalties(mode, fl_e_avgs, fl_unis, vio_lit, penalties)
                     info['n_leds'] = len(flight_leds)
                 modes[mode.name] = info
 
@@ -554,11 +572,12 @@ class Problem:
         return Evaluation(score=score, uniformity_pct=uniformity_pct, coverage=coverage,
                           e_avg=e_avg, n_active=len(active), penalties=penalties, metrics=last_metrics,
                           grid=(grids[0] if len(grids) == 1 else grids) if keep_grid else None,
-                          vio_grid=(vio_grid if vio_grid is not None else room_grid) if keep_grid else None,
+                          vio_grid=room_grid if keep_grid else None,
                           n_drivers=n_drivers, total_current_a=total_current, modes=modes, tilt=tilt,
-                          electrical=electrical,
-                          flash_grid=((flash_grids[0] if len(flash_grids) == 1 else flash_grids)
-                                      if (keep_grid and flash_grids) else None))
+                          tilt_walls=tilt_walls, electrical=electrical,
+                          flight_grid=((flight_grids[0] if len(flight_grids) == 1 else flight_grids)
+                                       if (keep_grid and flight_grids) else None),
+                          tilt_grids=tilt_grids if (keep_grid and tilt_grids) else None)
 
     def __call__(self, x):
         return self.evaluate(x).score
@@ -604,7 +623,7 @@ class Problem:
         return self._trace_leds(scene.leds, wall, 1.0, scene)
 
     def _trace_room(self, scene, leds, n_active):
-        """VIO room trace (flight LEDs) with roughly the ray budget of one main-wall trace."""
+        """T2: VIO room trace (flight LEDs) with roughly the ray budget of one main-wall trace."""
         w = self.walls[0]
         room_cells = int(self.vio.room_grid_size) ** 2
         rpp = max(1, int(round(w.rays_per_pixel * w.grid_size ** 2 / max(1, n_active * room_cells))))
@@ -613,7 +632,7 @@ class Problem:
         grids, _ = compute_room_intensity(leds, self.vio.room_settings(rpp), self.emission,
                                           absorbers=scene.absorbers, stl_mesh_data=scene.stl_mesh_data,
                                           use_gpu=self.use_gpu, verbose=False)
-        return {n: np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for n, g in grids.items()}
+        return {n: np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for n, g in grids.items() if n != 'back'}
 
     def _pick_wall(self, mode, values):
         if mode.min_avg_lux_dist is not None:
@@ -642,17 +661,14 @@ class Problem:
                 penalties[f'{mode.name}.vio'] = mode.vio_weight * short
         return info
 
-    def _flash_mode_penalties(self, mode: ModeSpec, flash_scores, flash_unis, flash_e_avgs, penalties):
-        """Pulse operating point: traced grid of 'vio' (continuous) + 'flash'/'both' (pulse flux)."""
-        info = {'scale': None, 'e_avg': self._pick_wall(mode, flash_e_avgs) if flash_e_avgs else 0.0,
-                'vio_fraction': None,
-                'uniformity_pct': float(np.mean(flash_unis)) if flash_unis else None}
+    def _flash_mode_penalties(self, mode: ModeSpec, unis, e_avgs, penalties):
+        """Pulse operating point: its image IS the T1 image, so only the lux target is added here."""
+        info = {'scale': None, 'e_avg': self._pick_wall(mode, e_avgs) if e_avgs else 0.0,
+                'vio_fraction': None, 'uniformity_pct': float(np.mean(unis)) if unis else None}
         if mode.min_avg_lux:
             short = max(0.0, (mode.min_avg_lux - info['e_avg']) / mode.min_avg_lux)
             if short > 0:
                 penalties[f'{mode.name}.lux'] = mode.lux_weight * short
-        if mode.uniformity_weight and flash_scores:
-            penalties[f'{mode.name}.uniformity'] = mode.uniformity_weight * float(np.mean(flash_scores))
         return info
 
     def _geometry_penalties(self, active, n_drivers=0, total_current=0.0, electrical=None, peak_current=0.0):
@@ -715,6 +731,24 @@ class Problem:
         return pen
 
 
+_LEGACY_KEYS = {
+    'objective': ('flight_weight', 'tilt_geometry'),
+    'vio': ('geometry', 'wall_dist', 'wall_size', 'grid_size'),
+    'mode': ('uniformity_weight',),
+}
+
+
+def _drop_legacy(section: dict, kind: str):
+    """Remove pre-test-case keys from a spec section (their behaviour is now fixed by T1/T2/T3)."""
+    dropped = [k for k in _LEGACY_KEYS[kind] if k in section]
+    for k in dropped:
+        section.pop(k)
+    if dropped:
+        print(f"[optim] ignoring obsolete {kind} key(s) {dropped}: T1 always scores the flash image when a flash "
+              "mode exists, T2/T3 always use rooms")
+    return section
+
+
 def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **problem_kwargs) -> Problem:
     """Build a Problem from a JSON-like spec dict (see optimization_specs/*.json).
 
@@ -746,13 +780,13 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     wall = WallSettings(**wall_spec)
     camera = CameraSpec(**spec.get('camera', {}))
     emission = EmissionSettings(**spec.get('emission', {}))
-    objective = ObjectiveSpec(**spec.get('objective', {}))
+    objective = ObjectiveSpec(**_drop_legacy(dict(spec.get('objective', {})), 'objective'))
     constraints = ConstraintSpec(**spec.get('constraints', {}))
     clear_base = bool(spec.get('clear_base', False))
     driver = DriverModel(**spec.get('driver', {}))
     cont_driver = DriverModel(**{**spec.get('driver', {}), **spec['cont_driver']}) if spec.get('cont_driver') else None
-    vio = VioSpec(**spec['vio']) if spec.get('vio') else None
-    modes = [ModeSpec(**m) for m in spec.get('modes', [])]
+    vio = VioSpec(**_drop_legacy(dict(spec['vio']), 'vio')) if spec.get('vio') else None
+    modes = [ModeSpec(**_drop_legacy(dict(m), 'mode')) for m in spec.get('modes', [])]
 
     working = copy.deepcopy(base_cfg)
     if clear_base:

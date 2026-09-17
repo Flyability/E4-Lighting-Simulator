@@ -87,3 +87,33 @@ def test_room_pipeline_with_bounces(elios3):
     assert set(grids) == {'front', 'left', 'right', 'top', 'bottom'}
     assert all(g.shape == (8, 8) for g in grids.values())
     assert grids['front'].sum() > 0
+
+
+def test_direct_illuminance_matches_monte_carlo_mean():
+    """Analytic gather == expected value of the MC room tracer on lit cells (no bounces)."""
+    from lighting_simulator.simulation import direct_illuminance
+    from lighting_simulator.simulation.room_geometry import WALL_INWARD_NORMALS, room_wall_cell_centers
+    leds = [LED(position=(0, 0, 0), direction=(1, 0, 0.3), viewing_angle=120.0),
+            LED(position=(2, -3, 1), direction=(0.5, 0.5, -0.4), viewing_angle=90.0)]
+    d, g = 100.0, 12
+    settings = RoomSettings(front_dist=d, side_dist=d, top_bottom_dist=d, grid_size=g, rays_per_pixel=4000)
+    emission = EmissionSettings(default_lumens=150.0, ray_uniformity=0.3)
+    grids, specs = compute_room_intensity(leds, settings, emission, use_gpu=False, verbose=False)
+    for name in ('front', 'top', 'right'):
+        pts = room_wall_cell_centers(name, specs[name], d, d, d, None).reshape(-1, 3)
+        nrm = np.tile(WALL_INWARD_NORMALS[name], (len(pts), 1))
+        e = direct_illuminance(pts, nrm, leds, emission).reshape(grids[name].shape)
+        mc = grids[name]
+        bright = mc > 0.2 * mc.max()  # skip cone-edge cells where the MC bin is half-filled
+        rel = np.abs(e[bright] - mc[bright]) / mc[bright]
+        assert np.median(rel) < 0.05, (name, np.median(rel))
+        # the analytic value is a point sample at the cell centre, MC a bin average: they only
+        # differ on cone-edge cells, so the wall totals agree loosely at this coarse resolution
+        assert e.sum() == pytest.approx(mc.sum(), rel=0.10)
+    blocker = [{'center': (10.0, 0.0, 3.0), 'half_sizes': (0.5, 4.0, 4.0), 'rotation': None}]
+    pts = room_wall_cell_centers('front', specs['front'], d, d, d, None).reshape(-1, 3)
+    nrm = np.tile(WALL_INWARD_NORMALS['front'], (len(pts), 1))
+    shaded = direct_illuminance(pts, nrm, leds, emission, absorbers=blocker)
+    assert shaded.sum() < 0.9 * direct_illuminance(pts, nrm, leds, emission).sum()
+    base = direct_illuminance(pts, nrm, leds, emission).sum()  # LED() defaults to 100 lm
+    assert direct_illuminance(pts, nrm, leds, emission, lumens=[200.0, 200.0]).sum() == pytest.approx(2 * base)

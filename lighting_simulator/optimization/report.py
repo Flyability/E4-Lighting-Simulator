@@ -154,10 +154,6 @@ def _verifier(problem, factor):
     p = copy.copy(problem)
     p.walls = [WallSettings(wall_dist=w.wall_dist, grid_size=w.grid_size, wall_size=w.wall_size,
                             rays_per_pixel=int(w.rays_per_pixel * factor)) for w in problem.walls]
-    if getattr(problem, "_needs_vio", False) and getattr(problem, "_vio_wall", None) is not None:
-        v = problem._vio_wall
-        p._vio_wall = WallSettings(wall_dist=v.wall_dist, grid_size=v.grid_size, wall_size=v.wall_size,
-                                   rays_per_pixel=int(v.rays_per_pixel * factor))
     return p
 
 
@@ -197,19 +193,52 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
     w.heading("Key results")
     labels = list(designs.keys())
     header = ["", *labels]
-    widths = [36] + [16] * len(labels)
+    widths = [40] + [16] * len(labels)
     evs = [designs[k][1] for k in labels]
     pct = problem.objective.min_percentile
     u0_label = f"U0 = P{pct:g}(E)/E_avg" if pct > 0 else "U0 = E_min/E_avg"
+    t1_img = "flash image" if problem.flash_modes else "flight image"
     rows = [
         [f"Score, verified {VERIFY_RAY_FACTOR}× rays", *[f"{e.score:.4f}" for e in evs]],
         ["Score, logged during run", *[(f"{logged_scores[k]:.4f}" if logged_scores.get(k) is not None else "—")
                                        for k in labels]],
+        [f"— T1: wall, main camera, {t1_img} —", *[""] * len(labels)],
         [f"{u0_label}, mean of walls", *[f"{e.uniformity_pct:.1f} %" for e in evs]],
         ["U0 hard-min per wall (UI legend)", *[" / ".join(f"{u:.0f}" for u in _hard_min_u0(problem, e)) + " %"
                                               for e in evs]],
-        ["FOV coverage", *[f"{e.coverage*100:.0f} %" for e in evs]],
+        ["FOV coverage (worst wall)", *[f"{e.coverage*100:.0f} %" for e in evs]],
         ["E_avg in FOV (mean over walls)", *[f"{e.e_avg:,.0f} lx" for e in evs]],
+    ]
+    if evs[0].metrics is not None:
+        rows += [
+            ["E_min / E_max (last wall)", *[
+                f"{e.metrics.e_min:,.0f} / {e.metrics.e_max:,.0f} lx" if e.metrics else "—" for e in evs]],
+            ["ΔEV (stops)", *[f"{e.metrics.delta_ev:.2f}" if e.metrics else "—" for e in evs]],
+        ]
+    if getattr(problem, "_needs_vio", False):
+        v = problem.vio
+        rows.append([f"— T2: room {v.room_dist:g} cm, VIO cameras —", *[""] * len(labels)])
+        for mode in problem.modes:
+            if mode.vio_min_lux:
+                rows.append([f"cells ≥ {mode.vio_min_lux:g} lx (target {mode.vio_min_fraction*100:.0f} %)", *[
+                    (lambda f: f"{f*100:.0f} %" if f is not None else "—")(e.modes.get(mode.name, {}).get('vio_fraction'))
+                    for e in evs]])
+    if problem.objective.tilt_fov_deg:
+        t = problem.objective.tilt_fov_deg
+        rows.append([f"— T3: rooms, camera ±{t:g}°, w={problem.objective.tilt_fov_weight:g} —",
+                     *[""] * len(labels)])
+        rows.append([f"U0 pitched +{t:g}° (up), mean of rooms", *[f"{e.tilt.get('up', 0):.1f} %" for e in evs]])
+        rows.append([f"U0 pitched −{t:g}° (down), mean of rooms", *[f"{e.tilt.get('down', 0):.1f} %" for e in evs]])
+        for i, wl in enumerate(problem.walls):
+            def _cell(e, keys, i=i):
+                if i >= len(e.tilt_walls):
+                    return "—"
+                tw = e.tilt_walls[i]
+                return " / ".join(f"{tw[k] * (100 if k.startswith('cov') else 1):.0f}" for k in keys) + " %"
+            rows.append([f"  room {wl.wall_dist:g} cm: U0 up / down", *[_cell(e, ('up', 'down')) for e in evs]])
+            rows.append([f"  room {wl.wall_dist:g} cm: coverage up / down", *[_cell(e, ('cov_up', 'cov_down')) for e in evs]])
+    rows.append(["— Hardware —", *[""] * len(labels)])
+    rows += [
         ["Active LEDs", *[str(e.n_active) for e in evs]],
         ["Drivers", *[str(e.n_drivers) for e in evs]],
         ["Continuous current", *[f"{e.total_current_a:.1f} A" for e in evs]],
@@ -223,28 +252,10 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
                 f"{e.electrical.get('n_pulse_drivers', 0)} / {e.electrical.get('n_cont_drivers', 0)}" for e in evs]],
             ["Peak current (flash)", *[f"{e.electrical.get('peak_current_a', 0):.1f} A" for e in evs]],
         ]
-    if evs[0].metrics is not None:
-        rows += [
-            ["E_min / E_max (last wall)", *[
-                f"{e.metrics.e_min:,.0f} / {e.metrics.e_max:,.0f} lx" if e.metrics else "—" for e in evs]],
-            ["ΔEV (stops)", *[f"{e.metrics.delta_ev:.2f}" if e.metrics else "—" for e in evs]],
-        ]
-    if problem.objective.tilt_fov_deg:
-        t = problem.objective.tilt_fov_deg
-        rows.append([f"U0, camera pitched +{t:g}° (up)", *[f"{e.tilt.get('up', 0):.1f} %" for e in evs]])
-        rows.append([f"U0, camera pitched −{t:g}° (down)", *[f"{e.tilt.get('down', 0):.1f} %" for e in evs]])
     for mode in problem.modes:
-        rows.append([f"{mode.name}: E_avg", *[
+        rows.append([f"{mode.name}: E_avg in FOV", *[
             f"{e.modes.get(mode.name, {}).get('e_avg', 0):,.0f} lx" for e in evs]])
-        if mode.is_flash or mode.uniformity_weight:
-            rows.append([f"{mode.name}: U0 ({'pulse' if mode.is_flash else 'continuous'} LEDs)", *[
-                (lambda u: f"{u:.1f} %" if u is not None else "—")(e.modes.get(mode.name, {}).get('uniformity_pct'))
-                for e in evs]])
-            rows.append([f"{mode.name}: LEDs lit", *[str(e.modes.get(mode.name, {}).get('n_leds', '—')) for e in evs]])
-        if mode.vio_min_lux:
-            rows.append([f"{mode.name}: VIO ≥{mode.vio_min_lux:g} lx", *[
-                (lambda f: f"{f*100:.0f} %" if f is not None else "—")(e.modes.get(mode.name, {}).get('vio_fraction'))
-                for e in evs]])
+        rows.append([f"{mode.name}: LEDs lit", *[str(e.modes.get(mode.name, {}).get('n_leds', '—')) for e in evs]])
     pen_keys = sorted({k for e in evs for k in e.penalties})
     for k in pen_keys:
         rows.append([f"penalty: {k}", *[f"{e.penalties.get(k, 0.0):.4f}" for e in evs]])
@@ -290,32 +301,30 @@ def _page_problem(w: _Writer, problem, designs):
                f"{cd.leds_per_driver} LED(s) per driver")
     if problem.vio is not None:
         v = problem.vio
-        where = (f"VIO room: six walls {v.room_dist:g} cm away ({2*v.room_dist/100:g} m across), "
-                 f"{v.room_grid_size}² cells per wall" if v.geometry == "room" else
-                 f"VIO wall at {v.wall_dist:g} cm, {v.wall_size:g} cm wide, {v.grid_size}² cells")
         w.line(f"VIO cameras: at {_fmt(list(v.position))} cm, cam1 pitch {v.cam1_pitch:g}° yaw {v.cam1_yaw:g}°, "
                f"cam2 pitch {v.cam2_pitch:g}° yaw {v.cam2_yaw:g}°, long-side FOV {v.long_fov:g}° "
-               f"({'landscape' if v.landscape else 'portrait'}); {where}")
+               f"({'landscape' if v.landscape else 'portrait'}); T2 room: five walls {v.room_dist:g} cm away "
+               f"({2*v.room_dist/100:g} m across), {v.room_grid_size}² cells per wall")
     if problem.modes:
         w.heading("Operating modes")
         for m in problem.modes:
-            parts = [(f"pulse: flash + both LEDs at {m.current_a:g} A, vio LEDs continuous" if m.is_flash
-                      else f"continuous: vio + both LEDs, flux × {m.lumens_scale:g}")]
-            if m.uniformity_weight:
-                parts.append(f"uniformity term w={m.uniformity_weight:g}")
+            parts = [(f"pulse: flash + both LEDs at {m.current_a:g} A, vio LEDs continuous — this is the image judged "
+                      "in T1 and T3" if m.is_flash
+                      else f"continuous: vio + both LEDs, flux × {m.lumens_scale:g}"
+                      + (" — judged in T2 only" if problem.flash_modes else " — the image judged in T1 and T3"))]
             if m.min_avg_lux:
                 parts.append(f"E_avg ≥ {m.min_avg_lux:,.0f} lx"
                              + (f" at {m.min_avg_lux_dist:g} cm" if m.min_avg_lux_dist else "") + f" (w={m.lux_weight:g})")
             if m.vio_min_lux:
-                parts.append(f"≥ {m.vio_min_fraction*100:.0f} % of VIO FOV above {m.vio_min_lux:g} lx (w={m.vio_weight:g})")
+                parts.append(f"T2: ≥ {m.vio_min_fraction*100:.0f} % of VIO FOV above {m.vio_min_lux:g} lx (w={m.vio_weight:g})")
             w.line(f"• {m.name}: " + "; ".join(parts))
 
     w.heading("Objective")
     o = problem.objective
     w.line(f"metric = {o.metric}, E_min percentile = {o.min_percentile:g} %, coverage weight = {o.coverage_weight:g}"
            + (f", min average lux = {o.min_avg_lux:,.0f} (w={o.lux_weight:g})" if o.min_avg_lux else "")
-           + (f"; ±{o.tilt_fov_deg:g}° tilt FOVs (w={o.tilt_fov_weight:g}) on the "
-              + ("VIO room walls" if getattr(problem, '_tilt_room', False) else "flat wall") if o.tilt_fov_deg else ""))
+           + (f"; T3: ±{o.tilt_fov_deg:g}° tilt FOVs on 5-wall rooms at the wall distances, "
+              f"{o.tilt_room_grid_size}² cells/wall, w={o.tilt_fov_weight:g}" if o.tilt_fov_deg else "; T3 off"))
 
     w.heading("Constraints (active)")
     cs = asdict(problem.constraints)
@@ -348,14 +357,72 @@ def _page_problem(w: _Writer, problem, designs):
 
 def _page_method(w: _Writer, problem):
     o, c = problem.objective, problem.constraints
-    w.heading("How a design is scored")
+    has_flash = bool(problem.flash_modes)
+    img = "flash image" if has_flash else "flight image"
+    dists = ", ".join(f"{wl.wall_dist:g}" for wl in problem.walls)
+    w.heading("Test cases")
     w.line("Each candidate decision vector x is decoded into a regular saved configuration (same JSON schema "
-           "as configs/*.json), the scene is built with the exact same code as the UI, and the wall "
-           "illuminance E (lux) is ray-traced on a grid at every wall distance d in the list above. Only the "
-           "cells inside the main-camera footprint (the FOV trapezoid, drawn in white on the images) are "
-           "kept; cells with E = 0 are ignored for the uniformity metrics but counted for coverage.")
+           "as configs/*.json) and the scene is built with the exact same code as the UI. The design is then "
+           "judged on three independent test cases — each with its own geometry, operating mode and camera — "
+           "plus hardware penalties. Two illuminance images exist when a flash mode is defined: the flight "
+           "image (VIO + Both LEDs at continuous current) and the flash image (Flash + Both LEDs at the "
+           "pulse current, VIO LEDs continuous). The main camera only records during the flash, so T1 and T3 "
+           "judge the flash image; the VIO cameras never see the flash, so T2 judges the flight image."
+           if has_flash else
+           "Each candidate decision vector x is decoded into a regular saved configuration (same JSON schema "
+           "as configs/*.json) and the scene is built with the exact same code as the UI. The design is then "
+           "judged on three independent test cases — each with its own geometry and camera — plus hardware "
+           "penalties. No flash mode is defined, so every test case uses the single continuous image.")
     w.gap(0.006)
-    w.line("Uniformity metrics over the lit FOV cells:", weight="bold")
+    w.table(
+        ["", "geometry", "image", "camera", "metric", "weight"],
+        [
+            ["T1 inspection", f"flat wall @ {dists} cm", img, "main, untilted",
+             f"{o.metric.upper()} + coverage" + (" + lux" if o.min_avg_lux or any(m.min_avg_lux for m in problem.modes) else ""),
+             "1 (base)"],
+            ["T2 VIO coverage",
+             (f"5-wall room @ {problem.vio.room_dist:g} cm" if getattr(problem, "_needs_vio", False) else "—"),
+             "flight image", "2 fisheye VIO",
+             (f"cells ≥ {[m.vio_min_lux for m in problem.modes if m.vio_min_lux][0]:g} lx"
+              if getattr(problem, "_needs_vio", False) else "off"),
+             (f"{[m.vio_weight for m in problem.modes if m.vio_min_lux][0]:g}"
+              if getattr(problem, "_needs_vio", False) else "—")],
+            ["T3 tilted view", f"5-wall rooms @ {dists} cm" if o.tilt_fov_deg else "—", img,
+             f"main, ±{o.tilt_fov_deg:g}°" if o.tilt_fov_deg else "—",
+             f"{o.metric.upper()} + coverage" if o.tilt_fov_deg else "off",
+             f"{o.tilt_fov_weight:g}" if o.tilt_fov_deg else "—"],
+        ],
+        [16, 30, 13, 15, 21, 8], size=7)
+    w.gap(0.006)
+    w.line("T1 — inspection image (primary).", weight="bold")
+    w.line(f"Monte-Carlo ray tracing on a {problem.wall.grid_size}² grid at each wall distance "
+           f"({problem.wall.rays_per_pixel} rays per cell shared by the active LEDs). Only the cells inside the "
+           "main-camera FOV trapezoid (white dashed outline on the images) are kept; cells with E = 0 are "
+           "ignored for the uniformity metric but counted for coverage. The score is the mean over distances.",
+           size=8.5, indent=0.03)
+    if getattr(problem, "_needs_vio", False):
+        v = problem.vio
+        w.line("T2 — VIO coverage.", weight="bold")
+        w.line(f"Monte-Carlo trace of the flight image on the five walls (front, left, right, top, bottom — no "
+               f"back wall) of a {2*v.room_dist/100:g} m room, {v.room_grid_size}² cells per wall, roughly the ray "
+               "budget of one T1 wall. The union of the two 170° fisheye footprints (cyan outline) selects the "
+               "cells; the metric is the share of those cells above the lux threshold, penalised through the "
+               "matching percentile so it keeps a gradient far from the target. The main camera plays no role.",
+               size=8.5, indent=0.03)
+    if o.tilt_fov_deg:
+        w.line("T3 — tilted inspection image (secondary).", weight="bold")
+        w.line(f"A 5-wall room is placed at each T1 distance ({dists} cm) so the pitched camera sees the front "
+               f"wall plus the ceiling or floor at the same working distance. The main camera is pitched "
+               f"+{o.tilt_fov_deg:g}° and −{o.tilt_fov_deg:g}° (orange / pink dotted outlines); the {img} is "
+               f"computed analytically — the exact expected value of the Monte-Carlo tracer, cos^n emission and "
+               f"1/d² with a shadow test against absorbers and the CAD mesh — on the {o.tilt_room_grid_size}² "
+               "cells inside those footprints only, so the term carries no ray noise and costs a fraction of a "
+               "trace. Each footprint gets the same metric + coverage term as T1; the penalty is the mean over "
+               f"distances and the two pitches, weighted {o.tilt_fov_weight:g}. Its U0 is inherently lower than "
+               "T1's (the footprint spans surfaces at very different distances), which is why the weight is small.",
+               size=8.5, indent=0.03)
+    w.gap(0.006)
+    w.line("Uniformity metrics over the lit cells of a footprint:", weight="bold")
     pct = f"P_{{{o.min_percentile:g}}}(E)" if o.min_percentile > 0 else r"\min(E)"
     w.math(rf"E_{{min}} = {pct},\quad E_{{avg}} = \overline{{E}},\quad E_{{max}} = \max(E)")
     w.math(r"U_0 = \frac{E_{min}}{E_{avg}},\qquad U_1 = \frac{E_{min}}{E_{max}},\qquad CV = \frac{\sigma_E}{E_{avg}}")
@@ -365,10 +432,20 @@ def _page_method(w: _Writer, problem):
     w.gap(0.006)
     w.line("Score (minimised):", weight="bold")
     f = {"u0": r"1 - U_0", "u1": r"1 - U_1", "cv": r"CV"}[o.metric]
-    w.math(rf"S(x) = \frac{{1}}{{N_d}}\sum_{{d}} \left[{f}\right]_d \;+\; "
-           rf"{o.coverage_weight:g}\,\left(1 - \min_d \mathrm{{cov}}_d\right) \;+\; \sum_k P_k(x)")
-    w.line("cov_d is the fraction of FOV cells receiving any light at distance d. Every constraint is a soft "
-           "penalty P_k ≥ 0 added to the score (no hard infeasibility), which keeps the landscape usable for "
+    w.math(rf"S(x) = T_1 + T_2 + T_3 + \sum_k P_k(x)")
+    w.math(rf"T_1 = \frac{{1}}{{N_d}}\sum_{{d}} \left[{f}\right]_d + "
+           rf"{o.coverage_weight:g}\,\left(1 - \min_d \mathrm{{cov}}_d\right)")
+    if getattr(problem, "_needs_vio", False):
+        w.math(r"T_2 = P_{vio}\quad\text{(see below)}")
+    else:
+        w.math(r"T_2 = 0\quad\text{(no VIO target)}")
+    if o.tilt_fov_deg:
+        w.math(rf"T_3 = {o.tilt_fov_weight:g}\cdot\frac{{1}}{{2N_d}}\sum_{{d}}\sum_{{\pm}}"
+               rf"\left(\left[{f}\right]_{{d,\pm}} + {o.coverage_weight:g}\,(1 - \mathrm{{cov}}_{{d,\pm}})\right)")
+    else:
+        w.math(r"T_3 = 0\quad\text{(tilt FOVs off)}")
+    w.line("cov is the fraction of footprint cells receiving any light. Every constraint is a soft penalty "
+           "P_k ≥ 0 added to the score (no hard infeasibility), which keeps the landscape usable for "
            "population-based global search.", size=8.5, color="#444", indent=0.03)
     w.gap(0.006)
     w.line("Active penalty terms:", weight="bold")
@@ -396,31 +473,28 @@ def _page_method(w: _Writer, problem):
         w.math(rf"P_{{sym}} = {c.symmetry_weight:g}\cdot\frac{{\#\{{i : \min_j \|p_i - M p_j\| > {c.symmetry_tol_cm:g}\}}}}{{N}},"
                r"\quad M = \mathrm{diag}(1,-1,1)")
     for m in problem.modes:
-        s = rf"I_{{{m.name}}} / \bar I" if m.current_a is not None else f"{m.lumens_scale:g}"
-        w.math(rf"\text{{mode {m.name}:}}\quad E^{{({m.name})}} = s\,E,\qquad s = {s}")
         if m.min_avg_lux:
             w.math(rf"P_{{{m.name},lux}} = {m.lux_weight:g}\,\max\!\left(0,\ \frac{{{m.min_avg_lux:g} - E^{{({m.name})}}_{{avg}}}}{{{m.min_avg_lux:g}}}\right)")
         if m.vio_min_lux:
-            w.math(rf"P_{{{m.name},vio}} = {m.vio_weight:g}\,\max\!\left(0,\ \frac{{{m.vio_min_lux:g} - E^{{({m.name})}}_{{P{100*(1-m.vio_min_fraction):g}}}}}{{{m.vio_min_lux:g}}}\right)")
+            w.math(rf"P_{{vio}} = {m.vio_weight:g}\,\max\!\left(0,\ \frac{{{m.vio_min_lux:g} - E^{{({m.name})}}_{{P{100*(1-m.vio_min_fraction):g}}}}}{{{m.vio_min_lux:g}}}\right)")
             w.line(f"E_P{100*(1-m.vio_min_fraction):g} is the {100*(1-m.vio_min_fraction):g}-th percentile of lux over the "
                    f"VIO-visible cells: requiring it to reach {m.vio_min_lux:g} lx is the same as requiring "
                    f"{m.vio_min_fraction*100:.0f} % of the VIO FOV above {m.vio_min_lux:g} lx, but the penalty keeps a "
                    "gradient when the target is still far away.", size=8, color="#444", indent=0.03)
-    if problem.modes:
-        w.line("Modes share the geometry and differ only by drive current; since luminous flux is linear in "
-               "current (Φ = I·V·η), the traced grid is rescaled per mode instead of re-traced. Ī is the mean "
-               "design current implied by the LED flux in the decoded configuration.", size=8.5, color="#444",
-               indent=0.03)
+    if has_flash:
+        w.line("The flash image is traced, not rescaled: 'vio', 'both' and 'flash' LEDs are traced as separate "
+               "groups (sharing the ray budget in proportion to their counts) and superposed with the pulse flux "
+               "Φ = I_flash·V·η applied to the flash / both group.", size=8.5, color="#444", indent=0.03)
     w.gap(0.004)
     w.line("Optimiser:", weight="bold")
     w.line("Differential evolution (scipy) evolves a population inside the bounds and keeps improvements; "
-           "integer variables (on/off, row/column counts) are rounded before decoding. Nelder–Mead / random "
+           "integer variables (row/column counts, roles) are rounded before decoding. Nelder–Mead / random "
            "search are local alternatives. The best design is exported after every improvement.", size=8)
-    w.line("Rays are random, so scores carry Monte-Carlo noise. Safeguards: a candidate beating the current "
-           "best is re-evaluated with fresh rays and the mean is kept (a lucky draw must be lucky twice); for "
-           f"this report the best distinct designs are re-evaluated with {VERIFY_RAY_FACTOR}× the rays and ranked "
-           "by that verified score. Dashed trend lines on the convergence page are centred moving averages over "
-           "~5 % of the run.", size=8)
+    w.line("Rays are random, so T1 and T2 carry Monte-Carlo noise (T3 is analytic). Safeguards: a candidate "
+           "beating the current best is re-evaluated with fresh rays and the mean is kept (a lucky draw must be "
+           f"lucky twice); for this report the best distinct designs are re-evaluated with {VERIFY_RAY_FACTOR}× "
+           "the rays and ranked by that verified score. Dashed trend lines on the convergence page are centred "
+           "moving averages over ~5 % of the run.", size=8)
 
 
 def _trend(y, frac=0.05, min_win=5):
@@ -506,46 +580,27 @@ def _fov_polygon(problem, wall_dist, pitch_offset=0.0, color="white", ls="--"):
 
 
 def _add_fov_outlines(ax, problem, wall_dist):
-    """Main-camera footprint plus the ±tilt footprints when they are scored on this wall."""
+    """Main-camera footprint (T1 is judged inside it)."""
     ax.add_patch(_fov_polygon(problem, wall_dist))
-    if getattr(problem, "_tilt_masks", None) is not None:
-        t = problem.objective.tilt_fov_deg
-        ax.add_patch(_fov_polygon(problem, wall_dist, +t, TILT_UP_COLOR, ":"))
-        ax.add_patch(_fov_polygon(problem, wall_dist, -t, TILT_DOWN_COLOR, ":"))
 
 
 def _fov_footer(problem, extra=""):
-    s = "Dashed white: main-camera FOV footprint (metrics are computed inside it). "
-    if getattr(problem, "_tilt_masks", None) is not None:
-        t = problem.objective.tilt_fov_deg
-        s += f"Dotted orange / pink: same camera tilted +{t:g}° / −{t:g}° (tilt uniformity). "
-    return s + extra
+    return "Dashed white: main-camera FOV footprint (T1 metrics are computed inside it). " + extra
 
 
 def _page_heatmaps(pdf, problem, designs):
     labels = list(designs.keys())
     n_rows = len(labels)
     cols = [(f"wall {wl.wall_dist:g} cm", wl.wall_size, i) for i, wl in enumerate(problem.walls)]
-    # A flat VIO wall is shown as an extra column; a VIO room gets its own unfolded page.
-    has_vio = any(isinstance(designs[l][1].vio_grid, np.ndarray) for l in labels)
-    if has_vio:
-        cols.append((f"VIO wall {problem.vio.wall_dist:g} cm", problem.vio.wall_size, "vio"))
     n_cols = len(cols)
     fig = Figure(figsize=A4, dpi=110)
-    fig.suptitle("Wall illuminance — initial vs. best designs" + (" (flight mode)" if problem.flash_modes else ""),
+    fig.suptitle("T1 — wall illuminance, main camera" + (" (flash image)" if problem.flash_modes else ""),
                  fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
     axs = np.atleast_2d(fig.subplots(n_rows, n_cols, squeeze=False))
     fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.10, hspace=0.35, wspace=0.35)
 
     for j, (title, wall_size, key) in enumerate(cols):
-        grids = []
-        for l in labels:
-            ev = designs[l][1]
-            if key == "vio":
-                g = ev.vio_grid if isinstance(ev.vio_grid, np.ndarray) else None
-            else:
-                g = _as_grid_list(ev)[key] if _as_grid_list(ev) else None
-            grids.append(g)
+        grids = [(_as_grid_list(designs[l][1])[key] if _as_grid_list(designs[l][1]) else None) for l in labels]
         vmax = max([float(np.nanmax(g)) for g in grids if g is not None] + [1e-9])
         half = wall_size / 2
         im = None
@@ -556,23 +611,16 @@ def _page_heatmaps(pdf, problem, designs):
                 ax.axis("off"); continue
             im = ax.imshow(g, origin="lower", extent=[-half, half, -half, half], cmap="inferno", vmin=0, vmax=vmax,
                            aspect="equal")
-            if key != "vio":
-                _add_fov_outlines(ax, problem, problem.walls[key].wall_dist)
-                fov = g[problem._fov_masks[key]]
-                lit = fov[fov > 0]
-                if lit.size:
-                    pct = problem.objective.min_percentile
-                    e_min = np.percentile(lit, pct) if pct > 0 else lit.min()
-                    sub = (f"U0 {e_min/lit.mean()*100:.0f} % (P{pct:g})  ·  hard-min {lit.min()/lit.mean()*100:.0f} %"
-                           f"  ·  {lit.mean():,.0f} lx")
-                else:
-                    sub = "unlit"
+            _add_fov_outlines(ax, problem, problem.walls[key].wall_dist)
+            fov = g[problem._fov_masks[key]]
+            lit = fov[fov > 0]
+            if lit.size:
+                pct = problem.objective.min_percentile
+                e_min = np.percentile(lit, pct) if pct > 0 else lit.min()
+                sub = (f"U0 {e_min/lit.mean()*100:.0f} % (P{pct:g})  ·  hard-min {lit.min()/lit.mean()*100:.0f} %"
+                       f"  ·  {lit.mean():,.0f} lx")
             else:
-                mask = problem._vio_mask
-                sub = f"{np.count_nonzero(mask)} VIO cells"
-                if mask.size and not mask.all():
-                    ax.contour(np.linspace(-half, half, g.shape[1]), np.linspace(-half, half, g.shape[0]),
-                               mask.astype(float), levels=[0.5], colors=VIO_COLOR, linewidths=0.8)
+                sub = "unlit"
             ax.invert_xaxis()  # +Y is to the viewer's left when facing the wall
             ax.set_title((title + "\n" if i == 0 else "") + sub, fontsize=7)
             ax.tick_params(labelsize=6)
@@ -584,30 +632,28 @@ def _page_heatmaps(pdf, problem, designs):
             cb = fig.colorbar(im, ax=axs[:, j].tolist(), orientation="horizontal", fraction=0.025, pad=0.06)
             cb.ax.tick_params(labelsize=6); cb.set_label("lux", fontsize=7)
     fig.text(MARGIN, 0.02, textwrap.fill(_fov_footer(
-        problem, ("Cyan: VIO camera footprint. " if has_vio else "") + "Colour scale is shared per column. "
+        problem, "Colour scale is shared per column. "
         f"Images use {VERIFY_RAY_FACTOR}× the run's rays per pixel."), 150), fontsize=7.5, color="#444", va="bottom")
     pdf.savefig(fig)
 
 
-def _unfolded_room(problem):
-    """Place the five VIO-room walls around the front wall (cube net, seen from inside).
+def _unfolded_room(settings, specs):
+    """Place the five room walls around the front wall (cube net, seen from inside).
 
-    Returns ``{wall: (transform, extent, H, V, valid)}``: ``transform`` reorients a wall grid
-    for ``imshow`` with ``extent`` (net coordinates, cm), ``H``/``V`` are the cell-centre net
-    coordinates in the grid's own indexing, ``valid`` masks cells behind the back wall.
+    Returns ``{wall: (transform, extent, H, V)}``: ``transform`` reorients a wall grid for
+    ``imshow`` with ``extent`` (net coordinates, cm), ``H``/``V`` are the cell-centre net
+    coordinates in the grid's own indexing.
     """
     from lighting_simulator.simulation.room_geometry import room_wall_cell_centers
-    s = problem.vio.room_settings()
-    specs = problem.vio.room_wall_specs()
+    s = settings
     hy, hz = specs['front']['size_y'] / 2, specs['front']['size_z'] / 2
     fd = s.front_dist
     out = {}
     for name, spec in specs.items():
         if name == 'back':
             continue
-        pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
+        pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist)
         x, y, z = pts[..., 0], pts[..., 1], pts[..., 2]
-        valid = x >= -s.back_dist - 1e-6
         depth = spec.get('size_x', 0.0)
         if name == 'front':      # grid [Z, Y]
             tf, H, V, ext = (lambda g: g), y, z, [-hy, hy, -hz, hz]
@@ -619,55 +665,21 @@ def _unfolded_room(problem):
             tf, H, V, ext = (lambda g: g), -(hy + (fd - x)), z, [-hy - depth, -hy, -hz, hz]
         else:                    # right, y = +side_dist
             tf, H, V, ext = (lambda g: g[:, ::-1]), hy + (fd - x), z, [hy, hy + depth, -hz, hz]
-        out[name] = (tf, ext, H, V, valid)
+        out[name] = (tf, ext, H, V)
     return out
 
 
-def _page_vio_room(pdf, problem, designs):
-    """Unfolded VIO room (flight mode) with the VIO footprints and the main / tilted camera FOVs."""
-    labels = [l for l in designs if isinstance(designs[l][1].vio_grid, dict)]
-    if not labels or not (getattr(problem, "_vio_room", False) or getattr(problem, "_tilt_room", False)):
-        return
-    from lighting_simulator.camera.fov import points_in_pinhole_fov
-    from lighting_simulator.simulation.room_geometry import room_wall_cell_centers
-    net = _unfolded_room(problem)
-    s = problem.vio.room_settings()
-    specs = problem.vio.room_wall_specs()
-    cam = problem.camera
-    cam_pos = np.array([cam.pos_x, cam.pos_y, 0.0])
-    t = problem.objective.tilt_fov_deg
-    outlines = []  # (label, colour, ls, {wall: mask})
-    main = {}
-    for name, spec in specs.items():
-        if name in net:
-            pts = room_wall_cell_centers(name, spec, s.front_dist, s.side_dist, s.top_bottom_dist, s.back_dist)
-            main[name] = points_in_pinhole_fov(cam_pos, cam.pitch, cam.fov_h, cam.fov_v, pts)
-    outlines.append(("main camera FOV", "white", "--", main))
-    if getattr(problem, "_tilt_room_masks", None):
-        outlines.append((f"camera tilted +{t:g}° (tilt uniformity)", TILT_UP_COLOR, ":", problem._tilt_room_masks['up']))
-        outlines.append((f"camera tilted −{t:g}°", TILT_DOWN_COLOR, ":", problem._tilt_room_masks['down']))
-    if getattr(problem, "_vio_room", False):
-        outlines.append(("VIO fisheyes footprint (coverage metric)", VIO_COLOR, "-", problem._vio_masks))
-    flight_modes = [m for m in problem.modes if not m.is_flash]
-    flight = flight_modes[0] if flight_modes else None
-
-    fig = Figure(figsize=A4, dpi=110)
-    fig.suptitle(f"VIO room — unfolded walls, flight mode ({2 * problem.vio.room_dist / 100:g} m cube)",
-                 fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
-    axs = fig.subplots(2, 2).ravel()
-    fig.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.12, hspace=0.3, wspace=0.25)
-    grids = {l: designs[l][1].vio_grid for l in labels}
-    vmax = max([float(np.nanmax(np.where(net[n][4], g[n], np.nan)))
-                for g in grids.values() for n in net if n in g] + [1e-9])
+def _draw_room_net(fig, axs, labels, grids, net, outlines, subtitles, cbar_label):
+    """Unfolded-room images for up to four designs; ``grids[label] = {wall: grid}``."""
+    vmax = max([float(np.nanmax(g[n])) for g in grids.values() for n in net if n in g] + [1e-9])
     im = None
     for ax, l in zip(axs, labels):
-        ev = designs[l][1]
-        for name, (tf, ext, H, V, valid) in net.items():
+        for name, (tf, ext, H, V) in net.items():
             g = grids[l].get(name)
             if g is None:
                 continue
-            im = ax.imshow(tf(np.where(valid, g, np.nan)), origin="lower", extent=ext, cmap="inferno", vmin=0,
-                           vmax=vmax, aspect="equal", interpolation="nearest")
+            im = ax.imshow(tf(g), origin="lower", extent=ext, cmap="inferno", vmin=0, vmax=vmax, aspect="equal",
+                           interpolation="nearest")
             ax.add_patch(Polygon([(ext[0], ext[2]), (ext[1], ext[2]), (ext[1], ext[3]), (ext[0], ext[3])],
                                  closed=True, fill=False, edgecolor="#888", lw=0.5))
             ax.text((ext[0] + ext[1]) / 2, (ext[2] + ext[3]) / 2, name, ha="center", va="center", fontsize=6,
@@ -679,35 +691,107 @@ def _page_vio_room(pdf, problem, designs):
         span = max(abs(v) for e in (e for _, e, *_ in net.values()) for v in e)
         ax.set_xlim(-span, span); ax.set_ylim(-span, span); ax.invert_xaxis()
         ax.set_facecolor("#f2f2f2")
-        sub = []
-        if flight is not None and flight.name in ev.modes and flight.vio_min_lux:
-            sub.append(f"VIO {ev.modes[flight.name].get('vio_fraction', 0) * 100:.0f} % of cells ≥ {flight.vio_min_lux:g} lx")
-        if ev.tilt:
-            sub.append(f"tilt U0 ↑{ev.tilt.get('up', 0):.0f} % ↓{ev.tilt.get('down', 0):.0f} %")
-        ax.set_title(f"{l}" + ("\n" + "  ·  ".join(sub) if sub else ""), fontsize=8, weight="bold")
+        ax.set_title(f"{l}" + ("\n" + subtitles[l] if subtitles.get(l) else ""), fontsize=8, weight="bold")
         ax.tick_params(labelsize=6)
         ax.set_xlabel("Y (cm, unfolded)", fontsize=7); ax.set_ylabel("Z (cm, unfolded)", fontsize=7)
     for ax in axs[len(labels):]:
         ax.axis("off")
     if im is not None:
         cb = fig.colorbar(im, ax=axs.tolist(), orientation="horizontal", fraction=0.02, pad=0.06)
-        cb.ax.tick_params(labelsize=6); cb.set_label("lux (flight mode)", fontsize=7)
+        cb.ax.tick_params(labelsize=6); cb.set_label(cbar_label, fontsize=7)
     from matplotlib.lines import Line2D
     handles = [Line2D([], [], color=c if c != "white" else "#555", ls=ls, lw=1.2, label=lbl) for lbl, c, ls, _ in outlines]
     (axs[len(labels)] if len(labels) < len(axs) else fig).legend(
         handles=handles, fontsize=7, loc="center" if len(labels) < len(axs) else "lower right", frameon=False)
+
+
+def _room_main_fov_masks(problem, settings, specs, pitch_offset=0.0):
+    from lighting_simulator.camera.fov import points_in_pinhole_fov
+    from lighting_simulator.simulation.room_geometry import room_wall_cell_centers
+    cam = problem.camera
+    cam_pos = np.array([cam.pos_x, cam.pos_y, 0.0])
+    return {name: points_in_pinhole_fov(cam_pos, cam.pitch + pitch_offset, cam.fov_h, cam.fov_v,
+                                        room_wall_cell_centers(name, spec, settings.front_dist, settings.side_dist,
+                                                               settings.top_bottom_dist))
+            for name, spec in specs.items()}
+
+
+def _page_vio_room(pdf, problem, designs):
+    """T2: unfolded VIO room (flight image) with the fisheye footprints."""
+    labels = [l for l in designs if isinstance(designs[l][1].vio_grid, dict)]
+    if not labels or not getattr(problem, "_needs_vio", False):
+        return
+    s = problem.vio.room_settings()
+    specs = problem.vio.room_wall_specs()
+    net = _unfolded_room(s, specs)
+    outlines = [("main camera FOV (not judged here)", "white", "--", _room_main_fov_masks(problem, s, specs)),
+                ("VIO fisheyes footprint (T2 metric)", VIO_COLOR, "-", problem._vio_masks)]
+    flight_modes = [m for m in problem.modes if not m.is_flash and m.vio_min_lux]
+    flight = flight_modes[0] if flight_modes else None
+    fig = Figure(figsize=A4, dpi=110)
+    fig.suptitle(f"T2 — VIO room, flight image ({2 * problem.vio.room_dist / 100:g} m cube, unfolded)",
+                 fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
+    axs = fig.subplots(2, 2).ravel()
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.12, hspace=0.3, wspace=0.25)
+    subtitles = {}
+    for l in labels:
+        ev = designs[l][1]
+        if flight is not None and flight.name in ev.modes:
+            frac = ev.modes[flight.name].get('vio_fraction') or 0.0
+            subtitles[l] = (f"{frac * 100:.0f} % of VIO cells ≥ {flight.vio_min_lux:g} lx "
+                            f"(target {flight.vio_min_fraction * 100:.0f} %)")
+    _draw_room_net(fig, axs, labels, {l: designs[l][1].vio_grid for l in labels}, net, outlines, subtitles,
+                   "lux (flight image)")
     fig.text(MARGIN, 0.02, textwrap.fill(
-        "Cube net seen from inside the room: side / top / bottom walls fold out around the front wall; the back "
-        "wall is omitted and cells behind it are blanked. +Y is to the viewer's left. "
-        "Wall grids are coarse (VIO room resolution), so footprints look blocky.", 150),
+        "Cube net seen from inside the room: side / top / bottom walls fold out around the front wall (no back "
+        "wall). +Y is to the viewer's left. Monte-Carlo trace of the VIO + Both LEDs at continuous current; only "
+        "the cells inside the cyan fisheye footprints count. Grids are coarse on purpose.", 150),
         fontsize=7.5, color="#444", va="bottom")
     pdf.savefig(fig)
 
 
+def _page_tilt_rooms(pdf, problem, designs):
+    """T3: one unfolded room per wall distance, main camera pitched ±t (analytic image)."""
+    labels = [l for l in designs if designs[l][1].tilt_grids]
+    rooms = getattr(problem, "_tilt_rooms", None)
+    if not labels or not rooms:
+        return
+    t = problem.objective.tilt_fov_deg
+    img = "flash image" if problem.flash_modes else "flight image"
+    for ri, room in enumerate(rooms):
+        net = _unfolded_room(room.settings, room.specs)
+        outlines = [("main camera untilted (T1, not judged here)", "white", "--",
+                     _room_main_fov_masks(problem, room.settings, room.specs)),
+                    (f"camera pitched +{t:g}° (T3 up)", TILT_UP_COLOR, ":", room.wall_masks('up')),
+                    (f"camera pitched −{t:g}° (T3 down)", TILT_DOWN_COLOR, ":", room.wall_masks('down'))]
+        fig = Figure(figsize=A4, dpi=110)
+        fig.suptitle(f"T3 — room at {room.dist:g} cm, main camera ±{t:g}° ({img}, analytic)",
+                     fontsize=15, weight="bold", x=MARGIN, ha="left", y=0.965)
+        axs = fig.subplots(2, 2).ravel()
+        fig.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.12, hspace=0.3, wspace=0.25)
+        subtitles = {}
+        grids = {}
+        for l in labels:
+            ev = designs[l][1]
+            grids[l] = ev.tilt_grids[ri] if ri < len(ev.tilt_grids) else {}
+            if ri < len(ev.tilt_walls):
+                tw = ev.tilt_walls[ri]
+                subtitles[l] = (f"U0 ↑{tw['up']:.0f} % (cov {tw['cov_up'] * 100:.0f} %)  ·  "
+                                f"↓{tw['down']:.0f} % (cov {tw['cov_down'] * 100:.0f} %)")
+        _draw_room_net(fig, axs, labels, grids, net, outlines, subtitles, f"lux ({img})")
+        fig.text(MARGIN, 0.02, textwrap.fill(
+            f"Cube net seen from inside a 5-wall room {room.dist:g} cm from the rig (same distance as the T1 wall). "
+            "Direct illuminance computed analytically on every cell for this picture; during optimisation only "
+            "the cells inside the dotted footprints are evaluated. The pitched footprints span the front wall "
+            "and the ceiling / floor, so their U0 is naturally lower than T1's.", 150),
+            fontsize=7.5, color="#444", va="bottom")
+        pdf.savefig(fig)
+
+
 def _page_flash_heatmaps(pdf, problem, designs):
-    """One page per wall: flight (continuous LEDs) next to flash (pulse) illuminance for every design."""
+    """One page per wall: flight (continuous LEDs, reported only) next to the judged flash image."""
     labels = list(designs.keys())
-    if not problem.flash_modes or not any(designs[l][1].flash_grid is not None for l in labels):
+    if not problem.flash_modes or not any(designs[l][1].flight_grid is not None for l in labels):
         return
     flash_mode = problem.flash_modes[0]
     pct = problem.objective.min_percentile
@@ -725,8 +809,8 @@ def _page_flash_heatmaps(pdf, problem, designs):
         axs = np.atleast_2d(fig.subplots(len(labels), 2, squeeze=False))
         fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.10, hspace=0.35, wspace=0.3)
         half = wl.wall_size / 2
-        cols = [("flight — VIO + Both LEDs, continuous current", "grid"),
-                (f"flash — Flash + Both LEDs at {flash_mode.current_a:g} A (+ VIO continuous)", "flash_grid")]
+        cols = [("flight — VIO + Both LEDs, continuous current (not judged)", "flight_grid"),
+                (f"flash — Flash + Both LEDs at {flash_mode.current_a:g} A (+ VIO continuous) — T1", "grid")]
         for j, (title, attr) in enumerate(cols):
             grids = [_grid(designs[l][1], attr, wi) for l in labels]
             vmax = max([float(np.nanmax(g)) for g in grids if g is not None] + [1e-9])
@@ -747,7 +831,7 @@ def _page_flash_heatmaps(pdf, problem, designs):
                 else:
                     sub = "unlit"
                 el = designs[l][1].electrical
-                n = (el.get('n_vio', 0) + el.get('n_both', 0)) if attr == "grid" else (el.get('n_flash', 0) + el.get('n_both', 0))
+                n = (el.get('n_vio', 0) + el.get('n_both', 0)) if attr == "flight_grid" else (el.get('n_flash', 0) + el.get('n_both', 0))
                 ax.invert_xaxis()
                 ax.set_title((title + "\n" if i == 0 else "") + f"{sub}  ·  {n} LEDs lit", fontsize=7)
                 ax.tick_params(labelsize=6)
@@ -953,8 +1037,9 @@ def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=F
         w.close()
         _page_convergence(pdf, problem, records, designs)
         _page_heatmaps(pdf, problem, designs)
-        _page_vio_room(pdf, problem, designs)
         _page_flash_heatmaps(pdf, problem, designs)
+        _page_vio_room(pdf, problem, designs)
+        _page_tilt_rooms(pdf, problem, designs)
         _page_layouts(pdf, problem, designs)
         _page_variable_bounds(pdf, problem, designs)
         _page_variable_history(pdf, problem, records, designs)

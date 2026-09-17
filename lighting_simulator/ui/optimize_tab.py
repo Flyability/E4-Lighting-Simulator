@@ -97,11 +97,6 @@ def build(ctx):
     _MODE_REFINE = "1 · Refine the current panels"
     _MODE_DUCTS = "2 · Design LEDs on the ducts (from scratch)"
     _MODE_PRESET = "3 · Run a preset spec file"
-    _VIO_GEOM_ROOM = "Room (6 walls around the rig)"
-    _VIO_GEOM_WALL = "Single far wall"
-    _OBJ_BOTH = "Flight + flash (weighted)"
-    _OBJ_FLIGHT = "Flight image only"
-    _OBJ_FLASH = "Flash image only"
 
     with tab_optim:
         server.gui.add_html(
@@ -444,45 +439,29 @@ def build(ctx):
         optim_flash_enable = server.gui.add_checkbox(
             "Enable flash mode", initial_value=False,
             hint="Off: every LED is continuous and roles are ignored (single operating point). "
-                 "On: LED roles decide which LEDs pulse; the flash image is scored too.",
-        )
-        optim_objective_mode = server.gui.add_dropdown(
-            "Optimise for", options=[_OBJ_BOTH, _OBJ_FLIGHT, _OBJ_FLASH], initial_value=_OBJ_BOTH,
-            hint="Which operating point's uniformity drives the score (constraints always apply to both)",
+                 "On: LED roles decide which LEDs pulse, and T1 / T3 judge the FLASH image (the main camera only "
+                 "records during the pulse); the flight image is still traced for T2 and the report.",
         )
         optim_flash_current = flash_current_input  # shared with the Display tab
-        optim_flash_uni_w = server.gui.add_slider("Flash uniformity weight", min=0.0, max=5.0, step=0.1,
-                                                  initial_value=1.0)
         optim_flash_lux = server.gui.add_number("Flash avg lux in FOV (0 = off)", 41000, min=0, step=1000)
         optim_flash_dist = server.gui.add_number("… at wall distance (cm)", 50, min=10, max=1500, step=5,
                                                  hint="Must be one of the wall distances above (nearest is used)")
-        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>VIO coverage (flight mode)</div>")
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;'>T2 · VIO coverage (flight image, room)</div>")
         optim_vio_enable = server.gui.add_checkbox("Require VIO FOV coverage", initial_value=False,
-                                                   hint="Uses the VIO camera poses from the FOV tab")
+                                                   hint="Uses the VIO camera poses from the FOV tab. Flight image only: "
+                                                        "the VIO cameras never see the flash.")
         optim_vio_lux = server.gui.add_number("Min lux on VIO surfaces", 120, min=0, step=10)
         optim_vio_fraction = server.gui.add_slider("Min share of VIO FOV lit (%)", min=0, max=100, step=5,
                                                    initial_value=50)
-        optim_vio_geometry = server.gui.add_dropdown(
-            "Evaluate VIO on", options=[_VIO_GEOM_ROOM, _VIO_GEOM_WALL], initial_value=_VIO_GEOM_ROOM,
-            hint="Room: six walls around the rig (what the fisheyes really see). Wall: a single far plane.")
         optim_vio_room_dist = server.gui.add_number("Room wall distance (cm)", 300, min=50, max=2000, step=10,
-                                                    hint="Opposite walls are twice this apart (300 → 6 m room)")
+                                                    hint="Five walls (front, sides, top, bottom — no back wall) this far "
+                                                         "from the rig; opposite walls are twice this apart")
         optim_vio_room_grid = server.gui.add_number("Room grid per wall", 20, min=5, max=80, step=5,
                                                     hint="Coarse on purpose: 20 → 30 cm cells in a 6 m room")
-        optim_vio_dist = server.gui.add_number("VIO wall distance (cm)", 300, min=50, max=2000, step=10)
-        optim_vio_wall_size = server.gui.add_number("VIO wall size (cm)", 1200, min=100, max=5000, step=50)
-        optim_vio_grid = server.gui.add_number("VIO wall grid resolution", 40, min=5, max=200, step=5)
-
-    def _optim_vio_geometry_changed(_=None):
-        room = optim_vio_geometry.value == _VIO_GEOM_ROOM
-        for h in (optim_vio_room_dist, optim_vio_room_grid):
-            h.visible = room
-        for h in (optim_vio_dist, optim_vio_wall_size, optim_vio_grid):
-            h.visible = not room
 
     def _optim_flash_changed(_=None):
         on = bool(optim_flash_enable.value)
-        for h in (optim_objective_mode, optim_flash_uni_w, optim_flash_lux, optim_flash_dist,
+        for h in (optim_flash_lux, optim_flash_dist,
                   optim_cont_max_current, optim_cont_leds_per_driver, optim_max_cont_drivers, optim_cont_driver_cost,
                   optim_max_pulse_drivers, optim_pulse_driver_cost, optim_max_peak_current, optim_var_roles, duct_roles):
             h.visible = on
@@ -496,12 +475,12 @@ def build(ctx):
     duct_var_counts.on_update(_duct_var_counts_changed)
     _duct_var_counts_changed()
 
-    optim_vio_geometry.on_update(_optim_vio_geometry_changed)
-    _optim_vio_geometry_changed()
-
     with tab_optim:
         _optim_obj_folder = server.gui.add_folder("Objective & constraints", order=50)
     with _optim_obj_folder:
+        server.gui.add_html("<div style='font-weight:600;'>T1 · Inspection image (wall, main camera)</div>"
+                            "<div style='color:#888;font-size:11px;'>Base score. Judges the flash image when flash "
+                            "mode is on, the continuous image otherwise.</div>")
         optim_metric = server.gui.add_dropdown(
             "Metric", options=["u0", "u1", "cv"], initial_value="u0",
             hint="u0 = Emin/Eavg (Emin at the percentile below), u1 = Emin/Emax, cv = σ/Eavg (uses all cells; "
@@ -509,16 +488,23 @@ def build(ctx):
         )
         optim_min_pct = server.gui.add_slider("Emin percentile (%)", min=0.0, max=10.0, step=0.5, initial_value=2.0,
                                               hint="0 = single darkest cell (very noisy on fine grids); 2–5 recommended")
-        optim_cov_w = server.gui.add_slider("Coverage penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
-        optim_min_lux = server.gui.add_number("Min average lux, normal mode (0 = off)", 0, min=0, step=10)
+        optim_cov_w = server.gui.add_slider("Coverage penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0,
+                                            hint="Share of FOV cells left dark (T1 and T3)")
+        optim_min_lux = server.gui.add_number("Min average lux in FOV (0 = off)", 0, min=0, step=10)
         optim_lux_w = server.gui.add_slider("Lux penalty weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>T3 · Tilted inspection image (rooms, main camera ±tilt)</div>")
         optim_tilt_enable = server.gui.add_checkbox(
-            "Add ±tilt FOV uniformity", initial_value=False,
-            hint="Also score the camera pitched up and down by the FOV tab's 'Tilt FOV angle' (mean 1−U of both, "
-                 "penalty 'tilt_uniformity'). With VIO geometry = Room the tilted footprints are measured on the "
-                 "room ceiling / floor / walls; otherwise on the (enlarged) flat wall.",
+            "Add ±tilt FOV test case", initial_value=False,
+            hint="A 5-wall room is placed at every wall distance and the main camera is pitched up / down by the FOV "
+                 "tab's 'Tilt FOV angle' (same image as T1). Uniformity + coverage of the cells inside each tilted "
+                 "footprint, computed analytically (no ray noise). Penalty 'tilt_uniformity'.",
         )
-        optim_tilt_w = server.gui.add_slider("Tilt uniformity weight", min=0.0, max=5.0, step=0.1, initial_value=1.0)
+        optim_tilt_w = server.gui.add_slider("T3 weight", min=0.0, max=2.0, step=0.05, initial_value=0.3,
+                                             hint="Keep well below 1: a 45° footprint spans wall + ceiling and can never "
+                                                  "be as uniform as the straight view")
+        optim_tilt_grid = server.gui.add_number("T3 room grid per wall", 32, min=8, max=128, step=4,
+                                                hint="Independent of the T2 room grid; only the footprint cells are computed")
+        server.gui.add_html("<div style='font-weight:600;margin-top:6px;'>Hardware</div>")
         optim_max_leds = server.gui.add_number("Max active LEDs (0 = no limit)", 0, min=0, step=1)
         optim_max_leds_w = server.gui.add_slider("Penalty per LED over limit", min=0.0, max=1.0, step=0.01,
                                                  initial_value=0.05)
@@ -640,7 +626,8 @@ def build(ctx):
         optim_tilt_enable.value = bool(obj.get('tilt_fov_deg'))
         if obj.get('tilt_fov_deg'):
             tilt_fov_deg.value = int(round(float(obj['tilt_fov_deg']) / 5) * 5)
-        optim_tilt_w.value = float(obj.get('tilt_fov_weight', 1.0))
+        optim_tilt_w.value = float(obj.get('tilt_fov_weight', 0.3))
+        optim_tilt_grid.value = int(obj.get('tilt_room_grid_size', 32))
         con = spec.get('constraints', {})
         optim_max_leds.value = int(con.get('max_leds') or 0)
         optim_max_leds_w.value = float(con.get('max_leds_weight', 0.05))
@@ -666,14 +653,9 @@ def build(ctx):
         cdrv = spec.get('cont_driver') or {}
         optim_cont_max_current.value = float(cdrv.get('max_current_a', 3.0))
         optim_cont_leds_per_driver.value = int(cdrv.get('leds_per_driver', 8))
-        optim_objective_mode.value = (_OBJ_FLASH if float(obj.get('flight_weight', 1.0)) == 0.0 else _OBJ_BOTH)
         vio = spec.get('vio') or {}
-        optim_vio_geometry.value = _VIO_GEOM_ROOM if vio.get('geometry') == 'room' else _VIO_GEOM_WALL
         optim_vio_room_dist.value = int(vio.get('room_dist', 300))
         optim_vio_room_grid.value = int(vio.get('room_grid_size', 20))
-        optim_vio_dist.value = int(vio.get('wall_dist', 300))
-        optim_vio_wall_size.value = int(vio.get('wall_size', 1200))
-        optim_vio_grid.value = int(vio.get('grid_size', 40))
         optim_flash_enable.value = False
         optim_vio_enable.value = False
         for m in spec.get('modes', []):
@@ -683,9 +665,6 @@ def build(ctx):
                 optim_flash_current.value = float(m.get('current_a') or optim_flash_current.value)
                 optim_flash_lux.value = int(m.get('min_avg_lux') or 0)
                 optim_flash_dist.value = int(m.get('min_avg_lux_dist') or optim_flash_dist.value)
-                optim_flash_uni_w.value = float(m.get('uniformity_weight', 0.0))
-                if float(obj.get('flight_weight', 1.0)) > 0 and not m.get('uniformity_weight'):
-                    optim_objective_mode.value = _OBJ_FLIGHT
             if m.get('vio_min_lux'):
                 optim_vio_enable.value = True
                 optim_vio_lux.value = int(m['vio_min_lux'])
@@ -892,12 +871,12 @@ def build(ctx):
         work['objective'] = {
             'metric': optim_metric.value,
             'min_percentile': float(optim_min_pct.value),
-            'flight_weight': 0.0 if (optim_flash_enable.value and optim_objective_mode.value == _OBJ_FLASH) else 1.0,
             'coverage_weight': float(optim_cov_w.value),
             'min_avg_lux': float(optim_min_lux.value) or None,
             'lux_weight': float(optim_lux_w.value),
             'tilt_fov_deg': float(tilt_fov_deg.value) if optim_tilt_enable.value else None,
             'tilt_fov_weight': float(optim_tilt_w.value),
+            'tilt_room_grid_size': int(optim_tilt_grid.value),
         }
         work['constraints'] = {
             'max_leds': int(optim_max_leds.value) or None,
@@ -939,20 +918,14 @@ def build(ctx):
                 'cam1_pitch': float(vio_cam1_pitch.value), 'cam1_yaw': float(vio_cam1_yaw.value),
                 'cam2_pitch': float(vio_cam2_pitch.value), 'cam2_yaw': float(vio_cam2_yaw.value),
                 'long_fov': float(vio_long_fov.value), 'landscape': bool(vio_landscape.value),
-                'geometry': 'room' if optim_vio_geometry.value == _VIO_GEOM_ROOM else 'wall',
                 'room_dist': float(optim_vio_room_dist.value), 'room_grid_size': int(optim_vio_room_grid.value),
-                'wall_dist': float(optim_vio_dist.value), 'wall_size': float(optim_vio_wall_size.value),
-                'grid_size': int(optim_vio_grid.value),
             }
         else:
             work.pop('vio', None)
         if optim_flash_enable.value:
-            flash_only = optim_objective_mode.value == _OBJ_FLASH
-            flight_only = optim_objective_mode.value == _OBJ_FLIGHT
             modes.append({'name': 'flash', 'current_a': float(optim_flash_current.value),
                           'min_avg_lux': float(optim_flash_lux.value) or None,
-                          'min_avg_lux_dist': float(optim_flash_dist.value),
-                          'uniformity_weight': 0.0 if flight_only else (1.0 if flash_only else float(optim_flash_uni_w.value))})
+                          'min_avg_lux_dist': float(optim_flash_dist.value)})
         work['modes'] = modes if (optim_vio_enable.value or optim_flash_enable.value) else []
 
     def _optim_build():

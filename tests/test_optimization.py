@@ -176,11 +176,13 @@ def test_wall_size_per_distance_and_auto_fit():
 def test_requirements_spec_modes_drivers_and_report(tmp_path):
     spec, spec_dir = load_spec("optimization_specs/elios4_ducts_flash_vio.json")
     spec['wall'].update({"grid_size": 10, "rays_per_pixel": 1})
-    spec['vio'].update({"grid_size": 8})
+    spec['vio'].update({"room_grid_size": 8, "geometry": "room"})  # obsolete key must be ignored
+    spec['objective'].update({"tilt_room_grid_size": 12})
     problem = problem_from_spec(spec, spec_dir)
     names = problem.names
     assert names[:2] == ["front_duct.n_rows", "front_duct.n_cols"] and problem.integrality[:2].all()
     assert "front_duct.radial" in names and names[-1] == "front_duct.current_a"
+    assert len(problem._tilt_rooms) == 3 and set(problem._vio_masks) == {'front', 'left', 'right', 'top', 'bottom'}
 
     x = problem.x0.copy()
     x[0], x[1] = 2, 3  # 2 rows x 3 cols, mirrored -> 12 LEDs
@@ -192,17 +194,24 @@ def test_requirements_spec_modes_drivers_and_report(tmp_path):
     assert g['lumens_value'] == pytest.approx(g['drive_current_a'] * 6.0 * 180.0)
     assert ev.total_current_a == pytest.approx(12 * g['drive_current_a'])
     assert set(ev.modes) == {"normal", "flash"}
-    # All LEDs default to role 'both': the flash image is the flight image at 13 A instead of I_design
+    # T1 judges the flash image: all LEDs are 'both', so it is the flight image at 13 A instead of I_design
     scale = 13.0 / g['drive_current_a']
     evg = problem.evaluate(x, keep_grid=True)
     grids = evg.grid if isinstance(evg.grid, list) else [evg.grid]
-    fgrids = evg.flash_grid if isinstance(evg.flash_grid, list) else [evg.flash_grid]
-    for gf, gg in zip(fgrids, grids):
-        assert float(gf.sum()) == pytest.approx(float(gg.sum()) * scale, rel=0.1)
+    fgrids = evg.flight_grid if isinstance(evg.flight_grid, list) else [evg.flight_grid]
+    for gflash, gflight in zip(grids, fgrids):
+        assert float(gflash.sum()) == pytest.approx(float(gflight.sum()) * scale, rel=0.1)
+    assert ev.modes['flash']['uniformity_pct'] == pytest.approx(ev.uniformity_pct)
     assert ev.modes['flash']['n_leds'] == ev.modes['normal']['n_leds'] == 12
     assert ev.electrical['n_pulse_drivers'] == 3 and ev.electrical['n_cont_drivers'] == 0
     assert ev.electrical['peak_current_a'] == pytest.approx(12 * 13.0)
     assert 0.0 <= ev.modes['normal']['vio_fraction'] <= 1.0
+    # T2 room grids (MC) and T3 room grids (analytic, one per wall distance)
+    assert set(evg.vio_grid) == {'front', 'left', 'right', 'top', 'bottom'}
+    assert len(evg.tilt_grids) == 3 and all(gr['front'].shape == (12, 12) for gr in evg.tilt_grids)
+    assert 'tilt_uniformity' in ev.penalties and len(ev.tilt_walls) == 3 and set(ev.tilt) == {'up', 'down'}
+    ev2 = problem.evaluate(x)
+    assert ev2.tilt == ev.tilt  # analytic T3 carries no Monte-Carlo noise
 
     summary, best = run(problem, OptimizerSpec(method="random_search", max_evals=8, population=4, log_every=0),
                         output_dir=tmp_path)

@@ -14,8 +14,7 @@
     "position": [10, 0, 0],
     "cam1_pitch": 45, "cam1_yaw": 0, "cam2_pitch": -45, "cam2_yaw": 0,
     "long_fov": 170, "landscape": true,
-    "geometry": "room", "room_dist": 300, "room_grid_size": 20,
-    "wall_dist": 300, "wall_size": 1200, "grid_size": 40
+    "room_dist": 300, "room_grid_size": 20
   },
 
   "modes": [
@@ -23,7 +22,8 @@
     { "name": "flash", "current_a": 13.0, "min_avg_lux": 41000, "min_avg_lux_dist": 50, "lux_weight": 1.0 }
   ],
 
-  "objective": { "metric": "u0", "min_percentile": 2.0, "coverage_weight": 1.0 },
+  "objective": { "metric": "u0", "min_percentile": 2.0, "coverage_weight": 1.0,
+                 "tilt_fov_deg": 45, "tilt_fov_weight": 0.3, "tilt_room_grid_size": 32 },
 
   "constraints": {
     "max_leds": 24, "max_leds_weight": 0.05,

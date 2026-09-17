@@ -24,16 +24,17 @@ LATERAL_DEPTH_FACTOR = 2.5
 
 
 def build_wall_specs(front_dist, side_dist, top_bottom_dist, grid_size,
-                     led_x_center=-35.0, back_dist=None):
+                     led_x_center=-35.0, back_dist=None, lateral_depth=None):
     """Return ``{wall_name: spec}`` describing each wall's size and grid.
 
     Every wall gets a ``grid_size × grid_size`` grid whose cells adapt to the
-    wall's physical dimensions (cm).
+    wall's physical dimensions (cm). Side/top/bottom walls run from the front wall
+    back by ``lateral_depth`` cm (default ``LATERAL_DEPTH_FACTOR`` × the rig-to-wall width).
     """
     wall_width_x = front_dist + abs(led_x_center)
     wall_width_y = 2 * side_dist
     wall_height_z = 2 * top_bottom_dist
-    lateral_depth_x = wall_width_x * LATERAL_DEPTH_FACTOR
+    lateral_depth_x = float(lateral_depth) if lateral_depth is not None else wall_width_x * LATERAL_DEPTH_FACTOR
     extended_x_min = front_dist - lateral_depth_x
 
     front_spec = {
