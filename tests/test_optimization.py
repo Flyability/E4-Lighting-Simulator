@@ -276,3 +276,22 @@ def test_requirements_spec_modes_drivers_and_report(tmp_path):
     assert (out / "initial_config.json").exists()
     with open(out / "report.pdf", "rb") as f:
         assert f.read(5) == b"%PDF-"
+
+    # sensitivity analysis on synthetic records: score driven by variable 0 only
+    from lighting_simulator.optimization import sensitivity as S
+    rng = np.random.default_rng(0)
+    lo = np.array([b[0] for b in problem.bounds]); hi = np.array([b[1] for b in problem.bounds])
+    xs = lo + rng.random((40, problem.dim)) * (hi - lo)
+    xs[:, :2] = np.round(xs[:, :2])
+    recs = []
+    for i, x in enumerate(xs):
+        e = problem.evaluate(x)
+        e.score = float(x[2] * 10 + rng.normal(0, 0.1))
+        recs.append((i, e, x))
+    res = S.analyse(problem, recs)
+    assert res.corr.shape == (problem.dim + 6, len(res.outcome_names))
+    assert res.outcome_names[0] == 'score' and {'T2 VIO %', 'T3 U0 up %'} <= set(res.outcome_names)
+    assert res.corr[2, 0] > 0.95 and res.ranking()[0] == 2 and res.surrogate_r2 > 0.9
+    assert np.isfinite(res.X[:, problem.dim]).all()  # active LEDs decoded for every record
+    assert S.spearman([1, 2, 3, 4], [1, 3, 2, 4]) == pytest.approx(0.8)
+    assert S.spearman([1, 1, 1], [1, 2, 3]) != S.spearman([1, 1, 1], [1, 2, 3])  # NaN on constant input

@@ -495,6 +495,10 @@ def _page_method(w: _Writer, problem):
            f"lucky twice); for this report the best distinct designs are re-evaluated with {VERIFY_RAY_FACTOR}× "
            "the rays and ranked by that verified score. Dashed trend lines on the convergence page are centred "
            "moving averages over ~5 % of the run.", size=8)
+    w.line("Sensitivity pages (end of report): Spearman rank correlations between every variable — plus derived "
+           "layout features such as LED count, nearest-neighbour spacing and spread — and every score component, "
+           "computed from the logged evaluations; a rank-linear surrogate ranks the variables and flags those the "
+           "score does not react to; binned-median trend plots show non-monotonic effects.", size=8)
 
 
 def _trend(y, frac=0.05, min_win=5):
@@ -983,6 +987,155 @@ def _lognorm(score):
     return Normalize(vmin=float(np.min(score)), vmax=float(np.max(score)))
 
 
+# --------------------------------------------------------------------------- sensitivity
+def _short(label, n=34):
+    return label if len(label) <= n else label[: n - 1] + "…"
+
+
+def _heatmap(ax, M, row_labels, col_labels, fontsize=6.5, annotate=True):
+    ax.imshow(np.where(np.isfinite(M), M, 0.0), cmap="coolwarm", vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(range(len(col_labels))); ax.set_xticklabels(col_labels, rotation=45, ha="left", fontsize=fontsize)
+    ax.xaxis.tick_top()
+    ax.set_yticks(range(len(row_labels))); ax.set_yticklabels(row_labels, fontsize=fontsize)
+    ax.tick_params(length=0)
+    if annotate:
+        for i in range(M.shape[0]):
+            for j in range(M.shape[1]):
+                v = M[i, j]
+                if np.isfinite(v):
+                    ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=fontsize - 1,
+                            color="white" if abs(v) > 0.6 else "black")
+                else:
+                    ax.text(j, i, "—", ha="center", va="center", fontsize=fontsize - 1, color="#888")
+
+
+def _page_sensitivity(pdf, problem, records):
+    """Which inputs move the score: Spearman heatmap, surrogate ranking, partial dependence, co-variation."""
+    if len(records) < 20 or problem.dim == 0:
+        return
+    from . import sensitivity as S
+    res = S.analyse(problem, records)
+    order = res.ranking()
+    si = res.outcome_names.index('score')
+
+    # ---- page 1: input × outcome correlation heatmap (rows ranked by |ρ(score)|)
+    rows = order
+    per_page = 38
+    for start in range(0, len(rows), per_page):
+        idx = rows[start:start + per_page]
+        fig = Figure(figsize=A4, dpi=110)
+        fig.suptitle("Sensitivity — rank correlation: inputs × score components",
+                     fontsize=13, weight="bold", x=MARGIN, ha="left", y=0.965)
+        ax = fig.add_axes([0.42, 0.12, 0.50, 0.74])
+        labels = [("★ " if i >= res.n_vars else "") + _short(res.input_labels[i], 44) for i in idx]
+        _heatmap(ax, res.corr[idx], labels, res.outcome_names)
+        fig.text(MARGIN, 0.075, textwrap.fill(
+            f"Spearman ρ over the {res.n_records} logged evaluations (derived layout features ★ on "
+            f"{res.n_derived_records} of them). The score is minimised: ρ < 0 with 'score' means increasing the "
+            "input tends to IMPROVE the design, ρ > 0 tends to hurt. For T1/T2/T3 columns (higher = better) the "
+            "sign reads the other way. |ρ| ≈ 0 means the score does not react monotonically to that input over the "
+            "explored range — either it does not matter, or its effect is non-monotonic (see the trend plots). "
+            "Correlations are associations over the points the optimiser visited, not controlled experiments: "
+            "the search oversamples good regions.", 135), fontsize=7.5, color="#444", va="top")
+        pdf.savefig(fig)
+
+    # ---- page 2: ranking bars (ρ with score and surrogate coefficient) + weak-variable list
+    fig = Figure(figsize=A4, dpi=110)
+    fig.suptitle("Sensitivity — influence ranking", fontsize=14, weight="bold", x=MARGIN, ha="left", y=0.965)
+    nv = res.n_vars
+    var_order = [i for i in order if i < nv][:38]
+    ax = fig.add_axes([0.40, 0.42, 0.55, 0.50])
+    y = np.arange(len(var_order))
+    rho = res.corr[var_order, si]
+    coef = res.surrogate_coef[var_order]
+    cmax = float(np.nanmax(np.abs(res.surrogate_coef))) or 1.0
+    ax.barh(y + 0.2, np.nan_to_num(rho), height=0.38, color=np.where(rho < 0, "#2e7d32", "#c62828"), label="Spearman ρ with score")
+    ax.barh(y - 0.2, coef / cmax, height=0.38, color="#607d8b", alpha=0.7,
+            label=f"rank-linear surrogate coefficient (scaled, R² = {res.surrogate_r2:.2f})")
+    ax.set_yticks(y); ax.set_yticklabels([_short(res.input_names[i], 40) for i in var_order], fontsize=6.5)
+    ax.invert_yaxis(); ax.axvline(0, color="k", lw=0.6); ax.set_xlim(-1.05, 1.05)
+    ax.tick_params(labelsize=7); ax.grid(axis="x", alpha=0.3); ax.legend(fontsize=7, loc="lower right")
+    ax.set_xlabel("← larger value improves the score   |   larger value hurts →", fontsize=7.5)
+    ax.set_title("Variables, most influential first", fontsize=9, loc="left")
+
+    # derived features ranking
+    feat_order = [i for i in order if i >= nv]
+    if feat_order:
+        ax2 = fig.add_axes([0.40, 0.20, 0.55, 0.14])
+        y2 = np.arange(len(feat_order))
+        r2 = res.corr[feat_order, si]
+        ax2.barh(y2, np.nan_to_num(r2), height=0.6, color=np.where(r2 < 0, "#2e7d32", "#c62828"))
+        ax2.set_yticks(y2); ax2.set_yticklabels([_short(res.input_labels[i], 48) for i in feat_order], fontsize=6.5)
+        ax2.invert_yaxis(); ax2.axvline(0, color="k", lw=0.6); ax2.set_xlim(-1.05, 1.05)
+        ax2.tick_params(labelsize=7); ax2.grid(axis="x", alpha=0.3)
+        ax2.set_title("Derived layout features (ρ with score)", fontsize=9, loc="left")
+
+    weak = res.weak_variables()
+    lines = []
+    if weak:
+        lines.append("Candidates to freeze (score barely reacts, yet the best 20 % of designs still span > 60 % of "
+                     "their range — the optimiser wanders in them for free):")
+        for i in weak:
+            lines.append(f"   • {res.input_names[i]}   ρ = {res.corr[i, si]:+.2f}, top-20 % range "
+                         f"{res.top_range_frac[i]*100:.0f} % of the bounds")
+    else:
+        lines.append("No variable qualifies as clearly unneeded (|ρ| < 0.1 and still spanning > 60 % of its bounds "
+                     "among the best 20 % of designs).")
+    for n in res.notes:
+        lines.append("⚠ " + n)
+    fig.text(MARGIN, 0.155, "\n".join(textwrap.fill(l, 135, subsequent_indent="      ") for l in lines),
+             fontsize=7.5, color="#444", va="top")
+    pdf.savefig(fig)
+
+    # ---- page 3: partial dependence (score vs input, binned median) for the most influential inputs
+    top_inputs = [i for i in order if np.isfinite(res.corr[i, si])][:12]
+    if top_inputs:
+        fig = Figure(figsize=A4, dpi=110)
+        fig.suptitle("Sensitivity — score vs. input, most influential first",
+                     fontsize=13, weight="bold", x=MARGIN, ha="left", y=0.965)
+        axs = np.atleast_2d(fig.subplots(4, 3, squeeze=False))
+        fig.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.06, hspace=0.55, wspace=0.3)
+        score = res.Y[:, si]
+        for ax, i in zip(axs.flat, top_inputs):
+            x = res.X[:, i]
+            ok = np.isfinite(x) & np.isfinite(score)
+            ax.scatter(x[ok], score[ok], s=4, color="#9e9e9e", alpha=0.35, lw=0)
+            cx, med, q1, q3 = S.binned_trend(x, score)
+            if cx.size:
+                ax.fill_between(cx, q1, q3, color="#ff9800", alpha=0.2, lw=0)
+                ax.plot(cx, med, color="#e65100", lw=1.6, marker="o", ms=2.5)
+            if np.all(np.isfinite(score[ok])) and score[ok].size and score[ok].max() / max(score[ok].min(), 1e-9) > 10:
+                ax.set_yscale("log")
+            ax.set_title(f"{_short(res.input_labels[i], 42)}   ρ = {res.corr[i, si]:+.2f}", fontsize=7)
+            ax.tick_params(labelsize=6); ax.grid(alpha=0.25)
+            if i < nv:
+                lo, hi = problem.bounds[i]
+                ax.axvline(lo, color="#bbb", lw=0.7, ls=":"); ax.axvline(hi, color="#bbb", lw=0.7, ls=":")
+        for ax in list(axs.flat)[len(top_inputs):]:
+            ax.axis("off")
+        fig.text(MARGIN, 0.035, textwrap.fill(
+            "Dots = evaluations, line = binned median score, band = interquartile range, dotted = bounds. "
+            "A minimum inside the bounds is the useful operating range for that input; a flat median with a large "
+            "|ρ| for another input signals interactions.", 135), fontsize=7.5, color="#444", va="top")
+        pdf.savefig(fig)
+
+    # ---- page 4: variable co-variation among the best designs
+    if 2 <= nv <= 45:
+        fig = Figure(figsize=A4, dpi=110)
+        fig.suptitle(f"Sensitivity — variable co-variation in the best {int(res.top_mask.sum())} designs (top 20 %)",
+                     fontsize=13, weight="bold", x=MARGIN, ha="left", y=0.965)
+        ax = fig.add_axes([0.30, 0.14, 0.62, 0.66])
+        vo = [i for i in order if i < nv]
+        lab = [_short(res.input_names[i], 30) for i in vo]
+        _heatmap(ax, res.top_corr[np.ix_(vo, vo)], lab, lab, fontsize=5.5, annotate=nv <= 24)
+        fig.text(MARGIN, 0.085, textwrap.fill(
+            "Spearman ρ between pairs of variables, restricted to the best-scoring fifth of the run. A strong "
+            "|ρ| means the good designs trade one variable against the other (e.g. wider arc ↔ smaller tilt): "
+            "they are not independent knobs and could be replaced by a single one. Near-zero everywhere means "
+            "the optimum is well separated in each variable.", 135), fontsize=7.5, color="#444", va="top")
+        pdf.savefig(fig)
+
+
 # --------------------------------------------------------------------------- entry point
 def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=False, path=None, n_confirm=0):
     """Render ``<out_dir>/report.pdf`` and return its path.
@@ -1043,6 +1196,7 @@ def write_report(problem, records, opt, out_dir, x0=None, elapsed=0.0, stopped=F
         _page_layouts(pdf, problem, designs)
         _page_variable_bounds(pdf, problem, designs)
         _page_variable_history(pdf, problem, records, designs)
+        _page_sensitivity(pdf, problem, records)
         w = _Writer(pdf, "Files")
         w.line("best_config.json — best design after verification, loadable in the UI (Project → Load) or via --evaluate")
         w.line("best2_config.json / initial_config.json — the other two designs compared in this report")
