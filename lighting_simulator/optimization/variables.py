@@ -457,6 +457,10 @@ class DuctPanelPose(VariableGroup):
     """± degrees swivel of the panel about the local tangent (toward / away from the axis)."""
     spin_range: tuple | None = None
     """± degrees rotation of the panel about its own (radial) normal."""
+    led_theta_range: tuple | None = None
+    """Per-LED ± degrees around the axis on top of the panel move (each LED slides on the surface)."""
+    led_axial_range: tuple | None = None
+    """Per-LED ± cm along the axis on top of the panel move."""
     mirror_group_index: int | None = None
     """Replace this other group with the XZ mirror of the moved panel (symmetric pair)."""
     names: list = field(default_factory=list, init=False)
@@ -472,6 +476,10 @@ class DuctPanelPose(VariableGroup):
                                      ('spin', self.spin_range)) if r is not None]
         self._bound = False
 
+    @property
+    def per_led(self):
+        return self.led_theta_range is not None or self.led_axial_range is not None
+
     def bind(self, base_cfg):
         group = base_cfg['custom_groups'][self.group_index]
         if not group.get('is_dynamic'):
@@ -480,8 +488,11 @@ class DuctPanelPose(VariableGroup):
         if not positions:
             raise ValueError(f"group {self.group_index} has no LEDs")
         P = np.asarray(positions, float)
+        D = np.asarray(directions, float)
+        RW = np.asarray(row_dirs, float) if row_dirs else None
         a, u, v = self.duct.frame()
-        rel = P.mean(axis=0) - np.asarray(self.duct.center, float)
+        c = np.asarray(self.duct.center, float)
+        rel = P.mean(axis=0) - c
         axial0 = float(np.dot(rel, a))
         rv = rel - axial0 * a
         self.theta0 = math.degrees(math.atan2(float(np.dot(rv, v)), float(np.dot(rv, u))))
@@ -490,8 +501,18 @@ class DuctPanelPose(VariableGroup):
         B = self._basis(self.theta0, 0.0, 0.0)
         anchor = self._anchor(self.theta0, self.axial0, self.radial0)
         self._local_pos = (P - anchor) @ B
-        self._local_dir = np.asarray(directions, float) @ B
-        self._local_row = np.asarray(row_dirs, float) @ B if row_dirs else None
+        self._local_dir = D @ B
+        self._local_row = RW @ B if RW is not None else None
+        # Per-LED surface coordinates + orientation in each LED's own surface frame
+        rel_i = P - c
+        ax_i = rel_i @ a
+        rv_i = rel_i - ax_i[:, None] * a
+        self._led_theta = np.degrees(np.arctan2(rv_i @ v, rv_i @ u))
+        self._led_axial = ax_i
+        self._led_radial = np.linalg.norm(rv_i, axis=1) - self.duct.radius - self.duct.mount_offset
+        self._led_dir = np.array([self._basis(th, 0.0, 0.0).T @ d for th, d in zip(self._led_theta, D)])
+        self._led_row = (np.array([self._basis(th, 0.0, 0.0).T @ r for th, r in zip(self._led_theta, RW)])
+                         if RW is not None else None)
         start = {'theta': self.theta0, 'axial': self.axial0, 'radial': self.radial0, 'tilt': 0.0, 'spin': 0.0}
         ranges = {'theta': self.theta_range, 'axial': self.axial_range, 'radial': self.radial_range,
                   'tilt': self.tilt_axial_range, 'spin': self.spin_range}
@@ -502,6 +523,16 @@ class DuctPanelPose(VariableGroup):
             self.bounds.append((start[k] + lo, start[k] + hi))
             self.integrality.append(False)
             self.x0.append(start[k])
+        self._n = len(P)
+        for key, rng in (('dtheta', self.led_theta_range), ('daxial', self.led_axial_range)):
+            if rng is None:
+                continue
+            lo, hi = (float(r) for r in rng)
+            for i in range(self._n):
+                self.names.append(f"group{self.group_index}.led{i}.{key}")
+                self.bounds.append((lo, hi))
+                self.integrality.append(False)
+                self.x0.append(0.0)
         self._bound = True
         return self
 
@@ -528,18 +559,39 @@ class DuctPanelPose(VariableGroup):
     def apply(self, x, cfg):
         if not self._bound:
             raise RuntimeError("DuctPanelPose.bind(base_cfg) must be called first")
+        x = [float(v) for v in x]
         vals = {'theta': self.theta0, 'axial': self.axial0, 'radial': self.radial0, 'tilt': 0.0, 'spin': 0.0}
-        vals.update(zip(self._keys, (float(v) for v in x)))
-        B = self._basis(vals['theta'], vals['tilt'], vals['spin'])
-        anchor = self._anchor(vals['theta'], vals['axial'], vals['radial'])
+        vals.update(zip(self._keys, x))
+        it = iter(x[len(self._keys):])
+        d_theta = [next(it) for _ in range(self._n)] if self.led_theta_range is not None else [0.0] * self._n
+        d_axial = [next(it) for _ in range(self._n)] if self.led_axial_range is not None else [0.0] * self._n
+        if self.per_led:
+            # Every LED slides on the surface by the panel move plus its own delta and turns with the
+            # wall; tilt / spin then act on each beam about its own tangent / normal.
+            positions, directions, rows = [], [], []
+            for i in range(self._n):
+                th = self._led_theta[i] + (vals['theta'] - self.theta0) + d_theta[i]
+                ax = self._led_axial[i] + (vals['axial'] - self.axial0) + d_axial[i]
+                rd = self._led_radial[i] + (vals['radial'] - self.radial0)
+                Bi = self._basis(th, vals['tilt'], vals['spin'])
+                positions.append([float(c) for c in self._anchor(th, ax, rd)])
+                directions.append([float(c) for c in Bi @ self._led_dir[i]])
+                if self._led_row is not None:
+                    rows.append([float(c) for c in Bi @ self._led_row[i]])
+        else:
+            B = self._basis(vals['theta'], vals['tilt'], vals['spin'])
+            anchor = self._anchor(vals['theta'], vals['axial'], vals['radial'])
+            positions = [[float(c) for c in anchor + B @ p] for p in self._local_pos]
+            directions = [[float(c) for c in B @ d] for d in self._local_dir]
+            rows = [[float(c) for c in B @ r] for r in self._local_row] if self._local_row is not None else []
         group = cfg['custom_groups'][self.group_index]
         group['position'] = [0.0, 0.0, 0.0]
         group['rotation_x'] = group['rotation_y'] = group['rotation_z'] = 0.0
         group['guide'] = None  # pose is fully baked into the LED arrays
-        group['led_positions'] = [[float(c) for c in anchor + B @ p] for p in self._local_pos]
-        group['led_rotations'] = [[float(c) for c in B @ d] for d in self._local_dir]
-        if self._local_row is not None:
-            group['led_row_directions'] = [[float(c) for c in B @ r] for r in self._local_row]
+        group['led_positions'] = positions
+        group['led_rotations'] = directions
+        if rows:
+            group['led_row_directions'] = rows
         group['led_euler_angles'] = []
         if self.mirror_group_index is not None:
             old = cfg['custom_groups'][self.mirror_group_index]

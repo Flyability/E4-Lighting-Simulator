@@ -116,10 +116,13 @@ fire_update(find("Panel movement"))
 find("± around the duct (cm along circumference)").value = 8.0
 fire_update(find("± around the duct (cm along circumference)"))
 find("± swivel toward axis (°)").value = 20
+find("Per-LED: ± slide around duct (cm)").value = 2.0
+fire_update(find("Per-LED: ± slide around duct (cm)"))
+find("Per-LED: ± slide along axis (cm)").value = 1.0
 find("Mirror partner group").value = find("Mirror partner group").options[2] if len(groups) > 1 else "(none)"
 n_rd = sum(1 for n in server.scene._handle_from_node_name if n.startswith("/optim_refine_duct/"))
 print("[smoke] refine-duct preview nodes:", n_rd)
-assert n_rd >= 4
+assert n_rd >= 5
 find("LED on / off").value = False
 find("LED roles (off / VIO / flash / both)").value = False
 find("Max evaluations").value = 20

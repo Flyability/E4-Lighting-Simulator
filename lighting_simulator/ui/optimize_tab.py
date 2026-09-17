@@ -146,6 +146,12 @@ def build(ctx):
                                         visible=False, hint="Whole panel pitches about its tangent line")
         rd_spin = server.gui.add_slider("± spin about panel normal (°)", min=0, max=180, step=5, initial_value=0,
                                         visible=False)
+        rd_led_arc = server.gui.add_number("Per-LED: ± slide around duct (cm)", 0.0, min=0.0, max=30.0, step=0.5,
+                                           visible=False,
+                                           hint="On top of the panel move, every LED may slide on the surface by its own "
+                                                "amount (2 variables per LED). 0 = LEDs stay rigid to the panel.")
+        rd_led_axial = server.gui.add_number("Per-LED: ± slide along axis (cm)", 0.0, min=0.0, max=10.0, step=0.5,
+                                             visible=False)
         _RD_NO_MIRROR = "(none)"
         rd_mirror = server.gui.add_dropdown("Mirror partner group", options=[_RD_NO_MIRROR] + _optim_group_labels(),
                                             initial_value=_RD_NO_MIRROR, visible=False,
@@ -430,12 +436,18 @@ def build(ctx):
                'radial_range': [-float(rd_tol_radial.value), float(rd_tol_radial.value)] if rd_tol_radial.value > 0 else None,
                'tilt_axial_range': [-float(rd_tilt.value), float(rd_tilt.value)] if rd_tilt.value > 0 else None,
                'spin_range': [-float(rd_spin.value), float(rd_spin.value)] if rd_spin.value > 0 else None}
+        d_led = arc_cm_to_deg(rd_led_arc.value, float(rd_radius.value))
+        if d_led > 0:
+            var['led_theta_range'] = [-d_led, d_led]
+        if rd_led_axial.value > 0:
+            var['led_axial_range'] = [-float(rd_led_axial.value), float(rd_led_axial.value)]
         if rd_mirror.value != _RD_NO_MIRROR and ':' in rd_mirror.value:
             mi = int(rd_mirror.value.split(':', 1)[0])
             if mi == gi:
                 raise ValueError("The mirror partner must be a different group.")
             var['mirror_group_index'] = mi
-        if all(var.get(k) is None for k in ('theta_range', 'axial_range', 'radial_range', 'tilt_axial_range', 'spin_range')):
+        if all(var.get(k) is None for k in ('theta_range', 'axial_range', 'radial_range', 'tilt_axial_range', 'spin_range',
+                                            'led_theta_range', 'led_axial_range')):
             raise ValueError("Every duct range is 0: nothing can move.")
         return var
 
@@ -451,7 +463,7 @@ def build(ctx):
         _refine_duct_handles.clear()
         on = optim_mode.value == _MODE_REFINE and optim_move_mode.value == _MOVE_DUCT
         for h in (rd_center, rd_radius, rd_axis, rd_rot, rd_tol_arc, rd_tol_axial, rd_tol_radial, rd_tilt, rd_spin,
-                  rd_mirror, rd_info):
+                  rd_led_arc, rd_led_axial, rd_mirror, rd_info):
             h.visible = on
         for h in (optim_pos_delta, optim_rot_delta):
             h.visible = optim_mode.value == _MODE_REFINE and optim_move_mode.value == _MOVE_FREE
@@ -472,7 +484,8 @@ def build(ctx):
         a, u, _v = Duct(**d).frame()
         c = np.asarray(d['center'], float)
         d_theta = arc_cm_to_deg(rd_tol_arc.value, r)
-        half = float(rd_tol_axial.value) + 2.0
+        d_led = arc_cm_to_deg(rd_led_arc.value, r)
+        half = float(rd_tol_axial.value) + float(rd_led_axial.value) + 2.0
         for k, t in enumerate((-half, 0.0, half)):
             _refine_duct_handles.append(server.scene.add_line_segments(
                 f"/optim_refine_duct/ring_{k}", points=_circle_line_segments_m(c + a * t, r, a, n_seg=64),
@@ -483,9 +496,17 @@ def build(ctx):
                                         var.axial0 - float(rd_tol_axial.value), var.axial0 + float(rd_tol_axial.value))
         _refine_duct_handles.append(server.scene.add_line_segments(
             "/optim_refine_duct/tol_box", points=segs, colors=(1.0, 0.85, 0.2), line_width=2.5))
+        if d_led > 0 or rd_led_axial.value > 0:  # envelope any single LED may reach
+            th_lo = float(var._led_theta.min()) - d_theta - d_led
+            th_hi = float(var._led_theta.max()) + d_theta + d_led
+            ax_lo = float(var._led_axial.min()) - float(rd_tol_axial.value) - float(rd_led_axial.value)
+            ax_hi = float(var._led_axial.max()) + float(rd_tol_axial.value) + float(rd_led_axial.value)
+            segs = _duct_sector_wireframe_m(c, a, u, th_lo, th_hi, r_lo, r_hi, ax_lo, ax_hi)
+            _refine_duct_handles.append(server.scene.add_line_segments(
+                "/optim_refine_duct/envelope", points=segs, colors=(1.0, 0.95, 0.6), line_width=1.0))
 
     for _h in (optim_move_mode, optim_group_dropdown, rd_center, rd_radius, rd_axis, rd_rot, rd_tol_arc,
-               rd_tol_axial, rd_tol_radial):
+               rd_tol_axial, rd_tol_radial, rd_led_arc, rd_led_axial):
         _h.on_update(_draw_refine_duct_preview)
 
     def _optim_mode_changed(_=None):
@@ -863,6 +884,8 @@ def build(ctx):
                     rd_tol_radial.value = _half(v.get('radial_range'))
                     rd_tilt.value = int(_half(v.get('tilt_axial_range')))
                     rd_spin.value = int(_half(v.get('spin_range')))
+                    rd_led_arc.value = round(r * _math.radians(_half(v.get('led_theta_range'))), 1)
+                    rd_led_axial.value = _half(v.get('led_axial_range'))
                     mi = v.get('mirror_group_index')
                     label = next((l for l in rd_mirror.options if l.startswith(f"{mi}:")), None) if mi is not None else None
                     rd_mirror.value = label or _RD_NO_MIRROR

@@ -123,6 +123,24 @@ def test_duct_panel_pose_slides_existing_layout_over_the_duct():
     assert ang == pytest.approx(20.0, abs=1e-6)
     assert len(build_scene_from_config(problem.decode(x)).active_leds) > 0
 
+    # per-LED slide: x0 still reproduces the scene, one LED's delta moves only that LED along the surface
+    var2 = DuctPanelPose(group_index=gi, duct=duct, theta_range=(-30, 30), axial_range=None,
+                         led_theta_range=(-10, 10), led_axial_range=(-1, 1)).bind(cfg)
+    n = len(base)
+    assert len(var2.names) == 1 + 2 * n and var2.names[1] == f"group{gi}.led0.dtheta"
+    p2 = Problem(cfg, [var2], WALL, CAM)
+    out0 = np.asarray(group_config_to_factory(p2.decode(p2.x0)['custom_groups'][gi])['led_positions'], float)
+    np.testing.assert_allclose(out0, base, atol=1e-6)
+    x = p2.x0.copy()
+    x[1] = 10.0           # LED 0 rotates 10 deg more around the duct
+    x[1 + n] = 0.7        # ... and slides 0.7 cm along the axis
+    outp = np.asarray(group_config_to_factory(p2.decode(x)['custom_groups'][gi])['led_positions'], float)
+    np.testing.assert_allclose(outp[1:], base[1:], atol=1e-6)
+    assert np.linalg.norm((outp[0] - duct.center)[:2]) == pytest.approx(np.linalg.norm((base[0] - duct.center)[:2]))
+    assert outp[0, 2] - base[0, 2] == pytest.approx(0.7)
+    ang0 = np.degrees(np.arctan2(*(outp - duct.center)[0, [1, 0]]) - np.arctan2(*(base - duct.center)[0, [1, 0]]))
+    assert ang0 == pytest.approx(10.0, abs=1e-6)
+
 
 def test_panel_pose_and_led_states_modify_base_groups():
     cfg = load_config("configs/Elios3.json")
