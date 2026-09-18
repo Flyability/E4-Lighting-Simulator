@@ -56,14 +56,16 @@ def build(ctx):
             "the view into the sphere or look through it from outside.</div>")
         sphere_enable = server.gui.add_checkbox("Enable Sphere Mode", initial_value=False)
         sphere_radius = server.gui.add_number("Sphere radius (cm)", 300.0, min=20.0, max=5000.0, step=10.0)
-        sphere_cells_n = server.gui.add_slider("Cells around (longitude)", min=24, max=360, step=12, initial_value=90,
-                                               hint="Latitude rows = half of this. 90 → 4 050 cells of ≈ 21 cm at R = 300 cm.")
+        sphere_cells_n = server.gui.add_slider("Sphere cells (approx.)", min=200, max=10000, step=100, initial_value=4000,
+                                               hint="Total cells on the sphere (lat/long grid). 4 000 → ≈ 21 cm cells at R = 300 cm; "
+                                                    "10 000 → ≈ 13 cm.")
         sphere_dim_outside = server.gui.add_checkbox("Dim cells outside the VIO FOV", initial_value=True)
         update_btn = server.gui.add_button("Update Sphere Intensity", color="#FFA500")
         info_html = server.gui.add_html("")
 
     def _settings():
-        return SphereSettings(radius_cm=float(sphere_radius.value), n_phi=int(sphere_cells_n.value))
+        n_phi = 2 * max(6, int(round(np.sqrt(2.0 * float(sphere_cells_n.value)) / 2)))  # n_phi * n_phi/2 ≈ cells
+        return SphereSettings(radius_cm=float(sphere_radius.value), n_phi=n_phi)
 
     def _clear():
         for h in handles:
