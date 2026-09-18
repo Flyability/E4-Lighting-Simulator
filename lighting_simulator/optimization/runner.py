@@ -46,6 +46,25 @@ class OptimizationStopped(Exception):
     """Raised inside the objective when the caller's ``stop_event`` is set."""
 
 
+class _PoolMap:
+    """scipy ``workers`` map-like: evaluates a population in a process pool, logs each result in the parent."""
+
+    def __init__(self, problem, logger, workers):
+        import multiprocessing
+        self.problem, self.logger = problem, logger
+        self.n_workers = multiprocessing.cpu_count() if workers is None or workers < 0 else max(1, int(workers))
+        self.pool = multiprocessing.Pool(self.n_workers)
+
+    def __call__(self, func, iterable):
+        xs = [np.array(x, dtype=float) for x in iterable]
+        evs = self.pool.map(self.problem.evaluate, xs)
+        return [self.logger.record(x, ev) for x, ev in zip(xs, evs)]
+
+    def close(self):
+        self.pool.close()
+        self.pool.join()
+
+
 class RunLogger:
     def __init__(self, problem: Problem, out_dir: Path, log_every=10, on_eval=None, stop_event=None,
                  confirm_best=True):
@@ -73,7 +92,10 @@ class RunLogger:
                             "n_drivers", "total_current_a"] + problem.names)
 
     def __call__(self, x):
-        ev = self.problem.evaluate(x)
+        return self.record(x, self.problem.evaluate(x))
+
+    def record(self, x, ev):
+        """Log an evaluation computed elsewhere (e.g. in a worker process); returns its score."""
         if self.confirm_best and self.best is not None and ev.score < self.best.score:
             # Candidate beats the best: confirm with an independent ray sample.
             ev = ev.averaged_with(self.problem.evaluate(x))
@@ -209,31 +231,32 @@ def _run_method(problem, opt, logger, x0, lo, hi, rng, optimize):
         maxiter = max(1, math.ceil(opt.max_evals / pop_total) - 1)
         init = rng.uniform(lo, hi, size=(pop_total, n))
         init[0] = x0
-        generations = [0]
 
         if opt.workers == 1:
             objective = logger
-
-            def stop(xk, convergence=None):
-                return logger.n >= opt.max_evals
+            pool_map = None
         else:
-            # Workers evaluate the (picklable) Problem; the parent re-evaluates the
-            # per-generation best once so logging / best_config export still work.
-            objective = problem
-            print(f"[optim] parallel DE: {pop_total} evals/generation, {maxiter + 1} generations")
+            # Workers evaluate the (picklable) Problem in parallel; every result is logged in the parent
+            # so history / progress / best-config export see each evaluation, not just the generation best.
+            objective = logger
+            pool_map = _PoolMap(problem, logger, opt.workers)
+            print(f"[optim] parallel DE: {pop_total} evals/generation, {maxiter + 1} generations, "
+                  f"{pool_map.n_workers} workers")
 
-            def stop(xk, convergence=None):
-                generations[0] += 1
-                logger(xk)
-                logger.n_external = (generations[0] + 1) * pop_total
-                return logger.n_external >= opt.max_evals
+        def stop(xk, convergence=None):
+            return logger.n >= opt.max_evals
 
-        optimize.differential_evolution(
-            objective, bounds, init=init, maxiter=maxiter, popsize=popsize, seed=opt.seed,
-            integrality=problem.integrality if problem.integrality.any() else None,
-            polish=opt.polish, workers=opt.workers, updating="deferred" if opt.workers != 1 else "immediate",
-            callback=stop, tol=0.0, atol=0.0,
-        )
+        try:
+            optimize.differential_evolution(
+                objective, bounds, init=init, maxiter=maxiter, popsize=popsize, seed=opt.seed,
+                integrality=problem.integrality if problem.integrality.any() else None,
+                polish=opt.polish, workers=pool_map if pool_map is not None else 1,
+                updating="deferred" if pool_map is not None else "immediate",
+                callback=stop, tol=0.0, atol=0.0,
+            )
+        finally:
+            if pool_map is not None:
+                pool_map.close()
     elif opt.method == "nelder_mead":
         ints = problem.integrality
         if ints.any():
