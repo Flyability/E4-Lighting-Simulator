@@ -294,7 +294,7 @@ def main():
             current_config_name[0] = lay.name or os.path.splitext(os.path.basename(path))[0]
             apply_layout(lay, platforms_dir=platforms_dir)
             _sync_platform_dropdown()
-            led_lumens_slider.value = int(round(lay.flux.vio_lumens))
+            led_lumens_slider.value = float(lay.flux.vio_lumens)
             if lay.flux.flash_lumens:
                 flash_lumens_input.value = float(lay.flux.flash_lumens)
             print(f"✓ Layout loaded: {lay.name}")
@@ -416,8 +416,8 @@ def main():
         ray_uniformity_slider = server.gui.add_slider(
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
         )
-        led_lumens_slider = server.gui.add_slider(
-            "Flight / VIO flux (lm/LED)", min=10, max=1000, step=1, initial_value=168,
+        led_lumens_slider = server.gui.add_number(
+            "Flight / VIO flux (lm/LED)", 168.0, min=1.0, max=100000.0, step=1.0,
             hint="Continuous flux of every LED in the 'Flight' operating mode (VIO + Both LEDs). "
                  "Saved in the layout as flux.vio_lumens.",
         )
