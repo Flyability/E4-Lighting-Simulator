@@ -16,6 +16,7 @@ from lighting_simulator.domain.led_factory import create_leds
 from lighting_simulator.domain.mirroring import expand_mirror_configs
 
 from .absorbers import build_elios_absorbers, rotate_absorbers_z
+from .layout import build_leds_from_layout, is_v2, layout_from_dict
 from .stl import global_z_rotation_4x4, stl_mesh_data, stl_transform
 
 # Azimuths (deg) of the Elios 3 base LED groups on the ring.
@@ -195,11 +196,14 @@ def _decode_mirror_primary(cfg, override):
 
 def build_scene_from_config(cfg, default_lumens=100.0, stl_mesh=None,
                             diffuser=None, mirror_primary=None):
-    """Full scene from a saved config.
+    """Full scene from a saved config (schema v1 dict or v2 layout dict).
 
-    ``stl_mesh`` is an optional loaded ``trimesh.Trimesh`` for ``cfg['stl_model']``.
-    ``diffuser`` is an optional ``(angle_deg, transmission)`` tuple.
+    ``stl_mesh`` is an optional loaded ``trimesh.Trimesh`` for the config's STL model.
+    ``diffuser`` is an optional ``(angle_deg, transmission)`` tuple. For v2 layouts the
+    flux comes from ``cfg['flux']`` and ``default_lumens`` is ignored.
     """
+    if is_v2(cfg):
+        return build_scene_from_layout(layout_from_dict(cfg), stl_mesh=stl_mesh, diffuser=diffuser)
     leds = build_leds_from_config(cfg, default_lumens=default_lumens, mirror_primary=mirror_primary)
     rot_z = float(cfg.get('global_rotation_z', 0.0))
     offset = (cfg.get('global_pos_x', 0.0), cfg.get('global_pos_y', 0.0), cfg.get('global_pos_z', 0.0))
@@ -222,3 +226,16 @@ def build_scene_from_config(cfg, default_lumens=100.0, stl_mesh=None,
         mesh_data = stl_mesh_data(stl_mesh, transform)
 
     return Scene(leds=leds, absorbers=absorbers, stl_mesh_data=mesh_data)
+
+
+def build_scene_from_layout(layout, platform=None, stl_mesh=None, diffuser=None, lumens=None, platforms_dir="platforms"):
+    """Scene from a v2 :class:`Layout`; ``platform`` defaults to the layout's (inline or by name)."""
+    leds = build_leds_from_layout(layout, lumens=lumens)
+    if diffuser is not None:
+        apply_diffuser(leds, *diffuser)
+    mesh_data = None
+    if stl_mesh is not None:
+        plat = platform if platform is not None else layout.resolve_platform(platforms_dir)
+        if plat.stl is not None and plat.stl.occludes:
+            mesh_data = stl_mesh_data(stl_mesh, stl_transform(plat.stl.scale, plat.stl.rotation, plat.stl.position))
+    return Scene(leds=leds, stl_mesh_data=mesh_data)
