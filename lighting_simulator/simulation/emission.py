@@ -18,6 +18,35 @@ def led_lumens(led, default_lumens):
     return float(getattr(led, 'lumens', None) or default_lumens)
 
 
+EMISSION_LUT_SIZE = 256
+
+
+def emission_cone_deg(led):
+    """Full cone angle (deg) inside which the LED emits: the profile's extent, else ``viewing_angle``."""
+    profile = getattr(led, 'beam_profile', None)
+    return 2.0 * profile.max_angle_deg if profile is not None else float(led.viewing_angle)
+
+
+def emission_weight_lut(led, ray_uniformity=0.0, size=EMISSION_LUT_SIZE):
+    """Per-ray weight w(θ) tabulated on θ ∈ [0, cone/2] for rays drawn uniformly in solid angle in the cone.
+
+    ``lumens_per_ray = Φ / N · w(θ)`` with w = I(θ)/Φ · 2π(1 − cos θmax), so the weights average to 1.
+    Shared by the CPU and GPU tracers; the GPU kernels index it with θ/θmax.
+    """
+    theta_max = np.radians(emission_cone_deg(led) / 2.0)
+    theta = np.linspace(0.0, theta_max, int(size))
+    cos_max = np.cos(theta_max)
+    profile = getattr(led, 'beam_profile', None)
+    if profile is not None:
+        w = profile.intensity_cd(np.degrees(theta), 1.0) * 2.0 * np.pi * (1.0 - cos_max)
+    else:
+        n = effective_lambertian_exponent(led, ray_uniformity)
+        denom = 1.0 - cos_max ** (n + 1.0)
+        norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0
+        w = norm_factor * np.power(np.clip(np.cos(theta), 0.0, 1.0), n)
+    return w.astype(np.float32)
+
+
 def generate_led_rays(led, n_rays, lumens, ray_uniformity, rng):
     """Sample ``n_rays`` directions from the LED's emission cone.
 

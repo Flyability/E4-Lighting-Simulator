@@ -219,8 +219,7 @@ def build(ctx):
         if p_obj is not None:
             _add(server.gui.add_html(
                 f"<div style='font-size:10px;color:#888;margin:-4px 0 4px;'>{p_obj.name}: 50 % at "
-                f"{p_obj.half_intensity_angle_deg():.0f}° full angle, emits to ±{p_obj.max_angle_deg:.0f}°. "
-                "Ray tracing falls back to the CPU for profiled LEDs; the analytic map is exact.</div>"))
+                f"{p_obj.half_intensity_angle_deg():.0f}° full angle, emits to ±{p_obj.max_angle_deg:.0f}°.</div>"))
 
     def _guide_controls(panel: Panel, index):
         guide = state.guides.get(index)

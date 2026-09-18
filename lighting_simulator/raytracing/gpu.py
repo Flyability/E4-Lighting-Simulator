@@ -170,7 +170,7 @@ def _init_taichi_backend():
                        out_positions: ti_module.types.ndarray(), out_dirs: ti_module.types.ndarray(),
                        out_lumens: ti_module.types.ndarray(), out_absorbed: ti_module.types.ndarray(),
                        num_rays: ti_module.i32, rays_per_led: ti_module.i32, num_absorbers: ti_module.i32,
-                       n_val: ti_module.f32, norm_factor: ti_module.f32, rays_per_led_f: ti_module.f32,
+                       weight_lut: ti_module.types.ndarray(), lut_last: ti_module.i32, rays_per_led_f: ti_module.f32,
                        ray_offset: ti_module.i32):
         for idx in range(num_rays):
             led_idx = (idx + ray_offset) // rays_per_led
@@ -195,9 +195,9 @@ def _init_taichi_backend():
             local_dir = ti_module.Vector([sin_theta * ti_module.cos(phi), sin_theta * ti_module.sin(phi), cos_theta])
             world_dir = (local_dir[0] * x_axis + local_dir[1] * y_axis + local_dir[2] * z_axis).normalized()
 
-            cos_tc = ti_module.math.clamp(cos_theta, 0.0, 1.0)
-            intensity = ti_module.pow(cos_tc, n_val)
-            lumens_per_ray = (led_lumens[led_idx] / rays_per_led_f) * intensity * norm_factor
+            # w(theta) from the per-LED table (cos^n or measured profile), indexed by theta / theta_max
+            k = ti_module.cast(ti_module.math.clamp(theta / max_theta, 0.0, 1.0) * lut_last + 0.5, ti_module.i32)
+            lumens_per_ray = (led_lumens[led_idx] / rays_per_led_f) * weight_lut[led_idx, k]
 
             absorbed = 0
             for a in range(num_absorbers):
@@ -474,6 +474,30 @@ def _prepare_absorber_arrays(absorbers):
 
 # Shared optics model (kept under the historical private names used below).
 _calculate_lambertian_exponent = lambertian_exponent
+
+
+def _weight_lut_table(leds_data, ray_uniformity=0.0):
+    """(n_leds, K) float32 per-ray weight w(θ) tables, θ ∈ [0, cone/2] per LED (see ``emission_weight_lut``)."""
+    from lighting_simulator.simulation.emission import EMISSION_LUT_SIZE, emission_weight_lut
+    rows = []
+    for ld in leds_data:
+        lut = ld.get('weight_lut')
+        if lut is None:  # payload without a table (external caller): cos^n from its viewing angle
+            class _L:
+                viewing_angle = float(ld['viewing_angle'])
+                ext_lens_angle = ld.get('ext_lens_angle')
+                beam_profile = None
+            lut = emission_weight_lut(_L(), ray_uniformity, EMISSION_LUT_SIZE)
+        rows.append(np.asarray(lut, dtype=np.float32))
+    return np.stack(rows)
+
+
+def _lut_weights(xp, table, led_indices, theta, max_theta):
+    """w(θ) for each ray from its LED's table (nearest bin on θ/θmax)."""
+    last = table.shape[1] - 1
+    frac = xp.clip(theta / xp.maximum(max_theta, xp.float32(1e-6)), 0.0, 1.0)
+    k = (frac * last + 0.5).astype(xp.int32)
+    return table[led_indices, k]
 _lens_efficiency = lens_efficiency
 
 
@@ -697,12 +721,8 @@ def _taichi_process_led_wall_batch(leds_data, params):
     else:
         led_lumens = np.full(num_leds, lumens_per_led, dtype=np.float32)
 
-    _ext_la = leds_data[0].get('ext_lens_angle', None)
-    n_val = _calculate_lambertian_exponent(
-        float(_ext_la) if _ext_la is not None else float(leds_data[0]['viewing_angle']), ray_uniformity)
-    cos_max_f = float(np.cos(np.radians(max(float(leds_data[0]['viewing_angle']), 120.0) / 2.0)))
-    denom = 1.0 - cos_max_f ** (n_val + 1.0)
-    norm_factor = (n_val + 1.0) * (1.0 - cos_max_f) / denom if denom > 1e-12 else 1.0
+    weight_lut = _weight_lut_table(leds_data, ray_uniformity)
+    lut_last = weight_lut.shape[1] - 1
 
     abs_center, abs_half, abs_rot, num_absorbers = _prepare_absorber_arrays(absorbers)
 
@@ -717,7 +737,7 @@ def _taichi_process_led_wall_batch(leds_data, params):
         n = min(batch, total_rays - start)
         _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
                            out_positions, out_dirs, out_lumens, out_absorbed,
-                           n, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led), start)
+                           n, rays_per_led, num_absorbers, weight_lut, lut_last, float(rays_per_led), start)
 
         if stl_mesh_data is not None:
             absorbed_bool = out_absorbed[:n].astype(bool)
@@ -786,6 +806,7 @@ def gpu_process_led_wall_batch(leds_data, params):
     positions = xp.asarray(positions_np)
     directions_led = xp.asarray(directions_np)
     viewing_angles = xp.asarray(viewing_np)
+    weight_lut_gpu = xp.asarray(_weight_lut_table(leds_data, ray_uniformity))
 
     rays_processed = 0
     for batch_start in range(0, total_rays, MAX_BATCH):
@@ -828,8 +849,6 @@ def gpu_process_led_wall_batch(leds_data, params):
             u1 = rng.uniform(0, 1, batch_size).astype(np.float32)
             u2 = rng.uniform(0, 1, batch_size).astype(np.float32)
 
-        _ext_la = leds_data[0].get('ext_lens_angle', None)
-        n_val = _calculate_lambertian_exponent(float(_ext_la) if _ext_la is not None else float(leds_data[0]['viewing_angle']), ray_uniformity)
         max_theta = xp.radians(ray_viewing_angles / 2.0)
         cos_max = xp.cos(max_theta)
         cos_theta = 1.0 - u1 * (1.0 - cos_max)
@@ -853,21 +872,16 @@ def gpu_process_led_wall_batch(leds_data, params):
         world_dir_norms = xp.maximum(world_dir_norms, xp.float32(1e-10))
         world_dirs = world_dirs / world_dir_norms
 
-        # ---- Compute per-ray lumens with cone normalization ----
-        cos_max_f = float(np.cos(np.radians(max(float(leds_data[0]['viewing_angle']), 120.0) / 2.0)))
-        cos_max_n1 = cos_max_f ** (n_val + 1.0)
-        denom = 1.0 - cos_max_n1
-        norm_factor = (n_val + 1.0) * (1.0 - cos_max_f) / denom if denom > 1e-12 else 1.0
-        cos_theta_clamped = xp.clip(cos_theta, 0.0, 1.0)
-        intensity = xp.power(cos_theta_clamped, xp.float32(n_val))
+        # ---- Per-ray lumens: w(theta) from the per-LED weight table (cos^n or measured profile) ----
+        intensity = _lut_weights(xp, weight_lut_gpu, led_indices, theta, max_theta)
         # Support per-LED lumens override
         per_led_lumens = params.get('per_led_lumens', None)
         if per_led_lumens is not None:
             per_led_lumens_gpu = xp.asarray(per_led_lumens, dtype=xp.float32)
             ray_lumens = per_led_lumens_gpu[led_indices]
-            lumens_per_ray = (ray_lumens / xp.float32(rays_per_led)) * intensity * xp.float32(norm_factor)
+            lumens_per_ray = (ray_lumens / xp.float32(rays_per_led)) * intensity
         else:
-            lumens_per_ray = (xp.float32(lumens_per_led) / xp.float32(rays_per_led)) * intensity * xp.float32(norm_factor)
+            lumens_per_ray = (xp.float32(lumens_per_led) / xp.float32(rays_per_led)) * intensity
 
         # ---- Check absorber intersections (vectorized) ----
         absorbed = xp.zeros(batch_size, dtype=bool)
@@ -1020,12 +1034,8 @@ def _taichi_process_room_batch(leds_data, params):
     else:
         led_lumens = np.full(num_leds, lumens_per_led, dtype=np.float32)
 
-    _ext_la = leds_data[0].get('ext_lens_angle', None)
-    n_val = _calculate_lambertian_exponent(
-        float(_ext_la) if _ext_la is not None else float(leds_data[0]['viewing_angle']), ray_uniformity)
-    cos_max_f = float(np.cos(np.radians(float(leds_data[0]['viewing_angle']) / 2.0)))
-    denom = 1.0 - cos_max_f ** (n_val + 1.0)
-    norm_factor = (n_val + 1.0) * (1.0 - cos_max_f) / denom if denom > 1e-12 else 1.0
+    weight_lut = _weight_lut_table(leds_data, ray_uniformity)
+    lut_last = weight_lut.shape[1] - 1
 
     abs_center, abs_half, abs_rot, num_absorbers = _prepare_absorber_arrays(absorbers)
 
@@ -1040,7 +1050,7 @@ def _taichi_process_room_batch(leds_data, params):
         n = min(batch, total_rays - start)
         _ti_generate_rays(positions, directions, viewing, led_lumens, abs_center, abs_half, abs_rot,
                            out_positions, out_dirs, out_lumens, out_absorbed,
-                           n, rays_per_led, num_absorbers, n_val, norm_factor, float(rays_per_led), start)
+                           n, rays_per_led, num_absorbers, weight_lut, lut_last, float(rays_per_led), start)
 
         if stl_mesh_data is not None:
             absorbed_bool = out_absorbed[:n].astype(bool)
@@ -1140,6 +1150,7 @@ def gpu_process_room_batch(leds_data, params):
     positions = xp.asarray(positions_np)
     dir_leds = xp.asarray(dir_leds_np)
     view_angles = xp.asarray(view_angles_np)
+    weight_lut_gpu = xp.asarray(_weight_lut_table(leds_data, ray_uniformity))
 
     for batch_start in range(0, total_rays, MAX_BATCH):
         batch_end = min(batch_start + MAX_BATCH, total_rays)
@@ -1176,8 +1187,6 @@ def gpu_process_room_batch(leds_data, params):
             u1 = rng.uniform(0, 1, batch_size).astype(np.float32)
             u2 = rng.uniform(0, 1, batch_size).astype(np.float32)
 
-        _ext_la = leds_data[0].get('ext_lens_angle', None)
-        n_val = _calculate_lambertian_exponent(float(_ext_la) if _ext_la is not None else float(leds_data[0]['viewing_angle']), ray_uniformity)
         max_theta = xp.radians(ray_va / 2.0)
         cos_max = xp.cos(max_theta)
         cos_theta = 1.0 - u1 * (1.0 - cos_max)
@@ -1193,20 +1202,15 @@ def gpu_process_room_batch(leds_data, params):
         wdn = xp.maximum(wdn, xp.float32(1e-10))
         world_dirs = world_dirs / wdn
 
-        cos_max_f = float(np.cos(np.radians(float(leds_data[0]['viewing_angle']) / 2.0)))
-        cos_max_n1 = cos_max_f ** (n_val + 1.0)
-        denom = 1.0 - cos_max_n1
-        norm_factor = (n_val + 1.0) * (1.0 - cos_max_f) / denom if denom > 1e-12 else 1.0
-        cos_tc = xp.clip(cos_theta, 0.0, 1.0)
-        intensity = xp.power(cos_tc, xp.float32(n_val))
+        intensity = _lut_weights(xp, weight_lut_gpu, led_indices, theta, max_theta)
         # Support per-LED lumens override
         per_led_lumens = params.get('per_led_lumens', None)
         if per_led_lumens is not None:
             per_led_lumens_gpu = xp.asarray(per_led_lumens, dtype=xp.float32)
             ray_lumens = per_led_lumens_gpu[led_indices]
-            lpr = (ray_lumens / xp.float32(rays_per_led)) * intensity * xp.float32(norm_factor)
+            lpr = (ray_lumens / xp.float32(rays_per_led)) * intensity
         else:
-            lpr = (xp.float32(lumens_per_led) / xp.float32(rays_per_led)) * intensity * xp.float32(norm_factor)
+            lpr = (xp.float32(lumens_per_led) / xp.float32(rays_per_led)) * intensity
 
         # Absorber check
         absorbed = xp.zeros(batch_size, dtype=bool)

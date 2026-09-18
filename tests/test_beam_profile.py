@@ -45,6 +45,10 @@ def test_profile_analytic_matches_cpu_tracer():
     mc = compute_wall_intensity(leds, ws, em, use_gpu=False, verbose=False)
     an = direct_wall_intensity(leds, ws, em)
     assert an.sum() == pytest.approx(mc.sum(), rel=0.03)
+    from lighting_simulator.simulation import gpu_backend
+    if gpu_backend.gpu_available():
+        gpu = compute_wall_intensity(leds, ws, em, use_gpu=True, verbose=False)
+        assert gpu.sum() == pytest.approx(mc.sum(), rel=0.01)
     # the flat profile lights the wall edge (±68° off axis) far more than a cos^n 120° beam would
     plain = direct_wall_intensity([LED(position=(0, 0, 0), direction=(1, 0, 0), viewing_angle=120.0, lumens=168.0)], ws, em)
     assert an[12, 0] > 3 * plain[12, 0]

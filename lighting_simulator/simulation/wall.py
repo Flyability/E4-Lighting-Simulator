@@ -18,7 +18,7 @@ from lighting_simulator.raytracing.mesh import (
 )
 
 from . import gpu_backend
-from .emission import generate_led_rays, led_lumens, led_rng
+from .emission import emission_cone_deg, emission_weight_lut, generate_led_rays, led_lumens, led_rng
 from .settings import EmissionSettings, WallSettings
 
 
@@ -92,14 +92,14 @@ def _wall_worker(args):
     )
 
 
-def _gpu_led_payload(active, default_lumens):
+def _gpu_led_payload(active, default_lumens, ray_uniformity=0.0):
     leds_data, lumens = [], []
     for led, led_idx in active:
         leds_data.append({
             'position': np.array(led.position, dtype=np.float32),
             'direction': np.array(led.direction, dtype=np.float32),
-            'viewing_angle': float(led.viewing_angle),
-            'ext_lens_angle': getattr(led, 'ext_lens_angle', None),
+            'viewing_angle': emission_cone_deg(led),
+            'weight_lut': emission_weight_lut(led, ray_uniformity),
             'led_idx': int(led_idx),
         })
         lumens.append(led_lumens(led, default_lumens))
@@ -168,13 +168,9 @@ def compute_wall_intensity(leds, settings: WallSettings, emission: EmissionSetti
 
     if use_gpu is None:
         use_gpu = gpu_backend.gpu_available()
-    if use_gpu and any(getattr(l, 'beam_profile', None) is not None for l, _ in active):
-        if verbose:
-            print("  measured beam profiles present → CPU tracer (GPU kernels only model cosⁿ beams)")
-        use_gpu = False
 
     if use_gpu:
-        leds_data, per_led_lumens = _gpu_led_payload(active, emission.default_lumens)
+        leds_data, per_led_lumens = _gpu_led_payload(active, emission.default_lumens, emission.ray_uniformity)
         gpu_params = {
             'wall_dist': wall_dist,
             'rays_per_led': rays_per_led,

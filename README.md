@@ -57,8 +57,8 @@ its `beam_angle` (50 % intensity at the edge). A **measured profile** replaces t
 datasheet intensity-vs-angle curve: *Selected → Beam profile, all LEDs* (stored as `profile` on
 each LED). `XFL12K HD` is built in; add others as `beam_profiles/<name>.json`
 (`{"name", "angles_deg", "relative_intensity"}`, angles ascending from 0 — see
-`beam_profiles/xfl12k_hd.json`). The analytic engine and the CPU tracer use the profile exactly;
-the GPU kernels only know `cosⁿ`, so ray tracing of profiled LEDs falls back to the CPU.
+`beam_profiles/xfl12k_hd.json`). The analytic engine and both tracers (CPU and GPU, via a per-LED
+weight table) use the profile exactly.
 
 ## Headless example (basis for optimisation loops)
 

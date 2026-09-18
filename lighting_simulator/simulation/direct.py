@@ -77,35 +77,51 @@ def direct_illuminance(points_cm, inward_normals, leds, emission, lumens=None, a
     return out
 
 
-def direct_wall_intensity(leds, settings, emission, absorbers=(), stl_mesh_data=None):
-    """Analytic counterpart of ``wall.compute_wall_intensity``: lux grid (rows = Z, cols = Y)."""
+def _block_mean(grid, k):
+    """Average k×k blocks of a (k·R, k·C) grid down to (R, C)."""
+    if k <= 1:
+        return grid
+    r, c = grid.shape[0] // k, grid.shape[1] // k
+    return grid.reshape(r, k, c, k).mean(axis=(1, 3))
+
+
+def direct_wall_intensity(leds, settings, emission, absorbers=(), stl_mesh_data=None, supersample=1):
+    """Analytic counterpart of ``wall.compute_wall_intensity``: lux grid (rows = Z, cols = Y).
+
+    ``supersample`` = k evaluates k×k points per cell and averages them, matching the tracer's
+    area integration at cone / shadow edges (cost ∝ k²).
+    """
     from lighting_simulator.simulation.room_geometry import wall_grid_cell_centers_cm
-    shape = (int(settings.grid_size), int(settings.grid_size))
-    pts = wall_grid_cell_centers_cm(shape, float(settings.wall_size), float(settings.wall_dist))
+    k = max(1, int(supersample))
+    g = int(settings.grid_size) * k
+    pts = wall_grid_cell_centers_cm((g, g), float(settings.wall_size), float(settings.wall_dist))
     normals = np.tile([-1.0, 0.0, 0.0], (pts.size // 3, 1))
     active = [led for led in leds if getattr(led, 'enabled', True)]
-    return direct_illuminance(pts.reshape(-1, 3), normals, active, emission, absorbers=absorbers,
-                              stl_mesh_data=stl_mesh_data).reshape(shape)
+    fine = direct_illuminance(pts.reshape(-1, 3), normals, active, emission, absorbers=absorbers,
+                              stl_mesh_data=stl_mesh_data).reshape(g, g)
+    return _block_mean(fine, k)
 
 
-def direct_room_intensity(leds, settings, emission, absorbers=(), stl_mesh_data=None):
+def direct_room_intensity(leds, settings, emission, absorbers=(), stl_mesh_data=None, supersample=1):
     """Analytic counterpart of ``room.compute_room_intensity`` (direct light only): ``(grids, wall_specs)``."""
     from lighting_simulator.raytracing.mesh import prepare_mesh_ray_accelerator
     from lighting_simulator.simulation.room_geometry import (
         WALL_INWARD_NORMALS, build_wall_specs, room_wall_cell_centers, wall_grid_shape,
     )
-    wall_specs = build_wall_specs(
-        settings.front_dist, settings.side_dist, settings.top_bottom_dist,
-        int(settings.grid_size), settings.led_x_center, settings.back_dist, settings.lateral_depth,
-    )
+    k = max(1, int(supersample))
+    args = (settings.front_dist, settings.side_dist, settings.top_bottom_dist)
+    wall_specs = build_wall_specs(*args, int(settings.grid_size), settings.led_x_center,
+                                  settings.back_dist, settings.lateral_depth)
+    fine_specs = build_wall_specs(*args, int(settings.grid_size) * k, settings.led_x_center,
+                                  settings.back_dist, settings.lateral_depth)
     active = [led for led in leds if getattr(led, 'enabled', True)]
     accel = prepare_mesh_ray_accelerator(stl_mesh_data) if stl_mesh_data is not None else None
     grids = {}
-    for name, spec in wall_specs.items():
-        pts = room_wall_cell_centers(name, spec, settings.front_dist, settings.side_dist,
-                                     settings.top_bottom_dist, settings.back_dist)
+    for name, spec in fine_specs.items():
+        pts = room_wall_cell_centers(name, spec, *args, settings.back_dist)
         shape = wall_grid_shape(spec, name)
         normals = np.tile(WALL_INWARD_NORMALS[name], (pts.size // 3, 1))
-        grids[name] = direct_illuminance(pts.reshape(-1, 3), normals, active, emission, absorbers=absorbers,
-                                         stl_mesh_data=stl_mesh_data, accel=accel).reshape(shape)
+        fine = direct_illuminance(pts.reshape(-1, 3), normals, active, emission, absorbers=absorbers,
+                                  stl_mesh_data=stl_mesh_data, accel=accel).reshape(shape)
+        grids[name] = _block_mean(fine, k)
     return grids, wall_specs

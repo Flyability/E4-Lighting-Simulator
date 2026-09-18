@@ -14,7 +14,7 @@ from lighting_simulator.raytracing.mesh import (
 )
 
 from . import gpu_backend
-from .emission import generate_led_rays, led_lumens, led_rng
+from .emission import emission_cone_deg, emission_weight_lut, generate_led_rays, led_lumens, led_rng
 from .room_geometry import (
     WALL_IDS,
     WALL_INWARD_NORMALS,
@@ -168,10 +168,6 @@ def compute_room_intensity(leds, settings: RoomSettings, emission: EmissionSetti
 
     if use_gpu is None:
         use_gpu = gpu_backend.gpu_available()
-    if use_gpu and any(getattr(l, 'beam_profile', None) is not None for l, _ in active):
-        if verbose:
-            print("  measured beam profiles present → CPU tracer (GPU kernels only model cosⁿ beams)")
-        use_gpu = False
 
     t0 = time.perf_counter()
     if use_gpu:
@@ -180,8 +176,8 @@ def compute_room_intensity(leds, settings: RoomSettings, emission: EmissionSetti
             leds_data.append({
                 'position': np.array(led.position, dtype=np.float32),
                 'direction': np.array(led.direction, dtype=np.float32),
-                'viewing_angle': float(led.viewing_angle),
-                'ext_lens_angle': getattr(led, 'ext_lens_angle', None),
+                'viewing_angle': emission_cone_deg(led),
+                'weight_lut': emission_weight_lut(led, emission.ray_uniformity),
             })
             per_led_lumens.append(led_lumens(led, emission.default_lumens))
         grid_shapes = {name: g.shape for name, g in grids.items()}
