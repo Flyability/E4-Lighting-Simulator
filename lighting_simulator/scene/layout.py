@@ -228,11 +228,31 @@ def load_platform(path) -> Platform:
     return Platform(**{k: v for k, v in d.items() if k != 'schema_version'})
 
 
+def _dumps(obj, indent=0):
+    """JSON with numeric vectors on one line (readable diffs for LED lists)."""
+    pad = " " * indent
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        items = [f'{pad}  {json.dumps(k)}: {_dumps(v, indent + 2)}' for k, v in obj.items()]
+        return "{\n" + ",\n".join(items) + f"\n{pad}}}"
+    if isinstance(obj, (list, tuple)):
+        if not obj:
+            return "[]"
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in obj):
+            return "[" + ", ".join(json.dumps(round(float(v), 6) if isinstance(v, float) else v) for v in obj) + "]"
+        items = [f"{pad}  {_dumps(v, indent + 2)}" for v in obj]
+        return "[\n" + ",\n".join(items) + f"\n{pad}]"
+    if isinstance(obj, float):
+        return json.dumps(round(obj, 6))
+    return json.dumps(obj)
+
+
 def save_json(obj, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
-        json.dump(obj.to_dict(), f, indent=2)
+        f.write(_dumps(obj.to_dict()))
         f.write("\n")
 
 
@@ -276,6 +296,85 @@ def build_leds_from_layout(layout: Layout, lumens=None):
     return leds
 
 
+# --------------------------------------------------------------------------- v2 → v1 runtime dict
+def panel_to_v1_group(panel: Panel, name=None):
+    """A panel as a v1 dynamic custom-group dict (rotation baked into the LED arrays)."""
+    R = panel.matrix()
+    n = len(panel.leds)
+    g = {
+        'enabled': panel.enabled, 'name': name or panel.name,
+        'position': list(panel.position), 'rotation_x': 0.0, 'rotation_y': 0.0, 'rotation_z': 0.0,
+        'is_dynamic': True, 'num_leds': n,
+        'led_positions': [[float(v) for v in R @ np.asarray(l.position, float)] for l in panel.leds],
+        'led_rotations': [[float(v) for v in R @ np.asarray(l.direction, float)] for l in panel.leds],
+        'led_row_directions': [[float(v) for v in R @ l.resolved_row_dir()] for l in panel.leds],
+        'led_sizes': [l.size for l in panel.leds],
+        'led_viewing_angles': [l.beam_angle for l in panel.leds],
+        'led_beam_tilts': [l.tilt for l in panel.leds],
+        'led_states': [l.on for l in panel.leds],
+        'led_roles': [l.role for l in panel.leds],
+        'led_rows': [list(r) for r in panel.rows] if panel.rows else [list(range(n))],
+        'led_euler_angles': [], 'led_lumens': [],
+        'lumens_override_enabled': False, 'lumens_value': 100,
+        'template_name': (panel.source or {}).get('template'),
+        'initial_pos': [0.0, 0.0, 0.0], 'initial_rot': [0, 0, 0], 'panel_slot': None, 'panel_slot_name': None,
+    }
+    if panel.source and panel.source.get('generator'):
+        g['generated_by'] = panel.source['generator']
+    return g
+
+
+def layout_to_v1(layout: Layout, platform: Platform | None = None, platforms_dir="platforms"):
+    """v1-style config dict (custom_groups / mirror_primary / stl_model / vio_cameras) for the
+    current UI runtime and the optimiser. The first mirrored panel becomes ``mirror_primary``;
+    further mirrored panels get an explicit mirrored twin group."""
+    from lighting_simulator.domain.mirroring import mirror_group_config_xz
+
+    groups, primary = [], None
+    for panel in layout.panels:
+        g = panel_to_v1_group(panel)
+        idx = len(groups)
+        groups.append(g)
+        if panel.mirror:
+            if primary is None:
+                primary = {'kind': 'custom_group', 'key': idx}
+            else:
+                m = mirror_group_config_xz(g)
+                m['name'] = f"{panel.name}_mirror"
+                m.pop('owner', None)
+                m['mirror_twin_of'] = idx  # lets convert_v1 fold it back into panel.mirror
+                groups.append(m)
+    cfg = {
+        'schema_version': 1, 'name': layout.name, 'description': layout.description,
+        'custom_groups': groups, 'individual_leds': [], 'mirror_primary': primary,
+        'global_rotation_z': 0, 'global_pos_x': 0.0, 'global_pos_y': 0.0, 'global_pos_z': 0.0,
+        'flux': asdict(layout.flux), 'stl_model': None,
+        'vio_cameras': asdict(VioCameras()),
+    }
+    try:
+        plat = platform if platform is not None else layout.resolve_platform(platforms_dir)
+    except FileNotFoundError:
+        print(f"[layout] platform '{layout.platform}' not found in {platforms_dir}/: using defaults")
+        plat = Platform()
+    cfg['platform_name'] = layout.platform if isinstance(layout.platform, str) else None
+    if plat.stl is not None:
+        s = plat.stl
+        cfg['stl_model'] = {'file_path': s.file, 'absorber_enable': s.occludes, 'visible': True, 'scale': s.scale,
+                            'position': list(s.position), 'rotation': list(s.rotation), 'opacity': s.opacity,
+                            'wireframe': s.wireframe}
+    cfg['vio_cameras'] = {**asdict(plat.vio_cameras), 'show': True, 'fill': False}
+    return cfg
+
+
+def to_v1_config(cfg_or_layout, platforms_dir="platforms"):
+    """Any config (v1 dict, v2 dict or Layout) as a v1 runtime dict."""
+    if isinstance(cfg_or_layout, Layout):
+        return layout_to_v1(cfg_or_layout, platforms_dir=platforms_dir)
+    if is_v2(cfg_or_layout):
+        return layout_to_v1(layout_from_dict(cfg_or_layout), platforms_dir=platforms_dir)
+    return cfg_or_layout
+
+
 # --------------------------------------------------------------------------- v1 conversion
 def _v1_group_to_panel(g, index, mirror, global_R, global_offset):
     """A v1 custom group → panel with panel-local LEDs (world geometry reproduced exactly)."""
@@ -283,7 +382,7 @@ def _v1_group_to_panel(g, index, mirror, global_R, global_offset):
     from lighting_simulator.scene.builder import euler_applies, group_runtime_state
 
     if not g.get('is_dynamic', False):
-        raise ValueError(f"custom group {index}: non-dynamic (Elios-3 template) groups are not supported in v2")
+        return _v1_standard_group_to_panel(g, index, mirror, global_R, global_offset)
     positions, directions, row_dirs = dynamic_group_world_geometry(group_runtime_state(g))
     rot = (g.get('rotation_x', 0.0), g.get('rotation_y', 0.0), g.get('rotation_z', 0.0)) if euler_applies(g) else (0, 0, 0)
     R = global_R @ euler_xyz_matrix(*rot)
@@ -315,6 +414,28 @@ def _v1_group_to_panel(g, index, mirror, global_R, global_offset):
     name = g.get('name') or g.get('panel_slot_name') or g.get('template_name') or f"panel{index}"
     return Panel(name=str(name), leds=leds, enabled=bool(g.get('enabled', True)), mirror=mirror,
                  position=p0, rotation=(roll, pitch, yaw), rows=g.get('led_rows'), source=src or None)
+
+
+def _v1_standard_group_to_panel(g, index, mirror, global_R, global_offset):
+    """A v1 non-dynamic (Elios-3 12-LED template) group → panel with its generated LEDs baked in."""
+    from lighting_simulator.domain.led_factory import _create_standard_group_leds
+    from lighting_simulator.scene.builder import group_config_to_factory
+
+    cfg = dict(group_config_to_factory(g))
+    cfg['enabled'] = True
+    placements = _create_standard_group_leds(cfg, 120.0, 100.0, 0)
+    p0 = global_R @ np.asarray(g.get('position', (0, 0, 0)), float) + global_offset
+    yaw = float(np.degrees(np.arctan2(global_R[1, 0], global_R[0, 0])))
+    leds = []
+    for p in placements:
+        leds.append(LedSpec(position=np.asarray(p.position, float) - np.asarray(g.get('position', (0, 0, 0)), float),
+                            direction=np.asarray(p.direction, float), row_dir=np.asarray(p.row_direction, float),
+                            beam_angle=p.viewing_angle, size=p.width, on=p.enabled, role=p.role))
+    # LED vectors are in the pre-global frame; the global yaw becomes the panel rotation
+    name = g.get('name') or g.get('panel_slot_name') or g.get('template_name') or f"panel{index}"
+    return Panel(name=str(name), leds=leds, enabled=bool(g.get('enabled', True)), mirror=mirror,
+                 position=p0, rotation=(0.0, 0.0, yaw), rows=[[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]],
+                 source={'template': 'elios3_12led'})
 
 
 def _v1_individual_to_panel(cfg, index, global_R, global_offset):
@@ -349,19 +470,25 @@ def convert_v1(cfg, default_lumens=168.0) -> Layout:
     mp = cfg.get('mirror_primary')
     primary = (mp['kind'], int(mp['key'])) if isinstance(mp, dict) and 'kind' in mp else None
 
+    groups = cfg.get('custom_groups', [])
+    twins = {int(g['mirror_twin_of']) for g in groups if g.get('mirror_twin_of') is not None}
     panels = []
-    for i, g in enumerate(cfg.get('custom_groups', [])):
+    for i, g in enumerate(groups):
+        if g.get('mirror_twin_of') is not None:
+            continue
         slot = g.get('panel_slot')
         owner = ('slot', slot) if slot is not None else ('custom_group', i)
         if g.get('lumens_override_enabled'):
             print(f"[layout] custom group {i}: lumens override {g.get('lumens_value')} lm dropped (flux is per mode now)")
-        panels.append(_v1_group_to_panel(g, i, owner == primary, global_R, global_offset))
+        panels.append(_v1_group_to_panel(g, i, owner == primary or i in twins, global_R, global_offset))
     for i, l in enumerate(cfg.get('individual_leds', [])):
         panels.append(_v1_individual_to_panel(l, i, global_R, global_offset))
 
     stl = cfg.get('stl_model') or None
     platform = None
-    if (stl and stl.get('file_path')) or cfg.get('vio_cameras'):
+    if cfg.get('platform_name'):
+        platform = str(cfg['platform_name'])
+    elif (stl and stl.get('file_path')) or cfg.get('vio_cameras'):
         vio = dict(cfg.get('vio_cameras') or {})
         vio.pop('show', None); vio.pop('fill', None)
         platform = Platform(
@@ -372,5 +499,6 @@ def convert_v1(cfg, default_lumens=168.0) -> Layout:
             if stl and stl.get('file_path') else None,
             vio_cameras=VioCameras(**vio) if vio else VioCameras(),
         )
+    flux = Flux(**cfg['flux']) if isinstance(cfg.get('flux'), dict) else Flux(vio_lumens=default_lumens)
     return Layout(name=str(cfg.get('name') or ''), description=str(cfg.get('description') or ''),
-                  platform=platform, flux=Flux(vio_lumens=default_lumens), panels=panels)
+                  platform=platform, flux=flux, panels=panels)

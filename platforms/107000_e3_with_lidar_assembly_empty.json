@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "name": "107000_e3_with_lidar_assembly_empty",
+  "stl": {
+    "file": "C:\\Users\\deskt\\Downloads\\107000 E3 WITH LIDAR ASSEMBLY EMPTY.STL",
+    "scale": 0.1,
+    "position": [0.0, 0.0, 0.0],
+    "rotation": [0.0, 0.0, 0.0],
+    "occludes": true,
+    "opacity": 0.8,
+    "wireframe": false
+  },
+  "vio_cameras": {
+    "position": [10.0, 0.0, 0.0],
+    "cam1_pitch": 45.0,
+    "cam1_yaw": 0.0,
+    "cam2_pitch": -45.0,
+    "cam2_yaw": 0.0,
+    "long_fov": 170.0,
+    "landscape": true
+  }
+}

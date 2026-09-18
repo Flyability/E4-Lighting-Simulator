@@ -19,14 +19,30 @@ python -m pytest tests           # engine regression tests
 |---|---|
 | `domain/` | `LED`, `LEDPlacement`, `create_leds` factory, optics (Lambertian/lens), geometry, panel guides, XZ mirroring |
 | `camera/` | Main pinhole camera and VD66GY fisheye VIO FOV geometry |
-| `raytracing/` | Intersection kernels: absorber boxes, STL meshes (trimesh BVH), GPU (CuPy/Taichi) |
+| `raytracing/` | Intersection kernels: box occluders, STL meshes (trimesh BVH), GPU (CuPy/Taichi) |
 | `simulation/` | The engine: `compute_wall_intensity`, `compute_room_intensity`, ray emission, room geometry, `WallSettings`/`RoomSettings`/`EmissionSettings` |
-| `scene/` | Saved config (`configs/*.json`) → LEDs, absorbers, STL occluder (`build_scene_from_config`) |
+| `scene/` | Layout / platform files (`layouts/*.json`, `platforms/*.json`, schema v2 in `scene/layout.py`) → LEDs + STL occluder (`build_scene_from_config`, `build_scene_from_layout`); `convert_v1` upgrades pre-v2 configs |
 | `analysis/` | `uniformity_metrics` (U0, U1, CV, ΔEV) and legend HTML |
 | `pipeline.py` | Headless facade: `simulate_wall(cfg, settings)` / `simulate_room(...)` → grid + metrics |
 | `ui/app.py` | The Viser GUI (`main`). Only this module imports Viser |
 
 Everything below `ui/` is UI-free and importable without Viser.
+
+## Files: layouts and platforms
+
+A **layout** (`layouts/<name>.json`) is the lighting design: `flux` (`vio_lumens` for the
+flight mode, `flash_lumens` for the pulse) and a list of `panels`, each with a `position` /
+`rotation` (extrinsic X-Y-Z, degrees) and its LEDs in panel-local coordinates (`position`,
+`direction` = square normal, `row_dir`, `beam_angle`, `tilt` about `row_dir`, `size`, `on`,
+`role` = `vio | flash | both`). `mirror: true` builds the XZ-mirrored (left/right) twin at load
+time, so a symmetric rig stores one half. Units cm; +X forward, +Y left, +Z up.
+
+A **platform** (`platforms/<name>.json`) is the drone: the CAD frame (`stl`: file, scale,
+pose, `occludes`) and the VIO camera poses. A layout links to one by name (`"platform":
+"harmony_e4"`) or embeds it inline. Camera FOV, wall distance, grid and rays are session
+settings, not part of either file. Pre-v2 configs are converted on load;
+`scripts/convert_configs_v2.py` batch-converts a folder (the old files live in
+`tests/data/v1_configs/` as fixtures).
 
 ## Headless example (basis for optimisation loops)
 
@@ -35,7 +51,7 @@ from lighting_simulator.pipeline import simulate_wall
 from lighting_simulator.scene import load_config
 from lighting_simulator.simulation import WallSettings
 
-cfg = load_config("configs/elios3.json")
+cfg = load_config("layouts/Elios3.json")
 settings = WallSettings(wall_dist=100, grid_size=50, wall_size=80, rays_per_pixel=4)
 
 def objective(cfg):
@@ -77,8 +93,8 @@ Variable groups (`type`):
 - `beam_angle` — shared viewing angle of a group.
 - `beam_tilts` — per-LED beam tilt inside a dynamic group.
 
-Output goes to `exports/optim/<name>/` (git-ignored): `best_config.json` (copy to
-`configs/` and open it in the UI via *Load Configuration*), `best2_config.json`,
+Output goes to `exports/optim/<name>/` (git-ignored): `best_config.json` (load it in the UI
+via *Load Configuration* or save it to `layouts/` from the Optimize tab), `best2_config.json`,
 `initial_config.json`, `history.csv`, `summary.json` and `report.pdf`.
 Ray sampling is random Monte Carlo; the optimiser re-checks every new best with a
 fresh sample and the report re-evaluates the top designs with 4× the rays before

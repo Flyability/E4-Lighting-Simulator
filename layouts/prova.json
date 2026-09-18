@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "name": "prova",
+  "description": "",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "led0",
+      "leds": [
+        {
+          "position": [0.0, 0.0, 0.0],
+          "direction": [1.0, 0.0, 0.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": null,
+      "source": null
+    }
+  ]
+}

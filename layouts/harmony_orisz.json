@@ -1,0 +1,556 @@
+{
+  "schema_version": 2,
+  "name": "Harmony_orisZ",
+  "description": "",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "Front -",
+      "leds": [
+        {
+          "position": [-0.22874, -0.100886, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.91496, -0.403545, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.094096, -0.832854, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.91496, -0.403545, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.551576, 0.631081, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.91496, -0.403545, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.51409, -0.546088, 0.4],
+          "direction": [0.935196, 0.038661, 0.352015],
+          "row_dir": [0.199572, 0.763605, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.22874, 0.100886, 0.4],
+          "direction": [0.792378, 0.34948, 0.5],
+          "row_dir": [0.45748, 0.201773, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.05661, 0.747861, 0.4],
+          "direction": [0.659154, 0.664531, 0.352015],
+          "row_dir": [-0.278692, 0.650634, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.51409, -0.546088, -0.4],
+          "direction": [0.935196, 0.038661, -0.352015],
+          "row_dir": [-0.292541, 0.644526, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.22874, 0.100886, -0.4],
+          "direction": [0.792378, 0.34948, -0.5],
+          "row_dir": [-0.45748, -0.201773, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.05661, 0.747861, -0.4],
+          "direction": [0.659154, 0.664531, -0.352015],
+          "row_dir": [-0.69846, 0.367525, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.22874, -0.100886, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.91496, 0.403545, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.094096, -0.832854, -1.0],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.91496, 0.403545, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.551576, 0.631081, -1.0],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.91496, 0.403545, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [18.03, 7.97, -0.9],
+      "rotation": [1.0, 0.0, -7.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11]
+      ],
+      "source": null
+    },
+    {
+      "name": "Side -",
+      "leds": [
+        {
+          "position": [-0.197003, -0.153915, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.788011, -0.615661, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.295526, -0.784324, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.788011, -0.615661, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.689532, 0.476493, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.788011, -0.615661, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.632341, -0.403292, 0.4],
+          "direction": [0.897137, 0.26689, 0.352015],
+          "row_dir": [0.006156, 0.789229, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.197003, 0.153915, 0.4],
+          "direction": [0.682437, 0.533178, 0.5],
+          "row_dir": [0.394005, 0.307831, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.238336, 0.711123, 0.4],
+          "direction": [0.476, 0.805922, 0.352015],
+          "row_dir": [-0.429782, 0.562388, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.632341, -0.403292, -0.4],
+          "direction": [0.897137, 0.26689, -0.352015],
+          "row_dir": [-0.441709, 0.55307, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.197003, 0.153915, -0.4],
+          "direction": [0.682437, 0.533178, -0.5],
+          "row_dir": [-0.394005, -0.307831, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.238336, 0.711123, -0.4],
+          "direction": [0.476, 0.805922, -0.352015],
+          "row_dir": [-0.767275, 0.184958, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.197003, -0.153915, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.788011, 0.615661, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.295526, -0.784324, -1.0],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.788011, 0.615661, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.689532, 0.476493, -1.0],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.788011, 0.615661, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [16.07, 12.57, -0.9],
+      "rotation": [0.0, 0.0, 3.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11]
+      ],
+      "source": null
+    },
+    {
+      "name": "Side +",
+      "leds": [
+        {
+          "position": [-0.196464, 0.154602, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.785857, 0.618408, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.691191, -0.474083, 1.0],
+          "direction": [0.0, -0.0, 1.0],
+          "row_dir": [-0.785857, 0.618408, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.298262, 0.783288, 1.0],
+          "direction": [0.0, -0.0, 1.0],
+          "row_dir": [-0.785857, 0.618408, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.240817, -0.710287, 0.4],
+          "direction": [0.473184, -0.807578, 0.352015],
+          "row_dir": [0.767916, 0.182279, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.196464, -0.154602, 0.4],
+          "direction": [0.680572, -0.535557, 0.5],
+          "row_dir": [0.392928, -0.309204, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.633745, 0.401083, 0.4],
+          "direction": [0.8962, -0.27002, 0.352015],
+          "row_dir": [0.443637, 0.551525, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.240817, -0.710287, -0.4],
+          "direction": [0.473184, -0.807578, -0.352015],
+          "row_dir": [0.431743, 0.560885, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.196464, -0.154602, -0.4],
+          "direction": [0.680572, -0.535557, -0.5],
+          "row_dir": [-0.392928, 0.309204, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.633745, 0.401083, -0.4],
+          "direction": [0.8962, -0.27002, -0.352015],
+          "row_dir": [-0.003401, 0.789246, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.196464, 0.154602, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.785857, -0.618408, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.691191, -0.474083, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.785857, -0.618408, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.298262, 0.783288, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.785857, -0.618408, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [16.07, -12.63, -0.82],
+      "rotation": [0.0, 0.0, -3.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11]
+      ],
+      "source": null
+    },
+    {
+      "name": "Front +",
+      "leds": [
+        {
+          "position": [-0.228916, 0.100487, 1.0],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-0.915663, 0.401948, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.550474, -0.632043, 1.0],
+          "direction": [0.0, -0.0, 1.0],
+          "row_dir": [-0.915663, 0.401948, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.092643, 0.833017, 1.0],
+          "direction": [0.0, -0.0, 1.0],
+          "row_dir": [-0.915663, 0.401948, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.055304, -0.747958, 0.4],
+          "direction": [0.660313, -0.663379, 0.352015],
+          "row_dir": [0.697817, 0.368744, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.228916, -0.100487, 0.4],
+          "direction": [0.792987, -0.348097, 0.5],
+          "row_dir": [0.457831, -0.200974, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.513136, 0.546984, 0.4],
+          "direction": [0.935262, -0.037029, 0.352015],
+          "row_dir": [0.291416, 0.645035, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.055304, -0.747958, -0.4],
+          "direction": [0.660313, -0.663379, -0.352015],
+          "row_dir": [0.277556, 0.651119, -0.706404],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.228916, -0.100487, -0.4],
+          "direction": [0.792987, -0.348097, -0.5],
+          "row_dir": [-0.457831, 0.200974, -0.866025],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.513136, 0.546984, -0.4],
+          "direction": [0.935262, -0.037029, -0.352015],
+          "row_dir": [-0.200905, 0.763255, -0.614068],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.228916, 0.100487, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.915663, -0.401948, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.550474, -0.632043, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.915663, -0.401948, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.092643, 0.833017, -1.0],
+          "direction": [0.0, -0.0, -1.0],
+          "row_dir": [0.915663, -0.401948, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [18.06, -7.92, -0.9],
+      "rotation": [0.0, 0.0, 11.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11]
+      ],
+      "source": null
+    }
+  ]
+}

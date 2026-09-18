@@ -9,7 +9,7 @@ Example::
     from lighting_simulator.scene import load_config
     from lighting_simulator.simulation import WallSettings
 
-    result = simulate_wall(load_config("configs/elios3.json"),
+    result = simulate_wall(load_config("layouts/Elios3.json"),
                            WallSettings(wall_dist=100, grid_size=50, rays_per_pixel=2))
     print(result.metrics.u0)
 """

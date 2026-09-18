@@ -37,7 +37,7 @@ def test_duct_led_pose_lies_on_cylinder_and_points_outward():
 
 
 def test_duct_ring_arc_generates_lattice_and_mirror():
-    cfg = load_config("configs/elios3.json")
+    cfg = load_config("tests/data/v1_configs/elios3.json")
     var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=6, n_rows=2,
                          placement="arc", beam_angle_range=(80, 130), optimize_enabled=True, mirror_xz=True)
     assert var.size == 4 + 1 + 1 + 6  # theta_c, span, axial_c, pitch | tilt | beam | 6 on-flags
@@ -91,7 +91,7 @@ def test_duct_panel_pose_slides_existing_layout_over_the_duct():
     """x0 reproduces the scene exactly; a theta step is a rigid rotation about the duct axis."""
     from lighting_simulator.optimization import DuctPanelPose
     from lighting_simulator.scene.builder import group_config_to_factory
-    cfg = load_config("configs/ludos_panels_n4.json")
+    cfg = load_config("tests/data/v1_configs/ludos_panels_n4.json")
     gi = 0
     duct = Duct(center=(6.3, 12.0, 0.0), axis=(0, 0, 1), radius=8.5, mount_offset=0.0)
     var = DuctPanelPose(group_index=gi, duct=duct, theta_range=(-30, 30), axial_range=(-2, 2),
@@ -144,7 +144,7 @@ def test_duct_panel_pose_slides_existing_layout_over_the_duct():
 
 
 def test_panel_pose_and_led_states_modify_base_groups():
-    cfg = load_config("configs/Elios3.json")
+    cfg = load_config("tests/data/v1_configs/Elios3.json")
     pose = PanelPose(group_index=0, pos_delta=(1, 0, 1), rot_delta=(0, 0, 5))
     states = LedStates(group_index=1).bind(cfg)
     problem = Problem(cfg, [pose, states], WALL, CAM)
@@ -166,7 +166,7 @@ def test_panel_pose_and_led_states_modify_base_groups():
 
 
 def test_evaluate_scores_and_penalties():
-    cfg = load_config("configs/elios3.json")
+    cfg = load_config("tests/data/v1_configs/elios3.json")
     var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=4, placement="arc",
                          tilt_axial_range=None)
     problem = Problem(cfg, [var], WALL, CAM, clear_base=True,
@@ -181,7 +181,7 @@ def test_evaluate_scores_and_penalties():
 
 def test_lumens_only_modes_without_electrical_model():
     """Default: fluxes come from the modes in lumens; no driver / current bookkeeping."""
-    cfg = load_config("configs/elios3.json")
+    cfg = load_config("tests/data/v1_configs/elios3.json")
     var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=4, placement="arc",
                          tilt_axial_range=None, lumens=250.0)
     assert not any("current" in n for n in var.names)
@@ -234,7 +234,7 @@ def test_run_methods_produce_outputs(tmp_path, method):
 
 
 def test_duct_center_delta_shifts_all_leds():
-    cfg = load_config("configs/elios3.json")
+    cfg = load_config("tests/data/v1_configs/elios3.json")
     var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=4, placement="arc",
                          tilt_axial_range=None, center_delta=(2.0, 0.0, 1.0))
     assert var.names[-2:] == ["d.dcx", "d.dcz"]
@@ -247,7 +247,7 @@ def test_duct_center_delta_shifts_all_leds():
 
 
 def test_wall_size_per_distance_and_auto_fit():
-    cfg = load_config("configs/elios3.json")
+    cfg = load_config("tests/data/v1_configs/elios3.json")
     var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=2, placement="arc",
                          tilt_axial_range=None)
     p = Problem(cfg, [var], WALL, CAM, clear_base=True, wall_dists=[50, 100, 200], wall_sizes="auto")

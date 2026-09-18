@@ -117,7 +117,7 @@ assert n_groups() < g_after_slots
 # 4. save project + template, reload project
 import atexit
 atexit.register(lambda: [os.path.exists(p) and os.remove(p) for p in
-                         ("configs/smoke_panels_tmp.json", "custom_groups_templates/smoke_tpl_tmp.json")])
+                         ("layouts/smoke_panels_tmp.json", "custom_groups_templates/smoke_tpl_tmp.json")])
 find("Project Name").value = "smoke_panels_tmp"
 find("Save As").value = "Full Configuration"
 click("💾 Save Project")
@@ -125,7 +125,7 @@ find("Project Name").value = "smoke_tpl_tmp"
 find("Save As").value = "Custom Group Template"
 click("💾 Save Project")
 time.sleep(0.3)
-assert os.path.exists("configs/smoke_panels_tmp.json"), "project not saved"
+assert os.path.exists("layouts/smoke_panels_tmp.json"), "project not saved"
 assert os.path.exists("custom_groups_templates/smoke_tpl_tmp.json"), "template not saved"
 before = (n_groups(), n_leds())
 click("🆕 New Project (Empty)")
@@ -136,9 +136,13 @@ click("📂 Load Configuration")
 time.sleep(1)
 after = (n_groups(), n_leds())
 print(f"[smoke] save/reload round trip: {before} -> {after}")
-# Template-sourced individual LEDs are saved as a template reference and come back as one
-# solid group, so groups go up by one per such template while standalone LEDs are kept.
-assert after[0] == before[0] + 1 and after[1] == 12, "round trip changed the scene unexpectedly"
+# Schema v2 has no individual LEDs: template-sourced ones come back as one panel, standalone
+# ones as one-LED panels, so every LED is still there but all of them live in groups now.
+import json as _json
+_lay = _json.load(open("layouts/smoke_panels_tmp.json"))
+assert _lay["schema_version"] == 2 and after[1] == 0, "round trip changed the scene unexpectedly"
+assert sum(len(p["leds"]) for p in _lay["panels"]) == 12 * before[0] + before[1], "LED count changed on save"
+assert after[0] == len(_lay["panels"]), "not every panel came back"
 
 # 5. wall map still works with this scene
 find("Show intensity on wall").value = True

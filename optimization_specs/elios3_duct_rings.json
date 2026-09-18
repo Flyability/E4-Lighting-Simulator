@@ -1,6 +1,6 @@
 {
   "name": "elios3_duct_rings",
-  "base_config": "configs/elios3.json",
+  "base_config": "layouts/Elios3.json",
   "clear_base": true,
 
   "wall":     { "wall_dist": 50, "grid_size": 30, "wall_size": 250, "rays_per_pixel": 300 },

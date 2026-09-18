@@ -146,7 +146,7 @@ def build(ctx):
     update_stl_mesh = ctx.update_stl_mesh
     update_ui_visibility = ctx.update_ui_visibility
     view_mode_dropdown = ctx.view_mode_dropdown
-    flash_current_input = ctx.flash_current_input
+    flash_lumens_input = ctx.flash_lumens_input
     led_voltage_input = ctx.led_voltage_input
     led_efficacy_input = ctx.led_efficacy_input
     vio_cam1_pitch = ctx.vio_cam1_pitch
@@ -2222,7 +2222,7 @@ def build(ctx):
             )
 
     view_mode_dropdown.on_update(on_view_mode_change)
-    flash_current_input.on_update(on_view_mode_change)
+    flash_lumens_input.on_update(on_view_mode_change)
     led_voltage_input.on_update(on_view_mode_change)
     led_efficacy_input.on_update(on_view_mode_change)
     

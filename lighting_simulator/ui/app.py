@@ -82,6 +82,9 @@ from lighting_simulator.ui import config_io as _config_io
 from lighting_simulator.ui import panels as _panels
 from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
 from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
+from lighting_simulator.scene.layout import (
+    Layout, Platform, convert_v1, layout_to_v1, load_layout, load_platform, save_json,
+)
 from lighting_simulator.scene.step_import import STEP_MM_TO_CM, is_step_file, load_step_mesh
 from lighting_simulator.scene.stl import (
     _rot4_x, _rot4_y, _rot4_z,
@@ -155,16 +158,18 @@ def main():
     # Prefer the launch directory (so a bundled exe finds its data next to it);
     # otherwise fall back to the project root so it works from any cwd.
     _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    config_dir = "configs" if os.path.isdir("configs") else os.path.join(_project_root, "configs")
-    custom_groups_templates_dir = (
-        "custom_groups_templates" if os.path.isdir("custom_groups_templates")
-        else os.path.join(_project_root, "custom_groups_templates")
-    )
-    if not os.path.exists(config_dir):
-        os.makedirs(config_dir)
-    if not os.path.exists(custom_groups_templates_dir):
-        os.makedirs(custom_groups_templates_dir)
-    print(f"  📁  Configs: {os.path.abspath(config_dir)}")
+
+    def _data_dir(name):
+        return name if os.path.isdir(name) else os.path.join(_project_root, name)
+
+    config_dir = _data_dir("layouts")          # schema-v2 layouts (legacy configs/*.json still load)
+    platforms_dir = _data_dir("platforms")
+    legacy_config_dir = _data_dir("configs")
+    custom_groups_templates_dir = _data_dir("custom_groups_templates")
+    for _d in (config_dir, platforms_dir, custom_groups_templates_dir):
+        os.makedirs(_d, exist_ok=True)
+    print(f"  📁  Layouts: {os.path.abspath(config_dir)}   platforms: {os.path.abspath(platforms_dir)}")
+    current_platform_name = [None]  # platform file the loaded layout links to (None = inline)
 
     # Flag to track if a project is loaded
     project_loaded = [False]  # Use list for mutability in nested functions
@@ -236,7 +241,7 @@ def main():
         _select_panel_impl[0](owner)
 
     def flash_lumens():
-        return float(flash_current_input.value) * float(led_voltage_input.value) * float(led_efficacy_input.value)
+        return float(flash_lumens_input.value)
 
     def apply_view_mode(leds):
         """Apply the selected operating mode (LED roles) to freshly built LEDs, in place."""
@@ -273,8 +278,15 @@ def main():
         server.gui.add_html("<hr style='margin:8px 0;'>")
         
         def get_available_configs():
-            files = [f for f in os.listdir(config_dir) if f.lower().endswith(".json")]
-            return sorted((f[:-5] for f in files), key=str.lower)
+            names = {f[:-5] for f in os.listdir(config_dir) if f.lower().endswith(".json")}
+            if os.path.isdir(legacy_config_dir) and os.path.abspath(legacy_config_dir) != os.path.abspath(config_dir):
+                names |= {f"{f[:-5]} (legacy)" for f in os.listdir(legacy_config_dir) if f.lower().endswith(".json")}
+            return sorted(names, key=str.lower)
+
+        def _config_path(name):
+            if name.endswith(" (legacy)"):
+                return os.path.join(legacy_config_dir, f"{name[:-9]}.json")
+            return os.path.join(config_dir, f"{name}.json")
 
         config_dropdown = server.gui.add_dropdown(
             "Select Configuration",
@@ -313,19 +325,36 @@ def main():
             if not name:
                 print("Error: Please select a configuration to load.")
                 return
-            path = os.path.join(config_dir, f"{name}.json")
+            path = _config_path(name)
             if os.path.exists(path):
-                with open(path, "r") as f:
-                    cfg = json.load(f)
-                    num_custom = len(cfg.get("custom_groups", []))
-                    print(f"Loading configuration: {name} ({num_custom} custom groups)")
-                    current_config_name[0] = name
-                    project_loaded[0] = True
-                    apply_config(cfg)
-                # Set the loaded config name in the save field for easy re-saving
-                save_name_input.value = name
-                print(f"✓ Configuration loaded: {name}")
-                print(f"  💡 Modify and click 'Save Project' to update the configuration")
+                load_layout_file(path)
+                save_name_input.value = name.replace(" (legacy)", "")
+                print(f"  💡 Modify and click 'Save Project' to update the layout")
+
+        def load_layout_file(path):
+            """Load a v2 layout (or legacy v1 config) file into the scene."""
+            lay = load_layout(path, default_lumens=float(led_lumens_slider.value))
+            print(f"Loading layout: {lay.name} ({len(lay.panels)} panel(s), "
+                  f"{sum(1 for p in lay.panels if p.mirror)} mirrored)")
+            current_config_name[0] = lay.name or os.path.splitext(os.path.basename(path))[0]
+            project_loaded[0] = True
+            apply_config(layout_to_v1(lay, platforms_dir=platforms_dir))
+            current_platform_name[0] = lay.platform if isinstance(lay.platform, str) else None
+            _sync_platform_dropdown()
+            led_lumens_slider.value = int(round(lay.flux.vio_lumens))
+            if lay.flux.flash_lumens:
+                flash_lumens_input.value = float(lay.flux.flash_lumens)
+            print(f"✓ Layout loaded: {lay.name}")
+
+        def current_layout(name=None):
+            """The scene as a v2 Layout (flux from the Display tab, platform link if one is selected)."""
+            lay = convert_v1(get_current_config(), default_lumens=float(led_lumens_slider.value))
+            lay.flux.flash_lumens = float(flash_lumens_input.value)
+            if current_platform_name[0]:
+                lay.platform = current_platform_name[0]
+            if name:
+                lay.name = name
+            return lay
 
         @save_project_btn.on_click
         def _(_):
@@ -338,16 +367,10 @@ def main():
             save_type = save_type_dropdown.value
             
             if save_type == "Full Configuration":
-                # Save complete configuration
-                cfg = get_current_config()
-                cfg["name"] = name
-                
                 path = os.path.join(config_dir, f"{name.lower().replace(' ', '_')}.json")
-                with open(path, "w") as f:
-                    json.dump(cfg, f, indent=4, default=_json_default)
-                
-                print(f"✓ Configuration saved: {name}")
-                # Refresh dropdown options
+                save_json(current_layout(name), path)
+                current_config_name[0] = name
+                print(f"✓ Layout saved: {path}")
                 config_dropdown.options = get_available_configs()
             else:
                 # Save as custom group template - save groups separately
@@ -519,31 +542,40 @@ def main():
             "Focus factor (0=Standard, 1=3x focused)", min=0.0, max=1.0, step=0.05, initial_value=0.0
         )
         led_lumens_slider = server.gui.add_slider(
-            "LED lumens (lm/LED)", min=10, max=1000, step=10, initial_value=168,
-            hint="Continuous flux used in the 'Flight' operating mode (VIO + Both LEDs). "
-                 "Panels / LEDs with a lumens override use their own value instead.",
+            "Flight / VIO flux (lm/LED)", min=10, max=1000, step=1, initial_value=168,
+            hint="Continuous flux of every LED in the 'Flight' operating mode (VIO + Both LEDs). "
+                 "Saved in the layout as flux.vio_lumens.",
         )
-        server.gui.add_html("<hr style='margin:8px 0;'><b>Electrical (roles / flash):</b>")
+        flash_lumens_input = server.gui.add_number(
+            "Flash flux (lm/LED)", 14040.0, min=1.0, max=1000000.0, step=100.0,
+            hint="Pulse flux of Flash / Both LEDs in the 'Flash' operating mode. Saved as flux.flash_lumens.",
+        )
+        server.gui.add_html("<hr style='margin:8px 0;'><b>Electrical helper (optional):</b>"
+                            "<div style='color:#888;font-size:11px;'>Sets the flash flux from a current: "
+                            "lm = I · V · efficacy.</div>")
         led_voltage_input = server.gui.add_number("LED forward voltage (V)", 6.0, min=1.0, max=60.0, step=0.1)
         led_efficacy_input = server.gui.add_number("Efficacy (lm/W)", 180.0, min=10.0, max=400.0, step=5.0)
-        flash_current_input = server.gui.add_number(
-            "Flash current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1,
-            hint="Used by the 'Flash (pulse)' operating mode: lm = I · V · efficacy for Flash / Both LEDs",
-        )
+        flash_current_input = server.gui.add_number("Flash current per LED (A)", 13.0, min=0.1, max=50.0, step=0.1)
+        apply_flash_current_btn = server.gui.add_button("→ Set flash flux from current")
+
+        @apply_flash_current_btn.on_click
+        def _(_):
+            flash_lumens_input.value = (float(flash_current_input.value) * float(led_voltage_input.value)
+                                        * float(led_efficacy_input.value))
 
         def _refresh_mode_lumens_html(_=None):
-            v, eff, i_fl = float(led_voltage_input.value), float(led_efficacy_input.value), float(flash_current_input.value)
+            v, eff = float(led_voltage_input.value), float(led_efficacy_input.value)
             lm_cont = float(led_lumens_slider.value)
             i_cont = lm_cont / (v * eff) if v * eff > 0 else 0.0
+            i_fl = flash_lumens() / (v * eff) if v * eff > 0 else 0.0
             mode_lumens_html.content = (
                 "<div style='font-size:11px;color:#bbb;margin:-2px 0 6px;line-height:1.5;'>"
-                f"<b>Flight</b> (VIO + Both): <b>{lm_cont:,.0f} lm</b>/LED ≈ {i_cont:.2f} A continuous "
-                "<span style='color:#888;'>(Display → LED lumens; panel / LED overrides win)</span><br>"
-                f"<b>Flash</b> (Flash + Both): <b>{flash_lumens():,.0f} lm</b>/LED = {i_fl:g} A × {v:g} V × {eff:g} lm/W "
-                "<span style='color:#888;'>(Display → Electrical); VIO LEDs stay at their flight flux</span></div>"
+                f"<b>Flight</b> (VIO + Both): <b>{lm_cont:,.0f} lm</b>/LED (≈ {i_cont:.2f} A at {v:g} V, {eff:g} lm/W)<br>"
+                f"<b>Flash</b> (Flash + Both): <b>{flash_lumens():,.0f} lm</b>/LED (≈ {i_fl:.1f} A); "
+                "VIO LEDs stay at their flight flux</div>"
             )
 
-        for _h in (led_lumens_slider, led_voltage_input, led_efficacy_input, flash_current_input):
+        for _h in (led_lumens_slider, led_voltage_input, led_efficacy_input, flash_lumens_input):
             _h.on_update(_refresh_mode_lumens_html)
         _refresh_mode_lumens_html()
         
@@ -611,19 +643,38 @@ def main():
     stl_mesh_data = [None]  # Store loaded trimesh object
 
     with tab_advanced:
-        _stl_folder = server.gui.add_folder("3D Models (STL / STEP)")
+        _stl_folder = server.gui.add_folder("Platform (frame model & VIO cameras)")
     with _stl_folder:
-        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Import 3D CAD models</div>")
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:6px;'>A platform = the drone: its "
+                            "CAD frame (STL/STEP, display + occlusion) and the VIO camera poses (FOV tab). Layouts link "
+                            "to a platform by name so several designs share one.</div>")
+
+        def get_available_platforms():
+            return sorted((f[:-5] for f in os.listdir(platforms_dir) if f.lower().endswith(".json")), key=str.lower)
+
+        _NO_PLATFORM = "(none / inline)"
+        platform_dropdown = server.gui.add_dropdown("Platform", options=[_NO_PLATFORM] + get_available_platforms(),
+                                                    initial_value=_NO_PLATFORM)
+        load_platform_btn = server.gui.add_button("📂 Load platform")
+        platform_name_input = server.gui.add_text("Save platform as", initial_value="")
+        save_platform_btn = server.gui.add_button("💾 Save platform (frame + VIO cameras)")
+
+        def _sync_platform_dropdown():
+            platform_dropdown.options = [_NO_PLATFORM] + get_available_platforms()
+            want = current_platform_name[0] or _NO_PLATFORM
+            platform_dropdown.value = want if want in platform_dropdown.options else _NO_PLATFORM
+
+        server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;margin-bottom:6px;'>Frame model (STL / STEP)</div>")
         server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:6px;'>"
                             "STEP keeps the CAD units and origin (true size, scale 0.1 = mm→cm). "
                             "STL has no units: it is centred and auto-fitted to 70 cm; set Scale to 0.1 for a mm export.</div>")
-        stl_file_path = server.gui.add_text("Model file path (.stl / .step)", initial_value=r"C:\Users\gianmatteo.marietti_\Downloads\109045 E3 CAGE ASSEMBLY_Coarse.STL")
+        stl_file_path = server.gui.add_text("Model file path (.stl / .step)", initial_value="")
         stl_load_button = server.gui.add_button("📂 Load model", color="#4CAF50")
         stl_clear_button = server.gui.add_button("🗑️ Clear Model", color="#FF5555")
         
         server.gui.add_html("<hr style='margin:8px 0;'>")
-        stl_absorber_enable = server.gui.add_checkbox("Enable as Light Absorber", initial_value=True)
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>When enabled, the 3D model blocks light rays</div>")
+        stl_absorber_enable = server.gui.add_checkbox("Occludes light (shadow test)", initial_value=True)
+        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>When enabled, the frame blocks light rays in every simulation</div>")
         
         server.gui.add_html("<hr style='margin:8px 0;'>")
         stl_visible = server.gui.add_checkbox("Show Model", initial_value=True)
@@ -1570,9 +1621,42 @@ def main():
         vio_pos_z=vio_pos_z,
     ))
     apply_config = _config_io_ns.apply_config
+    apply_platform_cfg = _config_io_ns.apply_platform_cfg
     get_current_config = _config_io_ns.get_current_config
     new_project = _config_io_ns.new_project
     update_ui_visibility = _config_io_ns.update_ui_visibility
+
+    @load_platform_btn.on_click
+    def _(_):
+        name = platform_dropdown.value
+        if not name or name == _NO_PLATFORM:
+            current_platform_name[0] = None
+            print("Platform link cleared: the frame / VIO settings will be saved inline with the layout.")
+            return
+        plat = load_platform(os.path.join(platforms_dir, f"{name}.json"))
+        loading_in_progress[0] = True
+        try:
+            apply_platform_cfg(layout_to_v1(Layout(platform=plat), platform=plat))
+        finally:
+            loading_in_progress[0] = False
+        current_platform_name[0] = name
+        update_scene()
+        print(f"✓ Platform loaded: {name}")
+
+    @save_platform_btn.on_click
+    def _(_):
+        name = platform_name_input.value.strip() or current_platform_name[0]
+        if not name:
+            print("Error: enter a platform name.")
+            return
+        lay = convert_v1(get_current_config())
+        plat = lay.platform if isinstance(lay.platform, Platform) else Platform()
+        plat.name = name
+        path = os.path.join(platforms_dir, f"{name.lower().replace(' ', '_')}.json")
+        save_json(plat, path)
+        current_platform_name[0] = os.path.splitext(os.path.basename(path))[0]
+        _sync_platform_dropdown()
+        print(f"✓ Platform saved: {path}")
     # --- Wall intensity map (see ui/intensity_map.py) ---
     _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
         _expand_mirror_configs=_expand_mirror_configs,
@@ -1871,7 +1955,7 @@ def main():
         update_stl_mesh=update_stl_mesh,
         update_ui_visibility=update_ui_visibility,
         view_mode_dropdown=view_mode_dropdown,
-        flash_current_input=flash_current_input,
+        flash_lumens_input=flash_lumens_input,
         led_voltage_input=led_voltage_input,
         led_efficacy_input=led_efficacy_input,
         vio_cam1_pitch=vio_cam1_pitch,
@@ -1908,7 +1992,7 @@ def main():
         diffuser_angle_slider=diffuser_angle_slider,
         diffuser_enable_chk=diffuser_enable_chk,
         diffuser_transmission_slider=diffuser_transmission_slider,
-        flash_current_input=flash_current_input,
+        flash_lumens_input=flash_lumens_input,
         get_available_configs=get_available_configs,
         get_current_config=get_current_config,
         led_efficacy_input=led_efficacy_input,

@@ -401,6 +401,64 @@ def build(ctx):
                 pass
         _clear_mirror_state()
     
+    def apply_platform_cfg(cfg):
+        """STL frame model + VIO camera poses from a v1-style config section."""
+        # Load STL model configuration if present
+        stl_cfg = cfg.get("stl_model")
+        if stl_cfg:
+            # Clear existing model first
+            clear_stl_model()
+            
+            # Load file path and try to load the model
+            file_path = stl_cfg.get('file_path', '')
+            if file_path and os.path.exists(file_path):
+                stl_file_path.value = file_path
+                load_stl_file()  # Load the mesh
+                
+                # Apply saved settings
+                stl_absorber_enable.value = stl_cfg.get('absorber_enable', True)
+                stl_visible.value = stl_cfg.get('visible', True)
+                stl_scale.value = stl_cfg.get('scale', 1.0)
+                
+                position = stl_cfg.get('position', [0, 0, 0])
+                stl_pos_x.value = position[0]
+                stl_pos_y.value = position[1]
+                stl_pos_z.value = position[2]
+                
+                rotation = stl_cfg.get('rotation', [0, 0, 0])
+                stl_rot_x.value = rotation[0]
+                stl_rot_y.value = rotation[1]
+                stl_rot_z.value = rotation[2]
+                
+                stl_opacity.value = stl_cfg.get('opacity', 0.8)
+                stl_wireframe.value = stl_cfg.get('wireframe', False)
+                
+                print(f"✓ STL model loaded from config: {os.path.basename(file_path)}")
+            else:
+                if file_path:
+                    print(f"⚠️ STL file not found: {file_path}")
+        else:
+            # No STL model in config, clear any existing model
+            clear_stl_model()
+        
+
+        vio_cfg = cfg.get("vio_cameras")
+        if vio_cfg:
+            show_vio_fov.value = vio_cfg.get("show", True)
+            vio_fill_fov.value = vio_cfg.get("fill", False)
+            pos = vio_cfg.get("position", [3.0, 0.0, 0.0])
+            vio_pos_x.value = pos[0]
+            vio_pos_y.value = pos[1] if len(pos) > 1 else 0.0
+            vio_pos_z.value = pos[2] if len(pos) > 2 else 0.0
+            vio_cam1_pitch.value = vio_cfg.get("cam1_pitch", 45)
+            vio_cam1_yaw.value = vio_cfg.get("cam1_yaw", 0)
+            vio_cam2_pitch.value = vio_cfg.get("cam2_pitch", -45)
+            vio_cam2_yaw.value = vio_cfg.get("cam2_yaw", 0)
+            vio_long_fov.value = vio_cfg.get("long_fov", 170)
+            vio_landscape.value = vio_cfg.get("landscape", True)
+            _refresh_vio_fov_label()
+        
+
     def apply_config(cfg):
         """Update GUI elements with values from config."""
         nonlocal loading_in_progress
@@ -996,44 +1054,8 @@ def build(ctx):
                 'groups': created_groups
             })
         
-        # Load STL model configuration if present
-        stl_cfg = cfg.get("stl_model")
-        if stl_cfg:
-            # Clear existing model first
-            clear_stl_model()
-            
-            # Load file path and try to load the model
-            file_path = stl_cfg.get('file_path', '')
-            if file_path and os.path.exists(file_path):
-                stl_file_path.value = file_path
-                load_stl_file()  # Load the mesh
-                
-                # Apply saved settings
-                stl_absorber_enable.value = stl_cfg.get('absorber_enable', True)
-                stl_visible.value = stl_cfg.get('visible', True)
-                stl_scale.value = stl_cfg.get('scale', 1.0)
-                
-                position = stl_cfg.get('position', [0, 0, 0])
-                stl_pos_x.value = position[0]
-                stl_pos_y.value = position[1]
-                stl_pos_z.value = position[2]
-                
-                rotation = stl_cfg.get('rotation', [0, 0, 0])
-                stl_rot_x.value = rotation[0]
-                stl_rot_y.value = rotation[1]
-                stl_rot_z.value = rotation[2]
-                
-                stl_opacity.value = stl_cfg.get('opacity', 0.8)
-                stl_wireframe.value = stl_cfg.get('wireframe', False)
-                
-                print(f"✓ STL model loaded from config: {os.path.basename(file_path)}")
-            else:
-                if file_path:
-                    print(f"⚠️ STL file not found: {file_path}")
-        else:
-            # No STL model in config, clear any existing model
-            clear_stl_model()
-        
+        apply_platform_cfg(cfg)
+
         # Recreate individual LEDs from config (skip intermediate scene updates)
         clear_all_individual_leds()
         individual_leds_data = cfg.get("individual_leds", [])
@@ -1066,22 +1088,6 @@ def build(ctx):
                 led_data['ext_lens_enable'].value = True
                 led_data['ext_lens_angle'].value = led_cfg.get('ext_lens_angle', 30)
                 led_data['ext_lens_efficiency'].value = led_cfg.get('ext_lens_efficiency', 80)
-        
-        vio_cfg = cfg.get("vio_cameras")
-        if vio_cfg:
-            show_vio_fov.value = vio_cfg.get("show", True)
-            vio_fill_fov.value = vio_cfg.get("fill", False)
-            pos = vio_cfg.get("position", [3.0, 0.0, 0.0])
-            vio_pos_x.value = pos[0]
-            vio_pos_y.value = pos[1] if len(pos) > 1 else 0.0
-            vio_pos_z.value = pos[2] if len(pos) > 2 else 0.0
-            vio_cam1_pitch.value = vio_cfg.get("cam1_pitch", 45)
-            vio_cam1_yaw.value = vio_cfg.get("cam1_yaw", 0)
-            vio_cam2_pitch.value = vio_cfg.get("cam2_pitch", -45)
-            vio_cam2_yaw.value = vio_cfg.get("cam2_yaw", 0)
-            vio_long_fov.value = vio_cfg.get("long_fov", 170)
-            vio_landscape.value = vio_cfg.get("landscape", True)
-            _refresh_vio_fov_label()
         
         # Restore mirror-primary panel (old configs omit this key → no-op)
         _clear_mirror_state()
@@ -1183,4 +1189,4 @@ def build(ctx):
     
 
 
-    return SimpleNamespace(apply_config=apply_config, get_current_config=get_current_config, new_project=new_project, update_ui_visibility=update_ui_visibility)
+    return SimpleNamespace(apply_platform_cfg=apply_platform_cfg, apply_config=apply_config, get_current_config=get_current_config, new_project=new_project, update_ui_visibility=update_ui_visibility)

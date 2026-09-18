@@ -19,6 +19,7 @@ from lighting_simulator.optimization import (
     problem_from_spec as _problem_from_spec,
     run as _run_optimization,
 )
+from lighting_simulator.scene.layout import convert_v1 as _convert_v1, save_json as _save_json
 
 
 def build(ctx):
@@ -28,7 +29,7 @@ def build(ctx):
     camera_fov_v = ctx.camera_fov_v
     camera_pitch = ctx.camera_pitch
     tilt_fov_deg = ctx.tilt_fov_deg
-    flash_current_input = ctx.flash_current_input
+    flash_lumens_input = ctx.flash_lumens_input
     led_voltage_input = ctx.led_voltage_input
     led_efficacy_input = ctx.led_efficacy_input
     camera_pos_x = ctx.camera_pos_x
@@ -543,7 +544,7 @@ def build(ctx):
         )
         optim_flash_lumens = server.gui.add_number(
             "Flash flux per LED (lm)",
-            float(flash_current_input.value) * float(led_voltage_input.value) * float(led_efficacy_input.value),
+            float(flash_lumens_input.value),
             min=1.0, max=1000000.0, step=100.0, visible=False)
         server.gui.add_html("<hr style='margin:8px 0;'>")
         optim_electrical = server.gui.add_checkbox(
@@ -784,7 +785,7 @@ def build(ctx):
         optim_load_btn = server.gui.add_button("📥 Load best into scene")
         optim_report_btn = server.gui.add_button("📄 Open PDF report", disabled=True)
         optim_save_name = server.gui.add_text("Save best as", initial_value="")
-        optim_save_btn = server.gui.add_button("💾 Save best to configs/")
+        optim_save_btn = server.gui.add_button("💾 Save best to layouts/")
 
     _optim_mode_changed()  # initial folder visibility for the default mode
 
@@ -1399,18 +1400,18 @@ def build(ctx):
         if not name:
             _optim_status("Enter a name in 'Save best as'.", "#ffaa00")
             return
-        cfg = dict(cfg)
         stem = name.lower().replace(' ', '_')
         path = os.path.join(config_dir, f"{stem}.json")
         n = 2
-        while os.path.exists(path):  # never overwrite an existing config
+        while os.path.exists(path):  # never overwrite an existing layout
             path = os.path.join(config_dir, f"{stem}_{n:03d}.json")
             n += 1
-        cfg['name'] = os.path.splitext(os.path.basename(path))[0]
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=4)
+        lay = _convert_v1(cfg, default_lumens=float(optim_vio_lumens.value))
+        lay.name = os.path.splitext(os.path.basename(path))[0]
+        lay.flux.flash_lumens = float(optim_flash_lumens.value) if optim_flash_enable.value else None
+        _save_json(lay, path)
         config_dropdown.options = get_available_configs()
-        _optim_status(f"Saved best configuration to {path}"
+        _optim_status(f"Saved best layout to {path}"
                       + ("  (name already existed → suffixed)" if n > 2 else ""), "#4CAF50")
 
 

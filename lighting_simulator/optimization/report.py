@@ -376,7 +376,7 @@ def _page_method(w: _Writer, problem):
     dists = ", ".join(f"{wl.wall_dist:g}" for wl in problem.walls)
     w.heading("Test cases")
     w.line("Each candidate decision vector x is decoded into a regular saved configuration (same JSON schema "
-           "as configs/*.json) and the scene is built with the exact same code as the UI. The design is then "
+           "as the layouts) and the scene is built with the exact same code as the UI. The design is then "
            "judged on three independent test cases — each with its own geometry, operating mode and camera — "
            "plus hardware penalties. Two illuminance images exist when a flash mode is defined: the flight "
            "image (VIO + Both LEDs at their continuous flux) and the flash image (Flash + Both LEDs at the "
@@ -384,7 +384,7 @@ def _page_method(w: _Writer, problem):
            "judge the flash image; the VIO cameras never see the flash, so T2 judges the flight image."
            if has_flash else
            "Each candidate decision vector x is decoded into a regular saved configuration (same JSON schema "
-           "as configs/*.json) and the scene is built with the exact same code as the UI. The design is then "
+           "as the layouts) and the scene is built with the exact same code as the UI. The design is then "
            "judged on three independent test cases — each with its own geometry and camera — plus hardware "
            "penalties. No flash mode is defined, so every test case uses the single continuous image.")
     w.gap(0.006)

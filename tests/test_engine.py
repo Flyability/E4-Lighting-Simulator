@@ -21,7 +21,7 @@ from lighting_simulator.simulation.room_geometry import build_wall_specs, wall_c
 
 @pytest.fixture(scope="module")
 def elios3():
-    return load_config("configs/Elios3.json")
+    return load_config("layouts/Elios3.json")
 
 
 def test_ray_weights_conserve_flux():

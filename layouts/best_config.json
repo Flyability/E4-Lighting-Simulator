@@ -1,0 +1,204 @@
+{
+  "schema_version": 2,
+  "name": "elios3_duct_rings",
+  "description": "Optimised: score=0.7994 U=21.3% cov=100% Eavg=341lx LEDs=6 [led_cost=0.012]",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "front_duct",
+      "leds": [
+        {
+          "position": [15.299442, 9.090297, -0.821538],
+          "direction": [0.994567, 0.012303, 0.103371],
+          "row_dir": [-0.012369, 0.999923, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [15.101553, 10.690545, -0.821538],
+          "direction": [0.967604, 0.230341, 0.103371],
+          "row_dir": [-0.231581, 0.972816, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [14.557189, 12.208313, -0.821538],
+          "direction": [0.893433, 0.43714, 0.103371],
+          "row_dir": [-0.439495, 0.898245, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [13.692908, 13.569551, -0.821538],
+          "direction": [0.775673, 0.622613, 0.103371],
+          "row_dir": [-0.625966, 0.77985, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [15.299442, 9.090297, 1.006433],
+          "direction": [0.994567, 0.012303, 0.103371],
+          "row_dir": [-0.012369, 0.999923, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [15.101553, 10.690545, 1.006433],
+          "direction": [0.967604, 0.230341, 0.103371],
+          "row_dir": [-0.231581, 0.972816, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [14.557189, 12.208313, 1.006433],
+          "direction": [0.893433, 0.43714, 0.103371],
+          "row_dir": [-0.439495, 0.898245, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [13.692908, 13.569551, 1.006433],
+          "direction": [0.775673, 0.622613, 0.103371],
+          "row_dir": [-0.625966, 0.77985, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7]
+      ],
+      "source": {
+        "generator": "DuctRingLayout"
+      }
+    },
+    {
+      "name": "front_duct_mirror",
+      "leds": [
+        {
+          "position": [15.299442, -9.090297, -0.821538],
+          "direction": [0.994567, -0.012303, 0.103371],
+          "row_dir": [-0.012369, -0.999923, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [15.101553, -10.690545, -0.821538],
+          "direction": [0.967604, -0.230341, 0.103371],
+          "row_dir": [-0.231581, -0.972816, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [14.557189, -12.208313, -0.821538],
+          "direction": [0.893433, -0.43714, 0.103371],
+          "row_dir": [-0.439495, -0.898245, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [13.692908, -13.569551, -0.821538],
+          "direction": [0.775673, -0.622613, 0.103371],
+          "row_dir": [-0.625966, -0.77985, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [15.299442, -9.090297, 1.006433],
+          "direction": [0.994567, -0.012303, 0.103371],
+          "row_dir": [-0.012369, -0.999923, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [15.101553, -10.690545, 1.006433],
+          "direction": [0.967604, -0.230341, 0.103371],
+          "row_dir": [-0.231581, -0.972816, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [14.557189, -12.208313, 1.006433],
+          "direction": [0.893433, -0.43714, 0.103371],
+          "row_dir": [-0.439495, -0.898245, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [13.692908, -13.569551, 1.006433],
+          "direction": [0.775673, -0.622613, 0.103371],
+          "row_dir": [-0.625966, -0.77985, 0.0],
+          "beam_angle": 101.961447,
+          "tilt": -0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7]
+      ],
+      "source": {
+        "generator": "DuctRingLayout"
+      }
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "name": "elios3_refine_panels",
-  "base_config": "configs/Elios3.json",
+  "base_config": "layouts/Elios3.json",
   "clear_base": false,
 
   "wall":     { "wall_dist": 100, "grid_size": 30, "wall_size": 250, "rays_per_pixel": 4 },

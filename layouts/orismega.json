@@ -1,0 +1,290 @@
+{
+  "schema_version": 2,
+  "name": "orismega",
+  "description": "",
+  "platform": "107000_e3_with_lidar_assembly_empty",
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "Front +",
+      "leds": [
+        {
+          "position": [-0.0, -0.0, 2.0],
+          "direction": [0.792987, -0.348097, 0.5],
+          "row_dir": [-0.401948, -0.915663, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.004869, 2.289156, 1.5],
+          "direction": [0.827886, -0.268595, 0.492404],
+          "row_dir": [-0.3086, -0.951192, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.004869, -2.289156, 1.5],
+          "direction": [0.758088, -0.427599, 0.492404],
+          "row_dir": [-0.491285, -0.870999, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.808765, 4.120482, 1.0],
+          "direction": [0.914221, -0.039186, 0.403317],
+          "row_dir": [-0.042823, -0.999083, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.808765, -4.120482, 1.0],
+          "direction": [0.647659, -0.646431, 0.403317],
+          "row_dir": [-0.706436, -0.707777, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [2.210713, 5.036144, 0.0],
+          "direction": [0.993961, 0.109734, 0.0],
+          "row_dir": [0.109734, -0.993961, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-2.210713, -5.036144, -0.0],
+          "direction": [0.592013, -0.805928, -0.0],
+          "row_dir": [-0.805928, -0.592013, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.808765, 4.120482, -1.0],
+          "direction": [0.914221, -0.039186, -0.403317],
+          "row_dir": [-0.042823, -0.999083, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.808765, -4.120482, -1.0],
+          "direction": [0.647659, -0.646431, -0.403317],
+          "row_dir": [-0.706436, -0.707777, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.004869, 2.289156, -1.5],
+          "direction": [0.827886, -0.268595, -0.492404],
+          "row_dir": [-0.3086, -0.951192, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.004869, -2.289156, -1.5],
+          "direction": [0.758088, -0.427599, -0.492404],
+          "row_dir": [-0.491285, -0.870999, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, -2.0],
+          "direction": [0.803505, -0.324136, -0.499315],
+          "row_dir": [-0.374109, -0.927385, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [19.06, -10.92, -1.29],
+      "rotation": [-7.0, 0.0, -1.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4],
+        [5, 6],
+        [7, 8, 9, 10],
+        [11]
+      ],
+      "source": {
+        "template": "orismega"
+      }
+    },
+    {
+      "name": "Front -",
+      "leds": [
+        {
+          "position": [0.0, 0.0, 2.0],
+          "direction": [0.792378, 0.34948, 0.5],
+          "row_dir": [0.403545, -0.91496, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.008863, 2.287399, 1.5],
+          "direction": [0.757341, 0.428921, 0.492404],
+          "row_dir": [0.492805, -0.87014, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.008863, -2.287399, 1.5],
+          "direction": [0.827416, 0.27004, 0.492404],
+          "row_dir": [0.31026, -0.950652, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.815954, 4.117319, 1.0],
+          "direction": [0.64653, 0.647561, 0.403317],
+          "row_dir": [0.70767, -0.706543, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.815954, -4.117319, 1.0],
+          "direction": [0.914151, 0.040781, 0.403317],
+          "row_dir": [0.044567, -0.999006, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-2.219499, 5.032278, -0.0],
+          "direction": [0.590606, 0.80696, 0.0],
+          "row_dir": [0.80696, -0.590606, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [2.219499, -5.032278, 0.0],
+          "direction": [0.994151, -0.107999, -0.0],
+          "row_dir": [-0.107999, -0.994151, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.815954, 4.117319, -1.0],
+          "direction": [0.64653, 0.647561, -0.403317],
+          "row_dir": [0.70767, -0.706543, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.815954, -4.117319, -1.0],
+          "direction": [0.914151, 0.040781, -0.403317],
+          "row_dir": [0.044567, -0.999006, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-1.008863, 2.287399, -1.5],
+          "direction": [0.757341, 0.428921, -0.492404],
+          "row_dir": [0.492805, -0.87014, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [1.008863, -2.287399, -1.5],
+          "direction": [0.827416, 0.27004, -0.492404],
+          "row_dir": [0.31026, -0.950652, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.0, -0.0, -2.0],
+          "direction": [0.781818, 0.373423, -0.499315],
+          "row_dir": [0.430995, -0.902354, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [19.03, 10.97, -1.29],
+      "rotation": [4.0, 0.0, 3.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4],
+        [5, 6],
+        [7, 8, 9, 10],
+        [11]
+      ],
+      "source": {
+        "template": "orismega"
+      }
+    }
+  ]
+}

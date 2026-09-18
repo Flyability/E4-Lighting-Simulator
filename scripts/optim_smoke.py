@@ -15,7 +15,7 @@ if use_gpu:
     print("[smoke] gpu_available:", gpu_backend.gpu_available(), gpu_backend.gpu_backend_label())
 
 spec, spec_dir = load_spec("optimization_specs/ludo_refine.json")
-base = load_config("configs/ludos_panels_n4.json")
+base = load_config("tests/data/v1_configs/ludos_panels_n4.json")
 spec['wall']['rays_per_pixel'] = 50
 spec['variables'] = [{"type": "panel_pose", "group_index": 0, "pos_delta": [2, 2, 2], "rot_delta": [10, 10, 10]}]
 problem = problem_from_spec(spec, spec_dir, base_cfg=base, use_gpu=use_gpu)

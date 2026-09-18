@@ -38,6 +38,7 @@ from lighting_simulator.camera.fov import (
 from lighting_simulator.domain.led import split_by_role
 from lighting_simulator.raytracing.mesh import prepare_mesh_ray_accelerator
 from lighting_simulator.scene.builder import build_scene_from_config, load_config
+from lighting_simulator.scene.layout import to_v1_config
 from lighting_simulator.simulation.direct import direct_illuminance
 from lighting_simulator.simulation.emission import led_lumens
 from lighting_simulator.simulation.room import compute_room_intensity
@@ -377,7 +378,7 @@ class Problem:
         if self.flash_modes and self.flash_modes[0].lumens is None and self.flash_modes[0].current_a is None:
             raise ValueError(f"flash mode '{self.flash_modes[0].name}' needs 'lumens' (or 'current_a')")
         self.flight_mode = next((m for m in self.modes if not m.is_flash), None)
-        self.base_cfg = copy.deepcopy(base_cfg)
+        self.base_cfg = copy.deepcopy(to_v1_config(base_cfg))  # variables edit v1 custom_groups
         if clear_base:
             self.base_cfg['custom_groups'] = []
             self.base_cfg['individual_leds'] = []
@@ -806,6 +807,7 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     else:
         base_cfg = copy.deepcopy(base_cfg)
         default_name = str(base_cfg.get('name') or 'scene').lower().replace(' ', '_') + "_optim"
+    base_cfg = to_v1_config(base_cfg)
 
     wall_spec = dict(spec.get('wall', {}))
     dist = wall_spec.get('wall_dist', 100.0)

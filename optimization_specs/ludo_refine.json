@@ -1,6 +1,6 @@
 {
   "name": "ludo_refine",
-  "base_config": "configs/ludos_panels_n4.json",
+  "base_config": "layouts/ludos_panels_n4.json",
   "clear_base": false,
 
   "wall":     { "wall_dist": 50, "grid_size": 30, "wall_size": 250, "rays_per_pixel": 300 },

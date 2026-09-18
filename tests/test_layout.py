@@ -12,7 +12,7 @@ from lighting_simulator.scene import (
     build_scene_from_layout, convert_v1, layout_from_dict, load_config, load_layout, save_json,
 )
 
-CONFIGS = sorted(glob.glob("configs/*.json"))
+CONFIGS = sorted(glob.glob("tests/data/v1_configs/*.json"))
 
 
 def _signature(leds, with_lumens=True):
@@ -56,7 +56,7 @@ def test_v1_config_converts_to_identical_scene(path):
 
 
 def test_convert_drops_legacy_parts_and_bakes_global_transform():
-    cfg = load_config("configs/elios3v1_l.json")
+    cfg = load_config("tests/data/v1_configs/elios3v1_l.json")
     assert cfg['global_rotation_z'] == 33
     layout = convert_v1(cfg)
     d = layout.to_dict()
@@ -68,7 +68,7 @@ def test_convert_drops_legacy_parts_and_bakes_global_transform():
 
 
 def test_mirror_flag_generates_xz_twin_and_halves_the_file():
-    cfg = load_config("configs/ludos_panels_n4.json")
+    cfg = load_config("tests/data/v1_configs/ludos_panels_n4.json")
     layout = convert_v1(cfg)
     assert layout.panels[0].mirror and not layout.panels[1].mirror and not layout.panels[1].enabled
     leds = build_leds_from_layout(layout)
@@ -107,8 +107,37 @@ def test_layout_and_platform_files(tmp_path):
     resolved = back.resolve_platform(tmp_path / "platforms")
     assert resolved.stl.file == "frame.STEP" and resolved.stl.scale == 0.1 and not resolved.stl.occludes
     # a v1 file loads through the same entry point
-    lay1 = load_layout("configs/ludos_panels_n4.json")
+    lay1 = load_layout("tests/data/v1_configs/ludos_panels_n4.json")
     assert lay1.name == "ludos_panels_n4" and isinstance(lay1.platform, Platform)
     # build_scene_from_config accepts a v2 dict directly
     scene = build_scene_from_config(layout.to_dict())
     assert len(scene.leds) == 1 and scene.leds[0].lumens == 168.0
+
+
+def test_layout_to_v1_round_trip_and_optimiser_base():
+    """v2 → v1 runtime dict (what the UI and the optimiser variables edit) → v2 keeps the scene."""
+    from lighting_simulator.optimization import CameraSpec, PanelPose, Problem
+    from lighting_simulator.scene.layout import layout_to_v1
+    from lighting_simulator.simulation import WallSettings
+
+    lay = Layout(name="t", flux=Flux(vio_lumens=300, flash_lumens=9000), panels=[
+        Panel(name="a", mirror=True, position=(5, 3, 0), rotation=(0, 10, 20),
+              leds=[LedSpec((0, 0, 0), (1, 0, 0), (0, 1, 0), tilt=15, role='vio'),
+                    LedSpec((0, 1, 0), (1, 0, 0), (0, 1, 0), on=False)]),
+        Panel(name="b", mirror=True, position=(0, 8, 2), leds=[LedSpec((0, 0, 0), (0, 1, 0))]),
+        Panel(name="c", enabled=False, leds=[LedSpec((0, 0, 0), (1, 0, 0))]),
+    ])
+    ref = _signature(build_leds_from_layout(lay))
+    v1 = layout_to_v1(lay)
+    assert v1['mirror_primary'] == {'kind': 'custom_group', 'key': 0}
+    assert [g['name'] for g in v1['custom_groups']] == ["a", "b", "b_mirror", "c"]
+    assert v1['custom_groups'][0]['rotation_y'] == 0  # rotation baked into the LED arrays
+    assert _signature(build_scene_from_config(v1, default_lumens=300).leds) == ref
+    back = convert_v1(v1)
+    assert [(p.name, p.mirror, p.enabled) for p in back.panels] == [("a", True, True), ("b", True, True), ("c", False, False)]
+    assert back.flux.flash_lumens == 9000 and _signature(build_leds_from_layout(back)) == ref
+    # the optimiser can start from a v2 layout dict
+    problem = Problem(lay.to_dict(), [PanelPose(group_index=1, pos_delta=(1, 0, 0), rot_delta=(0, 0, 0))],
+                      WallSettings(wall_dist=100, grid_size=8, wall_size=200, rays_per_pixel=1), CameraSpec())
+    assert problem.decode(problem.x0)['custom_groups'][1]['name'] == "b"
+    assert len(problem.build_scene(problem.decode(problem.x0)).active_leds) == 4  # (1 + 1) × mirror

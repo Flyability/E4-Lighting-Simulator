@@ -108,7 +108,7 @@ for name in sys.argv[1:]:
     m = re.search(r"font-weight:700;color:#\w+;margin:2px 0 6px;'>([\d.]+)%", html)
     ui_u = m.group(1) if m else "?"
     rows = dict(re.findall(r"<td[^>]*>(E<sub>\w+</sub>|U<sub>\d</sub>[^<]*)</td><td>([^<]+)</td>", html))
-    hl = problem.evaluate_config(load_config(f"configs/{name}.json"))
+    hl = problem.evaluate_config(load_config(f"tests/data/v1_configs/{name}.json"))
     print(f"\n=== {name} ===")
     print(f"  UI legend : U0={ui_u}%  {rows}")
     print(f"  headless  : {hl.summary()}")

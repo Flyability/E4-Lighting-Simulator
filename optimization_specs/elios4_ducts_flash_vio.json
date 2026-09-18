@@ -1,7 +1,7 @@
 {
   "name": "elios4_ducts_flash_vio",
   "description": "Meeting requirements: LEDs on the duct rings (cooling), flash for photogrammetry (41 klx @ 50 cm), normal lighting for VIO (>=50 % of the VIO FOV above 120 lx @ 3 m), few drivers, beams >= 30 deg off the camera axis, XZ symmetry.",
-  "base_config": "configs/elios3.json",
+  "base_config": "layouts/Elios3.json",
   "clear_base": true,
 
   "wall":     { "wall_dist": [50, 100, 200], "grid_size": 60, "wall_size": "auto", "rays_per_pixel": 1500 },
