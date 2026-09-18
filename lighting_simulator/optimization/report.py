@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib import colormaps as plt_colormaps
 from matplotlib.figure import Figure
 from matplotlib.patches import Polygon
 
@@ -1011,8 +1012,14 @@ def _short(label, n=34):
     return label if len(label) <= n else label[: n - 1] + "…"
 
 
-def _heatmap(ax, M, row_labels, col_labels, fontsize=6.5, annotate=True):
-    ax.imshow(np.where(np.isfinite(M), M, 0.0), cmap="coolwarm", vmin=-1, vmax=1, aspect="auto")
+def _heatmap(ax, M, row_labels, col_labels, fontsize=6.5, annotate=True, mask_diagonal=False):
+    M = np.array(M, dtype=float)
+    if mask_diagonal:
+        np.fill_diagonal(M, np.nan)  # self-correlation is always 1 and would dominate the colour scale
+    img = np.ma.masked_invalid(M)
+    cmap = plt_colormaps["coolwarm"].copy()
+    cmap.set_bad("#e6e6e6")
+    ax.imshow(img, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
     ax.set_xticks(range(len(col_labels))); ax.set_xticklabels(col_labels, rotation=45, ha="left", fontsize=fontsize)
     ax.xaxis.tick_top()
     ax.set_yticks(range(len(row_labels))); ax.set_yticklabels(row_labels, fontsize=fontsize)
@@ -1024,7 +1031,7 @@ def _heatmap(ax, M, row_labels, col_labels, fontsize=6.5, annotate=True):
                 if np.isfinite(v):
                     ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=fontsize - 1,
                             color="white" if abs(v) > 0.6 else "black")
-                else:
+                elif not (mask_diagonal and i == j):
                     ax.text(j, i, "—", ha="center", va="center", fontsize=fontsize - 1, color="#888")
 
 
@@ -1146,7 +1153,7 @@ def _page_sensitivity(pdf, problem, records):
         ax = fig.add_axes([0.30, 0.14, 0.62, 0.66])
         vo = [i for i in order if i < nv]
         lab = [_short(res.input_names[i], 30) for i in vo]
-        _heatmap(ax, res.top_corr[np.ix_(vo, vo)], lab, lab, fontsize=5.5, annotate=nv <= 24)
+        _heatmap(ax, res.top_corr[np.ix_(vo, vo)], lab, lab, fontsize=5.5, annotate=nv <= 24, mask_diagonal=True)
         fig.text(MARGIN, 0.085, textwrap.fill(
             "Spearman ρ between pairs of variables, restricted to the best-scoring fifth of the run. A strong "
             "|ρ| means the good designs trade one variable against the other (e.g. wider arc ↔ smaller tilt): "
