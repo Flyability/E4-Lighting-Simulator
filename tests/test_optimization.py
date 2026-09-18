@@ -335,3 +335,24 @@ def test_requirements_spec_modes_drivers_and_report(tmp_path):
     assert np.isfinite(res.X[:, problem.dim]).all()  # active LEDs decoded for every record
     assert S.spearman([1, 2, 3, 4], [1, 3, 2, 4]) == pytest.approx(0.8)
     assert S.spearman([1, 1, 1], [1, 2, 3]) != S.spearman([1, 1, 1], [1, 2, 3])  # NaN on constant input
+
+
+def test_problem_analytic_matches_traced_score():
+    from lighting_simulator.optimization.problem import problem_from_spec
+    from lighting_simulator.scene import load_config
+    import json, time
+    from pathlib import Path
+    spec = json.load(open("optimization_specs/elios3_refine_panels.json"))
+    spec["wall"] = {**spec.get("wall", {}), "grid_size": 40, "rays_per_pixel": 400}
+    base = load_config("layouts/Elios3.json")
+    traced = problem_from_spec(spec, Path("optimization_specs"), base_cfg=base, use_gpu=False)
+    exact = problem_from_spec(spec, Path("optimization_specs"), base_cfg=base, analytic=True)
+    assert exact.analytic and not traced.analytic
+    x0 = exact.x0
+    t0 = time.perf_counter(); e1 = exact.evaluate(x0); t_an = time.perf_counter() - t0
+    e2 = exact.evaluate(x0)
+    assert e1.score == e2.score  # deterministic
+    t0 = time.perf_counter(); e3 = traced.evaluate(x0); t_mc = time.perf_counter() - t0
+    assert e1.uniformity_pct == pytest.approx(e3.uniformity_pct, abs=3.0)
+    assert e1.e_avg == pytest.approx(e3.e_avg, rel=0.05)
+    print(f"analytic {t_an*1e3:.1f} ms vs traced {t_mc*1e3:.1f} ms")

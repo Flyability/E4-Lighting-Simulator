@@ -116,7 +116,9 @@ find("Max active LEDs (0 = no limit)").value = 6
 find("Load best into scene when finished").value = True
 find("Show intensity on wall").value = True
 find("Rays per pixel (↑quality, ↓speed)").value = 20
-run_and_wait("refine")
+find("Analytic direct light (no ray tracing)").value = True
+run_and_wait("refine (analytic)")
+find("Analytic direct light (no ray tracing)").value = False
 print("[smoke] Project Name field:", find("Project Name").value)
 
 # --- mode 1 on a duct: the existing panel slides over a cylinder, mirror partner follows ------

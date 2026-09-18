@@ -744,6 +744,12 @@ def build(ctx):
             "Use GPU", initial_value=_gpu_backend.HAS_GPU_MODULE,
             hint="Single-process GPU tracing; falls back to CPU if no backend passes the self-test",
         )
+        optim_analytic = server.gui.add_checkbox(
+            "Analytic direct light (no ray tracing)", initial_value=False,
+            hint="Score every candidate with the closed-form direct illuminance instead of Monte-Carlo rays: "
+                 "exact expected value, zero noise, ~100× faster; 'Rays per pixel' and the GPU are ignored. "
+                 "Frame shadows kept, wall reflections not modelled (the optimiser never traces bounces anyway).",
+        )
         optim_polish = server.gui.add_checkbox("Polish with Nelder-Mead", initial_value=False)
         optim_name = server.gui.add_text("Run name", initial_value="", hint="Output folder name; empty = auto")
 
@@ -1237,7 +1243,8 @@ def build(ctx):
                 extra['diffuser'] = (float(diffuser_angle_slider.value),
                                      float(diffuser_transmission_slider.value) / 100.0)
 
-        problem = _problem_from_spec(work, spec_dir, base_cfg=base_cfg, use_gpu=optim_use_gpu.value, **extra)
+        problem = _problem_from_spec(work, spec_dir, base_cfg=base_cfg, use_gpu=optim_use_gpu.value,
+                                     analytic=optim_analytic.value, **extra)
         opt = _OptimizerSpec(
             method=optim_method.value, max_evals=int(optim_max_evals.value), seed=int(optim_seed.value),
             population=int(optim_population.value), workers=int(optim_workers.value),
@@ -1255,7 +1262,7 @@ def build(ctx):
         head = "Finished" if final else "Running"
         _optim_status(
             f"{head}: {n_done}/{st['budget']} evals, {elapsed:.0f}s ({rate:.1f} eval/s)"
-            + (" [GPU]" if logger.problem.use_gpu else " [CPU]")
+            + (" [analytic]" if logger.problem.analytic else (" [GPU]" if logger.problem.use_gpu else " [CPU]"))
             + f"\nBest: {best.summary() if best else '—'}",
             "#4CAF50" if final else "#ccc",
         )
@@ -1344,7 +1351,7 @@ def build(ctx):
             _traceback.print_exc()
             _optim_status(f"Cannot build problem: {exc}", "#ff6666")
             return
-        if problem.use_gpu:
+        if problem.use_gpu and not problem.analytic:
             _optim_status("Checking GPU backend…")
             if not _gpu_backend.gpu_available():
                 problem.use_gpu = False
@@ -1360,7 +1367,7 @@ def build(ctx):
         optim_plot.data = _OPTIM_EMPTY_PLOT
         optim_run_btn.disabled = True
         optim_stop_btn.disabled = False
-        backend = _gpu_backend.gpu_backend_label() if problem.use_gpu else "CPU"
+        backend = "analytic" if problem.analytic else (_gpu_backend.gpu_backend_label() if problem.use_gpu else "CPU")
         _optim_status(f"Starting '{problem.name}': {problem.dim} variables, {opt.max_evals} evals, "
                       f"{len(problem.walls)} wall distance(s), {backend}…")
         t = _threading.Thread(target=_optim_worker, args=(problem, opt), daemon=True, name="optimizer")

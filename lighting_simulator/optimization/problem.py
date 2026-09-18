@@ -39,7 +39,7 @@ from lighting_simulator.domain.led import split_by_role
 from lighting_simulator.raytracing.mesh import prepare_mesh_ray_accelerator
 from lighting_simulator.scene.builder import build_scene_from_config, load_config
 from lighting_simulator.scene.layout import to_v1_config
-from lighting_simulator.simulation.direct import direct_illuminance
+from lighting_simulator.simulation.direct import direct_illuminance, direct_room_intensity, direct_wall_intensity
 from lighting_simulator.simulation.emission import led_lumens
 from lighting_simulator.simulation.room import compute_room_intensity
 from lighting_simulator.simulation.room_geometry import (
@@ -350,13 +350,16 @@ class Problem:
                  constraints: ConstraintSpec | None = None, clear_base=False, name="optim",
                  wall_dists=None, use_gpu=False, stl_mesh=None, diffuser=None,
                  driver: DriverModel | None = None, vio: VioSpec | None = None, modes=None,
-                 wall_sizes=None, cont_driver: DriverModel | None = None, electrical=False):
+                 wall_sizes=None, cont_driver: DriverModel | None = None, electrical=False, analytic=False):
         """``wall_dists``: optional list of distances (cm); the score is averaged over them
         so a layout is optimised for a range instead of a single wall distance.
         ``wall_sizes``: matching list of wall extents (cm), or ``"auto"`` to fit each wall
         to the camera footprint (keeps the FOV at full grid resolution at every distance).
 
-        ``use_gpu`` traces on the GPU backend (single process only). ``stl_mesh`` /
+        ``use_gpu`` traces on the GPU backend (single process only). ``analytic`` replaces the
+        Monte-Carlo tracer of T1 / T2 by the closed-form direct illuminance (``simulation.direct``):
+        exact expected value, no ray noise, ``rays_per_pixel`` ignored, no wall reflections
+        (T3 is always analytic). ``stl_mesh`` /
         ``diffuser`` are forwarded to ``build_scene_from_config`` so the UI scene is
         reproduced exactly. ``vio`` + ``modes`` add the per-operating-point lux / VIO-coverage
         targets. ``electrical`` turns on the current / driver model: ``driver`` is the
@@ -365,6 +368,8 @@ class Problem:
         driver / current penalty is computed."""
         self.name = name
         self.use_gpu = bool(use_gpu)
+        self.analytic = bool(analytic)
+        self._accel = None  # mesh ray accelerator for the (fixed) frame model, built on first use
         self.stl_mesh = stl_mesh
         self.diffuser = diffuser
         self.electrical = bool(electrical)
@@ -567,7 +572,7 @@ class Problem:
                              + [float(flash_lumens)] * len(pulse_leds))
             else:
                 t3_leds, t3_lumens = flight_leds, None
-            accel = prepare_mesh_ray_accelerator(scene.stl_mesh_data) if scene.stl_mesh_data is not None else None
+            accel = self._mesh_accel(scene)
             tilt_scores, tilt_unis = [], {'up': [], 'down': []}
             for room in self._tilt_rooms:
                 sel = np.ones(len(room.pts), bool) if keep_grid else room.scored
@@ -621,10 +626,21 @@ class Problem:
         return build_scene_from_config(cfg, default_lumens=self.emission.default_lumens,
                                        stl_mesh=self.stl_mesh, diffuser=self.diffuser)
 
+    def _mesh_accel(self, scene):
+        """BVH of the frame model (same for every evaluation), or None."""
+        if scene.stl_mesh_data is None:
+            return None
+        if self._accel is None:
+            self._accel = prepare_mesh_ray_accelerator(scene.stl_mesh_data)
+        return self._accel
+
     def _trace_leds(self, leds, wall, budget_frac, scene):
         """Trace a subset of LEDs with ``budget_frac`` of the wall's ray budget (zeros if empty)."""
         if not leds:
             return np.zeros((wall.grid_size, wall.grid_size))
+        if self.analytic:
+            grid = direct_wall_intensity(leds, wall, self.emission, accel=self._mesh_accel(scene))
+            return np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
         settings = wall if budget_frac >= 1.0 else replace(wall, rays_per_pixel=max(1, int(round(
             wall.rays_per_pixel * budget_frac))))
         grid = compute_wall_intensity(leds, settings, self.emission,
@@ -658,9 +674,13 @@ class Problem:
         rpp = max(1, int(round(w.rays_per_pixel * w.grid_size ** 2 / max(1, n_active * room_cells))))
         if not leds:
             return {name: np.zeros(mask.shape) for name, mask in self._vio_masks.items()}
-        grids, _ = compute_room_intensity(leds, self.vio.room_settings(rpp), self.emission,
-                                          stl_mesh_data=scene.stl_mesh_data,
-                                          use_gpu=self.use_gpu, verbose=False)
+        if self.analytic:
+            grids, _ = direct_room_intensity(leds, self.vio.room_settings(rpp), self.emission,
+                                             accel=self._mesh_accel(scene))
+        else:
+            grids, _ = compute_room_intensity(leds, self.vio.room_settings(rpp), self.emission,
+                                              stl_mesh_data=scene.stl_mesh_data,
+                                              use_gpu=self.use_gpu, verbose=False)
         return {n: np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for n, g in grids.items() if n != 'back'}
 
     def _pick_wall(self, mode, values):
@@ -845,6 +865,7 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
             v.setdefault('driver', copy.deepcopy(spec.get('driver', {})))
         variables.append(variable_from_spec(v, working))
     problem_kwargs.setdefault('use_gpu', bool(spec.get('use_gpu', False)))
+    problem_kwargs.setdefault('analytic', bool(spec.get('analytic', False)))
     return Problem(base_cfg, variables, wall, camera, emission, objective, constraints,
                    clear_base=clear_base, name=spec.get('name', default_name),
                    wall_dists=wall_dists, wall_sizes=wall_sizes, driver=driver, vio=vio, modes=modes,

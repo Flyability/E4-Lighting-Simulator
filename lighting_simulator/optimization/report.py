@@ -180,7 +180,7 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     w.line(f"Generated {now}   —   output folder: {out_dir}")
     w.line(f"Method: {opt.method}   budget: {opt.max_evals} evaluations   performed: {n_evals}   "
-           f"elapsed: {elapsed:.0f} s   backend: {'GPU' if problem.use_gpu else 'CPU'}"
+           f"elapsed: {elapsed:.0f} s   backend: {'analytic (no ray tracing)' if problem.analytic else ('GPU' if problem.use_gpu else 'CPU')}"
            + (f"   new-best confirmations: {n_confirm}" if n_confirm else "")
            + ("   (stopped by user)" if stopped else ""))
     w.line(f"Decision variables: {problem.dim}   walls: "
@@ -506,7 +506,11 @@ def _page_method(w: _Writer, problem):
     w.line("Differential evolution (scipy) evolves a population inside the bounds and keeps improvements; "
            "integer variables (row/column counts, roles) are rounded before decoding. Nelder–Mead / random "
            "search are local alternatives. The best design is exported after every improvement.", size=8)
-    w.line("Rays are random, so T1 and T2 carry Monte-Carlo noise (T3 is analytic). Safeguards: a candidate "
+    if problem.analytic:
+        w.line("Illuminance was computed analytically (closed-form direct light, exact expected value of the tracer): "
+               "no Monte-Carlo noise, so re-evaluations return identical scores; wall reflections are not modelled.", size=8)
+    else:
+        w.line("Rays are random, so T1 and T2 carry Monte-Carlo noise (T3 is analytic). Safeguards: a candidate "
            "beating the current best is re-evaluated with fresh rays and the mean is kept (a lucky draw must be "
            f"lucky twice); for this report the best distinct designs are re-evaluated with {VERIFY_RAY_FACTOR}× "
            "the rays and ranked by that verified score. Dashed trend lines on the convergence page are centred "

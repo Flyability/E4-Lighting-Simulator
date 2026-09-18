@@ -17,6 +17,8 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output-dir", help="override output_dir")
     parser.add_argument("--name", help="override run name (output folder)")
+    parser.add_argument("--analytic", action="store_true",
+                        help="score with the closed-form direct illuminance instead of ray tracing (spec key 'analytic')")
     parser.add_argument("--save-config", metavar="PATH", help="also copy best_config.json to this path (e.g. configs/opti_1.json)")
     parser.add_argument("--evaluate", metavar="CONFIG.json", action="append",
                         help="score an existing config under the spec's objective instead of optimising (repeatable)")
@@ -36,6 +38,8 @@ def main():
         spec["output_dir"] = args.output_dir
     if args.name:
         spec["name"] = args.name
+    if args.analytic:
+        spec["analytic"] = True
     if args.evaluate:
         problem = problem_from_spec(spec, spec_dir)
         w, c = problem.wall, problem.camera

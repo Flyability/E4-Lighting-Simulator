@@ -101,6 +101,7 @@ data, not code:
 | `constraints` | `max_leds`, `led_cost` (fewer lights), `min_led_spacing_cm`, `keep_out` boxes |
 | `variables` | list of design-variable groups (below) |
 | `optimizer` | `differential_evolution` / `nelder_mead` / `random_search`, `max_evals`, `population`, `workers`, `seed` |
+| `analytic` (top level) | `true` scores with the closed-form direct illuminance instead of Monte-Carlo rays (exact, noise-free, ~20× faster per evaluation, no reflections); CLI `--analytic`, UI *⑤ Optimizer → Analytic direct light*. `use_gpu` selects the tracer's backend otherwise. |
 
 Variable groups (`type`):
 

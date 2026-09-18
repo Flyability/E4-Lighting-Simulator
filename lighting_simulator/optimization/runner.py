@@ -154,7 +154,7 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
     """
     from scipy import optimize
 
-    if problem.use_gpu and opt.workers != 1:
+    if problem.use_gpu and not problem.analytic and opt.workers != 1:
         # GPU contexts cannot be shared with forked/spawned evaluation workers.
         print("[optim] use_gpu=True: forcing workers=1")
         opt = OptimizerSpec(**{**asdict(opt), 'workers': 1})
@@ -163,14 +163,14 @@ def run(problem: Problem, opt: OptimizerSpec, output_dir="exports/optim", on_eva
     if out_dir.name != problem.name:
         print(f"[optim] '{problem.name}' already has results → writing to {out_dir}")
     logger = RunLogger(problem, out_dir, log_every=opt.log_every, on_eval=on_eval, stop_event=stop_event,
-                       confirm_best=opt.confirm_best)
+                       confirm_best=opt.confirm_best and not problem.analytic)
     bounds = problem.bounds
     lo = np.array([b[0] for b in bounds]); hi = np.array([b[1] for b in bounds])
     x0 = np.clip(np.asarray(opt.x0, float) if opt.x0 is not None else problem.x0, lo, hi)
     rng = np.random.default_rng(opt.seed)
 
     print(f"[optim] {problem.name}: {problem.dim} variables, method={opt.method}, budget={opt.max_evals} evals"
-          + (" [GPU]" if problem.use_gpu else ""))
+          + (" [analytic]" if problem.analytic else (" [GPU]" if problem.use_gpu else "")))
     stopped = False
     try:
         logger(x0)  # initial guess is eval #1 so ``best`` is always defined
