@@ -87,13 +87,22 @@ print("[smoke] groups:", groups)
 find("Group").value = groups[0]
 find("Panel movement").value = "Free (± position / rotation)"
 fire_update(find("Panel movement"))
-find("LED on / off").value = True
-find("Drive current (→ lumens)").value = True
-find("Enable flash mode").value = True
-fire_update(find("Enable flash mode"))
-find("LED roles (off / VIO / flash / both)").value = True
+find("Optimise LED on / off").value = True
+find("Beam angle").value = "Fixed value"
+fire_update(find("Beam angle"))
+find("Beam angle (°)").value = 110.0
+find("Flight / VIO flux per LED (lm)").value = 200.0
+find("Flash mode (photogrammetry pulse)").value = True
+fire_update(find("Flash mode (photogrammetry pulse)"))
+find("Flash flux per LED (lm)").value = 12000.0
+find("Electrical model (currents & drivers)").value = True
+fire_update(find("Electrical model (currents & drivers)"))
+find("Optimise drive current (→ flux)").value = True
+find("Optimise LED roles (off / VIO / flash / both)").value = True
 find("Max peak current in flash (A, 0 = off)").value = 60
-find("Require VIO FOV coverage").value = True
+find("Min average lux in FOV (0 = off)").value = 30000
+find("Add VIO coverage test case").value = True
+fire_update(find("Add VIO coverage test case"))
 find("Wall distances (cm)").value = "50, 150"
 find("Wall size").value = "Auto: fit camera FOV at each distance"
 find("Min beam angle off camera axis (°, 0 = off)").value = 30
@@ -123,8 +132,12 @@ find("Mirror partner group").value = find("Mirror partner group").options[2] if 
 n_rd = sum(1 for n in server.scene._handle_from_node_name if n.startswith("/optim_refine_duct/"))
 print("[smoke] refine-duct preview nodes:", n_rd)
 assert n_rd >= 5
-find("LED on / off").value = False
-find("LED roles (off / VIO / flash / both)").value = False
+find("Optimise LED on / off").value = False
+find("Optimise LED roles (off / VIO / flash / both)").value = False
+find("Electrical model (currents & drivers)").value = False  # lumens-only path
+fire_update(find("Electrical model (currents & drivers)"))
+find("Beam angle").value = "Optimise in range"
+fire_update(find("Beam angle"))
 find("Max evaluations").value = 20
 run_and_wait("refine on duct")
 find("Panel movement").value = "Free (± position / rotation)"
@@ -136,8 +149,8 @@ fire_update(find("Design mode"))
 find("Spec file").value = "ludo_refine"
 fire_update(find("Spec file"))
 find("Start from the current scene").value = True
-find("Use the Evaluation folder (walls, camera, emission)").value = True
-fire_update(find("Use the Evaluation folder (walls, camera, emission)"))
+find("Use the UI folders ② ③ ④ instead of the spec's").value = True
+fire_update(find("Use the UI folders ② ③ ④ instead of the spec's"))
 find("Max evaluations").value = 20
 run_and_wait("preset (overrides)")
 
@@ -146,19 +159,34 @@ find("Spec file").value = "elios4_ducts_flash_vio"
 fire_update(find("Spec file"))
 click("📋 Copy spec into the controls & switch mode")
 print("[smoke] after copy: mode=", find("Design mode").value, "radius=", find("Duct radius (cm)").value,
-      "tol arc=", find("± around the duct (cm along circumference)").value, "rows=", find("Max rows (along axis)").value)
+      "tol arc=", find("± around the duct (cm along circumference)").value, "rows=", find("Max rows (along axis)").value,
+      "electrical=", find("Electrical model (currents & drivers)").value,
+      "flash lm=", find("Flash flux per LED (lm)").value, "beam=", find("Lattice beam angle").value)
 assert find("Design mode").value == MODE_DUCTS
+assert find("Electrical model (currents & drivers)").value is True
+assert abs(find("Flash flux per LED (lm)").value - 13.0 * 6.0 * 180.0) < 1e-6
+assert find("Lattice beam angle").value == "Optimise in range"
 
 # --- mode 2: ducts -----------------------------------------------------------
 find("± duct centre shift (cm)").value = (2.0, 2.0, 0.0)
 find("Optimise LED roles (VIO / flash / both)").value = True
 find("Mirror tilt top / bottom").value = True
 find("Add ±tilt FOV test case").value = True
+fire_update(find("Add ±tilt FOV test case"))
 find("T3 room grid per wall").value = 16
 find("Max evaluations").value = 30
 find("Method").value = "random_search"
 find("Rays per pixel").value = 50
-run_and_wait("ducts (T1 flash + T2 + T3)")
+run_and_wait("ducts (T1 flash + T2 + T3, electrical)")
+
+# lumens-only ducts with a fixed beam angle
+find("Electrical model (currents & drivers)").value = False
+fire_update(find("Electrical model (currents & drivers)"))
+find("Lattice beam angle").value = "Fixed value"
+fire_update(find("Lattice beam angle"))
+find("Lattice beam angle (°)").value = 100.0
+find("Max evaluations").value = 12
+run_and_wait("ducts (lumens only, fixed beam)")
 
 # tilted ducts + VIO scored on the five room walls
 find("Duct rotation X/Y/Z (°)").value = (8.0, -5.0, 0.0)

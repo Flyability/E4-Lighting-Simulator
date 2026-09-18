@@ -238,21 +238,25 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
             rows.append([f"  room {wl.wall_dist:g} cm: U0 up / down", *[_cell(e, ('up', 'down')) for e in evs]])
             rows.append([f"  room {wl.wall_dist:g} cm: coverage up / down", *[_cell(e, ('cov_up', 'cov_down')) for e in evs]])
     rows.append(["— Hardware —", *[""] * len(labels)])
-    rows += [
-        ["Active LEDs", *[str(e.n_active) for e in evs]],
-        ["Drivers", *[str(e.n_drivers) for e in evs]],
-        ["Continuous current", *[f"{e.total_current_a:.1f} A" for e in evs]],
-    ]
-    if any(e.electrical for e in evs):
+    rows.append(["Active LEDs", *[str(e.n_active) for e in evs]])
+    if problem.electrical:
         rows += [
-            ["LED roles vio / flash / both", *[
-                f"{e.electrical.get('n_vio', 0)} / {e.electrical.get('n_flash', 0)} / {e.electrical.get('n_both', 0)}"
-                for e in evs]],
+            ["Drivers", *[str(e.n_drivers) for e in evs]],
+            ["Continuous current", *[f"{e.total_current_a:.1f} A" for e in evs]],
+        ]
+    if any(e.electrical for e in evs):
+        rows.append(["LED roles vio / flash / both", *[
+            f"{e.electrical.get('n_vio', 0)} / {e.electrical.get('n_flash', 0)} / {e.electrical.get('n_both', 0)}"
+            for e in evs]])
+    if any('n_pulse_drivers' in e.electrical for e in evs):
+        rows += [
             ["Pulse / continuous drivers", *[
                 f"{e.electrical.get('n_pulse_drivers', 0)} / {e.electrical.get('n_cont_drivers', 0)}" for e in evs]],
             ["Peak current (flash)", *[f"{e.electrical.get('peak_current_a', 0):.1f} A" for e in evs]],
         ]
     for mode in problem.modes:
+        lm = problem.flash_lumens if mode.is_flash else problem.flight_lumens
+        rows.append([f"{mode.name}: flux per LED", *[f"{lm:,.0f} lm" if lm else "scene" for _ in evs]])
         rows.append([f"{mode.name}: E_avg in FOV", *[
             f"{e.modes.get(mode.name, {}).get('e_avg', 0):,.0f} lx" for e in evs]])
         rows.append([f"{mode.name}: LEDs lit", *[str(e.modes.get(mode.name, {}).get('n_leds', '—')) for e in evs]])
@@ -268,7 +272,7 @@ def _page_summary(w: _Writer, problem, opt, designs, n_evals, elapsed, stopped, 
         w.gap(0.004)
         w.line(f"⚠ penalty '{k}' is identical for every design ({evs[0].penalties[k]:.3f}): this target does not "
                "steer the search (unreachable or saturated). Relax it, add a variable that can act on it "
-               "(e.g. drive current), or drop it.", size=8.5, color="#b26a00")
+               "(e.g. the flux or the LED count), or drop it.", size=8.5, color="#b26a00")
 
     if len(evs) > 1 and evs[0].score > 0:
         gain = (evs[0].score - evs[1].score) / evs[0].score * 100
@@ -289,16 +293,21 @@ def _page_problem(w: _Writer, problem, designs):
     c = problem.camera
     w.line(f"Main camera: position ({c.pos_x:g}, {c.pos_y:g}) cm, pitch {c.pitch:g}°, FOV {c.fov_h:g}° × {c.fov_v:g}°")
     e = problem.emission
-    w.line(f"Emission: default {e.default_lumens:g} lm/LED, focus factor {e.ray_uniformity:g}"
+    w.line(f"Emission: default {e.default_lumens:g} lm/LED"
+           + (f" (every LED forced to {problem.flight_lumens:,.0f} lm in flight)" if problem.flight_lumens else "")
+           + f", focus factor {e.ray_uniformity:g}"
            + (";  diffuser " + f"{problem.diffuser[0]:g}° × {problem.diffuser[1]*100:.0f} %" if problem.diffuser else "")
            + (";  STL occluder active" if problem.stl_mesh is not None else ""))
-    d = problem.driver
-    w.line(f"Pulse driver model: {d.voltage_v:g} V, {d.efficacy_lm_per_w:g} lm/W → {d.lumens(1.0):,.0f} lm/A, "
-           f"max {d.max_current_a:g} A per LED, {d.leds_per_driver} LED(s) per driver")
-    if problem.cont_driver is not problem.driver:
-        cd = problem.cont_driver
-        w.line(f"Continuous driver model ('vio' LEDs): max {cd.max_current_a:g} A per LED, "
-               f"{cd.leds_per_driver} LED(s) per driver")
+    if problem.electrical:
+        d = problem.driver
+        w.line(f"Electrical model on — pulse driver: {d.voltage_v:g} V, {d.efficacy_lm_per_w:g} lm/W → "
+               f"{d.lumens(1.0):,.0f} lm/A, max {d.max_current_a:g} A per LED, {d.leds_per_driver} LED(s) per driver")
+        if problem.cont_driver is not problem.driver:
+            cd = problem.cont_driver
+            w.line(f"Continuous driver model ('vio' LEDs): max {cd.max_current_a:g} A per LED, "
+                   f"{cd.leds_per_driver} LED(s) per driver")
+    else:
+        w.line("Electrical model off: fluxes are set per mode in lumens; no driver / current penalties.")
     if problem.vio is not None:
         v = problem.vio
         w.line(f"VIO cameras: at {_fmt(list(v.position))} cm, cam1 pitch {v.cam1_pitch:g}° yaw {v.cam1_yaw:g}°, "
@@ -308,10 +317,15 @@ def _page_problem(w: _Writer, problem, designs):
     if problem.modes:
         w.heading("Operating modes")
         for m in problem.modes:
-            parts = [(f"pulse: flash + both LEDs at {m.current_a:g} A, vio LEDs continuous — this is the image judged "
-                      "in T1 and T3" if m.is_flash
-                      else f"continuous: vio + both LEDs, flux × {m.lumens_scale:g}"
-                      + (" — judged in T2 only" if problem.flash_modes else " — the image judged in T1 and T3"))]
+            if m.is_flash:
+                src = f"{problem.flash_lumens:,.0f} lm" + (f" ({m.current_a:g} A)" if m.current_a is not None else "")
+                parts = [f"pulse: flash + both LEDs at {src} per LED, vio LEDs continuous — this is the image judged "
+                         "in T1 and T3"]
+            else:
+                src = f"{problem.flight_lumens:,.0f} lm per LED" if problem.flight_lumens else "scene flux"
+                parts = [f"continuous: vio + both LEDs at {src}"
+                         + (f" × {m.lumens_scale:g}" if m.lumens_scale != 1.0 else "")
+                         + (" — judged in T2 only" if problem.flash_modes else " — the image judged in T1 and T3")]
             if m.min_avg_lux:
                 parts.append(f"E_avg ≥ {m.min_avg_lux:,.0f} lx"
                              + (f" at {m.min_avg_lux_dist:g} cm" if m.min_avg_lux_dist else "") + f" (w={m.lux_weight:g})")
@@ -365,8 +379,8 @@ def _page_method(w: _Writer, problem):
            "as configs/*.json) and the scene is built with the exact same code as the UI. The design is then "
            "judged on three independent test cases — each with its own geometry, operating mode and camera — "
            "plus hardware penalties. Two illuminance images exist when a flash mode is defined: the flight "
-           "image (VIO + Both LEDs at continuous current) and the flash image (Flash + Both LEDs at the "
-           "pulse current, VIO LEDs continuous). The main camera only records during the flash, so T1 and T3 "
+           "image (VIO + Both LEDs at their continuous flux) and the flash image (Flash + Both LEDs at the "
+           "pulse flux, VIO LEDs continuous). The main camera only records during the flash, so T1 and T3 "
            "judge the flash image; the VIO cameras never see the flash, so T2 judges the flight image."
            if has_flash else
            "Each candidate decision vector x is decoded into a regular saved configuration (same JSON schema "
@@ -455,11 +469,11 @@ def _page_method(w: _Writer, problem):
         w.math(rf"P_{{led}} = {c.led_cost:g}\cdot N_{{LED}}")
     if c.max_leds is not None:
         w.math(rf"P_{{maxled}} = {c.max_leds_weight:g}\cdot\max(0,\ N_{{LED}} - {c.max_leds})")
-    if c.driver_cost:
+    if c.driver_cost and problem.electrical:
         w.math(rf"P_{{drv}} = {c.driver_cost:g}\cdot N_{{drv}},\qquad N_{{drv}} = \left\lceil N_{{LED}} / {problem.driver.leds_per_driver} \right\rceil")
-    if c.max_drivers is not None:
+    if c.max_drivers is not None and problem.electrical:
         w.math(rf"P_{{maxdrv}} = {c.max_drivers_weight:g}\cdot\max(0,\ N_{{drv}} - {c.max_drivers})")
-    if c.max_total_current_a:
+    if c.max_total_current_a and problem.electrical:
         w.math(rf"P_{{I}} = {c.current_weight:g}\,\max\!\left(0,\ \frac{{\sum_i I_i - {c.max_total_current_a:g}}}{{{c.max_total_current_a:g}}}\right),"
                rf"\qquad I_i = \frac{{\Phi_i}}{{V\cdot\eta}}")
     if c.min_led_spacing_cm:
@@ -484,7 +498,9 @@ def _page_method(w: _Writer, problem):
     if has_flash:
         w.line("The flash image is traced, not rescaled: 'vio', 'both' and 'flash' LEDs are traced as separate "
                "groups (sharing the ray budget in proportion to their counts) and superposed with the pulse flux "
-               "Φ = I_flash·V·η applied to the flash / both group.", size=8.5, color="#444", indent=0.03)
+               f"Φ = {problem.flash_lumens:,.0f} lm"
+               + (" (= I_flash·V·η)" if problem.electrical and problem.flash_modes[0].lumens is None else "")
+               + " applied to the flash / both group.", size=8.5, color="#444", indent=0.03)
     w.gap(0.004)
     w.line("Optimiser:", weight="bold")
     w.line("Differential evolution (scipy) evolves a population inside the bounds and keeps improvements; "
@@ -552,7 +568,7 @@ def _page_convergence(pdf, problem, records, designs):
     ax.plot(ev_no, _trend(nled), **trend_kw)
     if ndrv.any():
         ax.plot(ev_no, ndrv, ".", ms=2, color="#c62828", label="drivers")
-    ax.set_title("Active LEDs / drivers"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
+    ax.set_title("Active LEDs / drivers" if ndrv.any() else "Active LEDs"); ax.set_xlabel("evaluation"); ax.legend(fontsize=7)
 
     ax = axs[2, 1]
     labels = list(designs.keys())
@@ -748,7 +764,7 @@ def _page_vio_room(pdf, problem, designs):
                    "lux (flight image)")
     fig.text(MARGIN, 0.02, textwrap.fill(
         "Cube net seen from inside the room: side / top / bottom walls fold out around the front wall (no back "
-        "wall). +Y is to the viewer's left. Monte-Carlo trace of the VIO + Both LEDs at continuous current; only "
+        "wall). +Y is to the viewer's left. Monte-Carlo trace of the VIO + Both LEDs at their continuous flux; only "
         "the cells inside the cyan fisheye footprints count. Grids are coarse on purpose.", 150),
         fontsize=7.5, color="#444", va="bottom")
     pdf.savefig(fig)
@@ -797,7 +813,6 @@ def _page_flash_heatmaps(pdf, problem, designs):
     labels = list(designs.keys())
     if not problem.flash_modes or not any(designs[l][1].flight_grid is not None for l in labels):
         return
-    flash_mode = problem.flash_modes[0]
     pct = problem.objective.min_percentile
 
     def _grid(ev, attr, wi):
@@ -813,8 +828,8 @@ def _page_flash_heatmaps(pdf, problem, designs):
         axs = np.atleast_2d(fig.subplots(len(labels), 2, squeeze=False))
         fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.10, hspace=0.35, wspace=0.3)
         half = wl.wall_size / 2
-        cols = [("flight — VIO + Both LEDs, continuous current (not judged)", "flight_grid"),
-                (f"flash — Flash + Both LEDs at {flash_mode.current_a:g} A (+ VIO continuous) — T1", "grid")]
+        cols = [("flight — VIO + Both LEDs, continuous flux (not judged)", "flight_grid"),
+                (f"flash — Flash + Both LEDs at {problem.flash_lumens:,.0f} lm (+ VIO continuous) — T1", "grid")]
         for j, (title, attr) in enumerate(cols):
             grids = [_grid(designs[l][1], attr, wi) for l in labels]
             vmax = max([float(np.nanmax(g)) for g in grids if g is not None] + [1e-9])

@@ -9,6 +9,7 @@ from lighting_simulator.optimization import (
     Duct,
     DuctRingLayout,
     LedStates,
+    ModeSpec,
     OptimizerSpec,
     PanelPose,
     Problem,
@@ -176,6 +177,41 @@ def test_evaluate_scores_and_penalties():
     assert ev.penalties['spacing'] > 0
     assert 0 <= ev.uniformity_pct <= 100 and ev.score > 0
     assert problem(problem.x0) == pytest.approx(ev.score)
+
+
+def test_lumens_only_modes_without_electrical_model():
+    """Default: fluxes come from the modes in lumens; no driver / current bookkeeping."""
+    cfg = load_config("configs/elios3.json")
+    var = DuctRingLayout(name="d", duct=Duct(center=(8, 9, 0), radius=7), n_leds=4, placement="arc",
+                         tilt_axial_range=None, lumens=250.0)
+    assert not any("current" in n for n in var.names)
+    modes = [ModeSpec(name="flight", lumens=500.0), ModeSpec(name="flash", flash=True, lumens=20000.0,
+                                                               min_avg_lux=1000.0)]
+    problem = Problem(cfg, [var], WALL, CAM, clear_base=True, modes=modes,
+                      constraints=ConstraintSpec(driver_cost=0.5, max_total_current_a=0.1))
+    assert problem.flash_lumens == 20000.0 and problem.flight_lumens == 500.0
+    cfgd = problem.decode(problem.x0)
+    assert cfgd['custom_groups'][0]['lumens_value'] == 250.0  # group override (ignored: flight lumens wins)
+    ev = problem.evaluate(problem.x0, keep_grid=True)
+    assert ev.n_drivers == 0 and ev.total_current_a == 0.0
+    assert set(ev.electrical) == {'n_vio', 'n_flash', 'n_both'} and ev.electrical['n_both'] == 4
+    assert not {'driver_cost', 'current', 'peak_current'} & set(ev.penalties)
+    assert ev.modes['flight']['lumens'] == 500.0 and ev.modes['flash']['lumens'] == 20000.0
+    grid = ev.grid if not isinstance(ev.grid, list) else ev.grid[0]
+    fgrid = ev.flight_grid if not isinstance(ev.flight_grid, list) else ev.flight_grid[0]
+    assert float(grid.sum()) == pytest.approx(float(fgrid.sum()) * 40.0, rel=0.15)
+    # the same design with the electrical model on reports drivers and currents
+    prob_el = Problem(cfg, [var], WALL, CAM, clear_base=True, modes=modes, electrical=True,
+                      constraints=ConstraintSpec(driver_cost=0.5))
+    ev2 = prob_el.evaluate(problem.x0)
+    assert ev2.n_drivers == 4 and ev2.penalties['driver_cost'] == pytest.approx(2.0)
+    assert ev2.electrical['peak_current_a'] == pytest.approx(4 * 20000.0 / (6.0 * 180.0))
+    with pytest.raises(ValueError, match="needs 'lumens'"):
+        Problem(cfg, [var], WALL, CAM, modes=[ModeSpec(name="flash", flash=True)])
+    spec, spec_dir = load_spec("optimization_specs/elios4_ducts_flash_vio.json")
+    spec.pop('electrical')
+    with pytest.raises(ValueError, match="electrical"):
+        problem_from_spec(spec, spec_dir)
 
 
 @pytest.mark.parametrize("method", ["differential_evolution", "nelder_mead", "random_search"])

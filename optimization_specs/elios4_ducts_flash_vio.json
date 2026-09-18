@@ -8,6 +8,7 @@
   "emission": { "default_lumens": 168, "ray_uniformity": 0.0 },
   "camera":   { "pos_x": 10, "pos_y": -4, "pitch": 0, "fov_h": 75, "fov_v": 60 },
 
+  "electrical": true,
   "driver": { "voltage_v": 6.0, "efficacy_lm_per_w": 180.0, "max_current_a": 13.0, "leds_per_driver": 4 },
 
   "vio": {

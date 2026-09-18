@@ -148,7 +148,9 @@ class DuctRingLayout(VariableGroup):
     """Whether the role variable may switch an LED off. Default: only when the counts are fixed."""
     default_role: str = "both"
     current_range: tuple | None = None
-    """Shared drive current (A); converted to lumens with ``driver``."""
+    """Shared drive current (A); converted to lumens with ``driver`` (electrical model on)."""
+    lumens: float | None = None
+    """Fixed continuous flux per LED (lm) written as a group override; None = scene default."""
     driver: DriverModel = field(default_factory=DriverModel)
     led_size: float = 0.5
     color: tuple = (1.0, 0.0, 1.0)
@@ -328,6 +330,10 @@ class DuctRingLayout(VariableGroup):
         states = [all_states[s] for s in slots]
         roles = [all_roles[s] for s in slots]
         current_a = float(next(it)) if self.current_range is not None else None
+        if current_a is not None:
+            lumens = self.driver.lumens(current_a)
+        else:
+            lumens = float(self.lumens) if self.lumens is not None else None
 
         positions, directions, row_dirs = [], [], []
         for i, (th, ax) in enumerate(zip(thetas, axials)):
@@ -359,8 +365,8 @@ class DuctRingLayout(VariableGroup):
             'led_rows': rows,
             'led_euler_angles': [],
             'led_lumens': [],
-            'lumens_override_enabled': current_a is not None,
-            'lumens_value': self.driver.lumens(current_a) if current_a is not None else 100,
+            'lumens_override_enabled': lumens is not None,
+            'lumens_value': lumens if lumens is not None else 100,
             'drive_current_a': current_a,
             'template_name': None,
             'initial_pos': [0.0, 0.0, 0.0],

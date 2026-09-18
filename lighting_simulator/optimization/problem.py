@@ -17,8 +17,9 @@ geometry / electrical penalties (see ``Problem.evaluate_config``):
 Operating modes (``ModeSpec``) share the geometry. Each LED has a *role*
 (``domain.led``): 'vio' LEDs are on continuously, 'flash' LEDs only fire during the
 photogrammetry pulse, 'both' do both. The flash image is "vio LEDs at their continuous
-flux + flash/both LEDs at the pulse current", the flight image "vio + both at their
-continuous flux".
+flux + flash/both LEDs at the pulse flux", the flight image "vio + both at their
+continuous flux". Each mode sets its per-LED flux directly (``ModeSpec.lumens``); the
+electrical model (currents, drivers, ``DriverModel``) is optional (``Problem(electrical=True)``).
 """
 
 from __future__ import annotations
@@ -193,13 +194,18 @@ class TiltRoom:
 class ModeSpec:
     """An operating point of the same hardware (e.g. 'flight' vs 'flash').
 
-    A mode with ``current_a`` is a *flash* (pulse) mode: 'flash' and 'both' LEDs run at
-    that current while 'vio' LEDs keep their continuous flux. A mode without it is a
-    *flight* mode ('vio' + 'both' at continuous flux, ``lumens_scale`` applied).
+    A *flash* (pulse) mode (``flash=True`` or ``current_a`` set): 'flash' and 'both' LEDs run at
+    the pulse flux while 'vio' LEDs keep their continuous flux. Any other mode is a *flight*
+    mode ('vio' + 'both' at continuous flux, ``lumens_scale`` applied).
     """
 
     name: str = "normal"
+    lumens: float | None = None
+    """Per-LED flux (lm) in this mode. Flight: replaces the scene flux of every LED (panel
+    overrides included); flash: the pulse flux. None = scene flux (flight) / ``current_a`` via
+    the driver model (flash)."""
     current_a: float | None = None
+    """Pulse current (A); only converted to flux when ``lumens`` is not given."""
     lumens_scale: float = 1.0
     flash: bool | None = None
     """Force pulse (True) / flight (False) semantics; None = pulse iff ``current_a`` is set."""
@@ -274,13 +280,14 @@ class Evaluation:
     total_current_a: float = 0.0
     """Summed continuous current (flight)."""
     modes: dict = field(default_factory=dict)
-    """Per-mode diagnostics: ``{name: {'e_avg', 'vio_fraction', 'scale', 'uniformity_pct', 'n_leds'}}``."""
+    """Per-mode diagnostics: ``{name: {'e_avg', 'vio_fraction', 'scale', 'uniformity_pct', 'n_leds', 'lumens'}}``."""
     tilt: dict = field(default_factory=dict)
     """T3 U-metric (%) ``{'up': .., 'down': ..}``, mean over wall distances, when ``tilt_fov_deg`` is set."""
     tilt_walls: list = field(default_factory=list)
     """T3 per wall distance: ``[{'up': U%, 'down': U%, 'cov_up': f, 'cov_down': f}, ...]``."""
     electrical: dict = field(default_factory=dict)
-    """``{'n_pulse_drivers', 'n_cont_drivers', 'peak_current_a', 'n_vio', 'n_flash', 'n_both'}`` with a flash mode."""
+    """``{'n_vio', 'n_flash', 'n_both'}`` with a flash mode, plus ``{'n_pulse_drivers', 'n_cont_drivers',
+    'peak_current_a'}`` when the electrical model is on."""
     flight_grid: np.ndarray | None = None
     """Flight image per wall when a flash mode exists (reported, not scored)."""
     tilt_grids: list | None = None
@@ -296,9 +303,11 @@ class Evaluation:
             s += f" drv={self.n_drivers} I={self.total_current_a:.1f}A"
         el = self.electrical
         if el:
-            s += (f" [vio {el.get('n_vio', 0)} / flash {el.get('n_flash', 0)} / both {el.get('n_both', 0)};"
-                  f" pulse drv {el.get('n_pulse_drivers', 0)}, cont drv {el.get('n_cont_drivers', 0)},"
-                  f" peak {el.get('peak_current_a', 0):.1f}A]")
+            s += f" [vio {el.get('n_vio', 0)} / flash {el.get('n_flash', 0)} / both {el.get('n_both', 0)}"
+            if 'n_pulse_drivers' in el:
+                s += (f"; pulse drv {el['n_pulse_drivers']}, cont drv {el['n_cont_drivers']},"
+                      f" peak {el['peak_current_a']:.1f}A")
+            s += "]"
         for name, m in self.modes.items():
             parts = [f"Eavg={m['e_avg']:.0f}lx"]
             if m.get('uniformity_pct') is not None:
@@ -340,7 +349,7 @@ class Problem:
                  constraints: ConstraintSpec | None = None, clear_base=False, name="optim",
                  wall_dists=None, use_gpu=False, stl_mesh=None, diffuser=None,
                  driver: DriverModel | None = None, vio: VioSpec | None = None, modes=None,
-                 wall_sizes=None, cont_driver: DriverModel | None = None):
+                 wall_sizes=None, cont_driver: DriverModel | None = None, electrical=False):
         """``wall_dists``: optional list of distances (cm); the score is averaged over them
         so a layout is optimised for a range instead of a single wall distance.
         ``wall_sizes``: matching list of wall extents (cm), or ``"auto"`` to fit each wall
@@ -348,13 +357,16 @@ class Problem:
 
         ``use_gpu`` traces on the GPU backend (single process only). ``stl_mesh`` /
         ``diffuser`` are forwarded to ``build_scene_from_config`` so the UI scene is
-        reproduced exactly. ``driver`` is the pulse-class driver (flash / both LEDs),
-        ``cont_driver`` the continuous class ('vio' LEDs; defaults to ``driver``);
-        ``vio`` + ``modes`` add the per-operating-point lux / VIO-coverage targets."""
+        reproduced exactly. ``vio`` + ``modes`` add the per-operating-point lux / VIO-coverage
+        targets. ``electrical`` turns on the current / driver model: ``driver`` is the
+        pulse-class driver (flash / both LEDs), ``cont_driver`` the continuous class ('vio'
+        LEDs; defaults to ``driver``); off, fluxes come straight from the modes and no
+        driver / current penalty is computed."""
         self.name = name
         self.use_gpu = bool(use_gpu)
         self.stl_mesh = stl_mesh
         self.diffuser = diffuser
+        self.electrical = bool(electrical)
         self.driver = driver or DriverModel()
         self.cont_driver = cont_driver or self.driver
         self.vio = vio
@@ -362,6 +374,9 @@ class Problem:
         self.flash_modes = [m for m in self.modes if m.is_flash]
         if len(self.flash_modes) > 1:
             raise ValueError("at most one flash (pulse) mode is supported")
+        if self.flash_modes and self.flash_modes[0].lumens is None and self.flash_modes[0].current_a is None:
+            raise ValueError(f"flash mode '{self.flash_modes[0].name}' needs 'lumens' (or 'current_a')")
+        self.flight_mode = next((m for m in self.modes if not m.is_flash), None)
         self.base_cfg = copy.deepcopy(base_cfg)
         if clear_base:
             self.base_cfg['custom_groups'] = []
@@ -431,6 +446,20 @@ class Problem:
     def dim(self):
         return len(self.names)
 
+    @property
+    def flash_lumens(self):
+        """Pulse flux per flash / both LED (lm), or None without a flash mode."""
+        if not self.flash_modes:
+            return None
+        m = self.flash_modes[0]
+        return float(m.lumens) if m.lumens is not None else self.driver.lumens(m.current_a)
+
+    @property
+    def flight_lumens(self):
+        """Continuous flux forced on every LED (lm), or None to keep the scene's fluxes."""
+        m = self.flight_mode
+        return float(m.lumens) if (m is not None and m.lumens is not None) else None
+
     def decode(self, x):
         """Config dict for a decision vector."""
         x = np.asarray(x, dtype=float)
@@ -453,36 +482,41 @@ class Problem:
         """
         scene = self.build_scene(cfg)
         active = scene.active_leds
+        if self.flight_lumens is not None:
+            active = _with_lumens(active, self.flight_lumens)
         flash_mode = self.flash_modes[0] if self.flash_modes else None
+        flash_lumens = self.flash_lumens
         by_role = split_by_role(active)
         flight_leds = by_role['vio'] + by_role['both']
         pulse_leds = by_role['flash'] + by_role['both']
         electrical = {}
+        n_drivers, total_current, peak_current = 0, 0.0, 0.0
         if flash_mode is not None:
-            # Two driver classes: 'vio' LEDs on continuous drivers, flash/both on pulse drivers.
-            cont_current = float(self.cont_driver.led_currents(flight_leds).sum()) if flight_leds else 0.0
-            vio_current = float(self.cont_driver.led_currents(by_role['vio']).sum()) if by_role['vio'] else 0.0
-            peak_current = vio_current + len(pulse_leds) * float(flash_mode.current_a)
-            n_pulse_drv = self.driver.n_drivers(len(pulse_leds))
-            n_cont_drv = self.cont_driver.n_drivers(len(by_role['vio']))
-            n_drivers = n_pulse_drv + n_cont_drv
-            total_current = cont_current
-            electrical = {'n_pulse_drivers': n_pulse_drv, 'n_cont_drivers': n_cont_drv,
-                          'peak_current_a': peak_current, 'n_vio': len(by_role['vio']),
-                          'n_flash': len(by_role['flash']), 'n_both': len(by_role['both'])}
+            electrical = {'n_vio': len(by_role['vio']), 'n_flash': len(by_role['flash']), 'n_both': len(by_role['both'])}
+            if self.electrical:
+                # Two driver classes: 'vio' LEDs on continuous drivers, flash/both on pulse drivers.
+                cont_current = float(self.cont_driver.led_currents(flight_leds).sum()) if flight_leds else 0.0
+                vio_current = float(self.cont_driver.led_currents(by_role['vio']).sum()) if by_role['vio'] else 0.0
+                peak_current = vio_current + len(pulse_leds) * self.driver.current(flash_lumens)
+                n_pulse_drv = self.driver.n_drivers(len(pulse_leds))
+                n_cont_drv = self.cont_driver.n_drivers(len(by_role['vio']))
+                n_drivers = n_pulse_drv + n_cont_drv
+                total_current = cont_current
+                electrical.update({'n_pulse_drivers': n_pulse_drv, 'n_cont_drivers': n_cont_drv,
+                                   'peak_current_a': peak_current})
         else:
             flight_leds = active  # no pulse mode: every LED is continuous, roles are irrelevant
-            currents = self.driver.led_currents(active)
-            n_drivers = self.driver.n_drivers(len(active))
-            total_current = float(currents.sum()) if len(active) else 0.0
-            peak_current = total_current
+            if self.electrical:
+                currents = self.driver.led_currents(active)
+                n_drivers = self.driver.n_drivers(len(active))
+                total_current = float(currents.sum()) if len(active) else 0.0
+                peak_current = total_current
         penalties = self._geometry_penalties(active, n_drivers, total_current, electrical, peak_current)
 
         if not active:
             return Evaluation(score=10.0 + sum(penalties.values()), uniformity_pct=0.0, coverage=0.0,
                               e_avg=0.0, n_active=0, penalties=penalties)
 
-        flash_lumens = self.driver.lumens(flash_mode.current_a) if flash_mode is not None else None
         m = self.objective.metric
         cov_w = float(self.objective.coverage_weight)
 
@@ -610,13 +644,7 @@ class Problem:
         g_vio = self._trace_leds(by_role['vio'], wall, len(by_role['vio']) / n, scene)
         g_both = self._trace_leds(by_role['both'], wall, len(by_role['both']) / n, scene)
         pulse = by_role['flash'] + by_role['both']
-        pulse_leds = []
-        for p in pulse:  # copies so the scene's continuous flux is untouched
-            p2 = copy.copy(p)
-            p2.led = copy.copy(p.led)
-            p2.led.lumens = float(flash_lumens)
-            pulse_leds.append(p2)
-        g_pulse = self._trace_leds(pulse_leds, wall, len(pulse) / n, scene)
+        g_pulse = self._trace_leds(_with_lumens(pulse, flash_lumens), wall, len(pulse) / n, scene)
         return g_vio + g_both, g_vio + g_pulse
 
     def _trace(self, scene, wall):
@@ -644,7 +672,7 @@ class Problem:
         """Continuous operating point: 'vio' + 'both' LEDs at their flux (× ``lumens_scale``)."""
         scale = float(mode.lumens_scale)
         info = {'scale': scale, 'e_avg': self._pick_wall(mode, e_avgs) * scale, 'vio_fraction': None,
-                'uniformity_pct': float(np.mean(unis)) if unis else None}
+                'uniformity_pct': float(np.mean(unis)) if unis else None, 'lumens': self.flight_lumens}
         if mode.min_avg_lux:
             short = max(0.0, (mode.min_avg_lux - info['e_avg']) / mode.min_avg_lux)
             if short > 0:
@@ -664,7 +692,8 @@ class Problem:
     def _flash_mode_penalties(self, mode: ModeSpec, unis, e_avgs, penalties):
         """Pulse operating point: its image IS the T1 image, so only the lux target is added here."""
         info = {'scale': None, 'e_avg': self._pick_wall(mode, e_avgs) if e_avgs else 0.0,
-                'vio_fraction': None, 'uniformity_pct': float(np.mean(unis)) if unis else None}
+                'vio_fraction': None, 'uniformity_pct': float(np.mean(unis)) if unis else None,
+                'lumens': self.flash_lumens}
         if mode.min_avg_lux:
             short = max(0.0, (mode.min_avg_lux - info['e_avg']) / mode.min_avg_lux)
             if short > 0:
@@ -680,23 +709,24 @@ class Problem:
             pen['led_cost'] = c.led_cost * n
         if c.max_leds is not None and n > c.max_leds:
             pen['max_leds'] = c.max_leds_weight * (n - c.max_leds)
-        if c.driver_cost:
-            pen['driver_cost'] = c.driver_cost * n_drivers
-        if c.max_drivers is not None and n_drivers > c.max_drivers:
-            pen['max_drivers'] = c.max_drivers_weight * (n_drivers - c.max_drivers)
-        if el:
-            if c.pulse_driver_cost:
-                pen['pulse_driver_cost'] = c.pulse_driver_cost * el['n_pulse_drivers']
-            if c.max_pulse_drivers is not None and el['n_pulse_drivers'] > c.max_pulse_drivers:
-                pen['max_pulse_drivers'] = c.max_drivers_weight * (el['n_pulse_drivers'] - c.max_pulse_drivers)
-            if c.cont_driver_cost:
-                pen['cont_driver_cost'] = c.cont_driver_cost * el['n_cont_drivers']
-            if c.max_cont_drivers is not None and el['n_cont_drivers'] > c.max_cont_drivers:
-                pen['max_cont_drivers'] = c.max_drivers_weight * (el['n_cont_drivers'] - c.max_cont_drivers)
-        if c.max_total_current_a and total_current > c.max_total_current_a:
-            pen['current'] = c.current_weight * (total_current - c.max_total_current_a) / c.max_total_current_a
-        if c.max_peak_current_a and peak_current > c.max_peak_current_a:
-            pen['peak_current'] = c.peak_current_weight * (peak_current - c.max_peak_current_a) / c.max_peak_current_a
+        if self.electrical:
+            if c.driver_cost:
+                pen['driver_cost'] = c.driver_cost * n_drivers
+            if c.max_drivers is not None and n_drivers > c.max_drivers:
+                pen['max_drivers'] = c.max_drivers_weight * (n_drivers - c.max_drivers)
+            if 'n_pulse_drivers' in el:
+                if c.pulse_driver_cost:
+                    pen['pulse_driver_cost'] = c.pulse_driver_cost * el['n_pulse_drivers']
+                if c.max_pulse_drivers is not None and el['n_pulse_drivers'] > c.max_pulse_drivers:
+                    pen['max_pulse_drivers'] = c.max_drivers_weight * (el['n_pulse_drivers'] - c.max_pulse_drivers)
+                if c.cont_driver_cost:
+                    pen['cont_driver_cost'] = c.cont_driver_cost * el['n_cont_drivers']
+                if c.max_cont_drivers is not None and el['n_cont_drivers'] > c.max_cont_drivers:
+                    pen['max_cont_drivers'] = c.max_drivers_weight * (el['n_cont_drivers'] - c.max_cont_drivers)
+            if c.max_total_current_a and total_current > c.max_total_current_a:
+                pen['current'] = c.current_weight * (total_current - c.max_total_current_a) / c.max_total_current_a
+            if c.max_peak_current_a and peak_current > c.max_peak_current_a:
+                pen['peak_current'] = c.peak_current_weight * (peak_current - c.max_peak_current_a) / c.max_peak_current_a
         if n and c.min_beam_angle_deg:
             dirs = np.array([led.direction for led in active], dtype=float)
             dirs /= np.maximum(np.linalg.norm(dirs, axis=1, keepdims=True), 1e-12)
@@ -729,6 +759,17 @@ class Problem:
                     depth = np.min((half - np.abs(pos[inside] - center)) / half, axis=1)
                     pen[f'keep_out{i}'] = c.keep_out_weight * float(depth.sum())
         return pen
+
+
+def _with_lumens(leds, lumens):
+    """Copies of LED placements with their flux replaced (the scene's own LEDs are untouched)."""
+    out = []
+    for p in leds:
+        p2 = copy.copy(p)
+        p2.led = copy.copy(p.led)
+        p2.led.lumens = float(lumens)
+        out.append(p2)
+    return out
 
 
 _LEGACY_KEYS = {
@@ -783,6 +824,7 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     objective = ObjectiveSpec(**_drop_legacy(dict(spec.get('objective', {})), 'objective'))
     constraints = ConstraintSpec(**spec.get('constraints', {}))
     clear_base = bool(spec.get('clear_base', False))
+    electrical = bool(spec.get('electrical', False))
     driver = DriverModel(**spec.get('driver', {}))
     cont_driver = DriverModel(**{**spec.get('driver', {}), **spec['cont_driver']}) if spec.get('cont_driver') else None
     vio = VioSpec(**_drop_legacy(dict(spec['vio']), 'vio')) if spec.get('vio') else None
@@ -794,14 +836,17 @@ def problem_from_spec(spec, spec_dir: Path | None = None, base_cfg=None, **probl
     variables = []
     for v in spec['variables']:
         v = dict(v)
-        if v.get('type') in ('duct_ring', 'group_current'):
+        if v.get('type') == 'group_current' or (v.get('type') == 'duct_ring' and v.get('current_range')):
+            if not electrical:
+                raise ValueError(f"variable '{v.get('name', v['type'])}' optimises a drive current: set "
+                                 "\"electrical\": true or give the flux in lumens instead")
             v.setdefault('driver', copy.deepcopy(spec.get('driver', {})))
         variables.append(variable_from_spec(v, working))
     problem_kwargs.setdefault('use_gpu', bool(spec.get('use_gpu', False)))
     return Problem(base_cfg, variables, wall, camera, emission, objective, constraints,
                    clear_base=clear_base, name=spec.get('name', default_name),
                    wall_dists=wall_dists, wall_sizes=wall_sizes, driver=driver, vio=vio, modes=modes,
-                   cont_driver=cont_driver, **problem_kwargs)
+                   cont_driver=cont_driver, electrical=electrical, **problem_kwargs)
 
 
 def load_spec(path):
