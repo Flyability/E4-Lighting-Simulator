@@ -13,7 +13,7 @@ import numpy as np
 from lighting_simulator.domain.geometry import rotation_matrix_z
 from lighting_simulator.domain.guides import dynamic_group_world_geometry
 from lighting_simulator.domain.led_factory import create_leds
-from lighting_simulator.domain.mirroring import expand_mirror_configs
+from lighting_simulator.domain.mirroring import expand_mirror_configs, mirror_group_config_xz
 
 from .layout import build_leds_from_layout, is_v2, layout_from_dict
 from .stl import global_z_rotation_4x4, stl_mesh_data, stl_transform
@@ -154,14 +154,21 @@ def build_leds_from_config(cfg, default_lumens=100.0, mirror_primary=None):
     row_enabled = list(cfg.get('row_enabled', DEFAULT_ROWS))
 
     custom_groups_configs = []
+    mirrored = []
     for idx, group_cfg in enumerate(cfg.get('custom_groups', [])):
         slot = group_cfg.get('panel_slot')
         owner = ('slot', slot) if slot is not None else ('custom_group', idx)
-        custom_groups_configs.append(group_config_to_factory(group_cfg, owner=owner, row_enabled=row_enabled))
+        config = group_config_to_factory(group_cfg, owner=owner, row_enabled=row_enabled)
+        custom_groups_configs.append(config)
+        if group_cfg.get('mirror'):
+            mirrored.append(config)
     individual_leds_configs = [
         individual_led_config_to_factory(led_cfg) for led_cfg in cfg.get('individual_leds', [])
     ]
-    expand_mirror_configs(custom_groups_configs, individual_leds_configs, _decode_mirror_primary(cfg, mirror_primary))
+    primary = _decode_mirror_primary(cfg, mirror_primary)
+    expand_mirror_configs(custom_groups_configs, individual_leds_configs, primary)
+    # per-group XZ twins (skip the legacy mirror primary, already expanded above)
+    custom_groups_configs += [mirror_group_config_xz(c) for c in mirrored if c.get('owner') != primary]
 
     return create_leds(
         cfg.get('viewing_angle', 120),

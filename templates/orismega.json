@@ -1,0 +1,145 @@
+{
+  "schema_version": 2,
+  "name": "orismega",
+  "description": "Panel template converted from custom_groups_templates/orismega.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "orismega",
+      "leds": [
+        {
+          "position": [0.0, 0.0, 2.0],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, -2.0],
+          "direction": [0.866025, 0.026168, -0.499315],
+          "row_dir": [0.030202, -0.999544, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 2.5, 1.5],
+          "direction": [0.866025, 0.086824, 0.492404],
+          "row_dir": [0.099756, -0.995012, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 2.5, -1.5],
+          "direction": [0.866025, 0.086824, -0.492404],
+          "row_dir": [0.099756, -0.995012, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -2.5, 1.5],
+          "direction": [0.866025, -0.086824, 0.492404],
+          "row_dir": [-0.099756, -0.995012, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -2.5, -1.5],
+          "direction": [0.866025, -0.086824, -0.492404],
+          "row_dir": [-0.099756, -0.995012, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 4.5, 1.0],
+          "direction": [0.852869, 0.331588, 0.403317],
+          "row_dir": [0.362367, -0.932035, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 4.5, -1.0],
+          "direction": [0.852869, 0.331588, -0.403317],
+          "row_dir": [0.362367, -0.932035, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -4.5, 1.0],
+          "direction": [0.852869, -0.331588, 0.403317],
+          "row_dir": [-0.362367, -0.932035, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -4.5, -1.0],
+          "direction": [0.852869, -0.331588, -0.403317],
+          "row_dir": [-0.362367, -0.932035, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 5.5, 0.0],
+          "direction": [0.866025, 0.5, 0.0],
+          "row_dir": [0.5, -0.866025, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -5.5, 0.0],
+          "direction": [0.866025, -0.5, 0.0],
+          "row_dir": [-0.5, -0.866025, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+      ],
+      "source": null
+    }
+  ]
+}

@@ -1,0 +1,145 @@
+{
+  "schema_version": 2,
+  "name": "Mercedes4",
+  "description": "Panel template converted from custom_groups_templates/Mercedes4.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "Mercedes4",
+      "leds": [
+        {
+          "position": [-0.4, 0.0, 1.775877],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-1.0, 0.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [0.136808, 0.0, 1.024123],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.096738, 0.717157, -0.334215],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [-0.353553, -0.707107, -0.612372],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.096738, -0.717157, -0.334215],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [-0.353553, 0.707107, -0.612372],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.096738, 1.282843, -0.865785],
+          "direction": [0.506801, 0.422618, -0.751363],
+          "row_dir": [-0.309214, -0.724471, -0.616059],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.096738, -1.282843, -0.865785],
+          "direction": [0.506801, -0.422618, -0.751363],
+          "row_dir": [-0.323211, 0.714857, -0.620093],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.4, 0.0, -1.6],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [-1.0, 0.0, -0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [0.136808, 0.0, -0.89079],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [0.0, 1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.096738, -0.717157, 0.467548],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [-0.353553, 0.707107, 0.612372],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.096738, 0.717157, 0.467548],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [-0.353553, -0.707107, 0.612372],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.096738, -1.282843, 0.999119],
+          "direction": [0.506801, -0.422618, 0.751363],
+          "row_dir": [-0.309214, 0.724471, 0.616059],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.096738, 1.282843, 0.999119],
+          "direction": [0.506801, 0.422618, 0.751363],
+          "row_dir": [-0.323211, -0.714857, 0.620093],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+      ],
+      "source": null
+    }
+  ]
+}

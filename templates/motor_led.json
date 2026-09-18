@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "name": "Motor_led",
+  "description": "Panel template converted from custom_groups_templates/Motor_led.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "Motor_led",
+      "leds": [
+        {
+          "position": [7.2, 9.0, 3.8],
+          "direction": [0.034708, -0.156403, 0.987083],
+          "row_dir": [-0.97625, -0.216646, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [7.2, -9.0, 3.9],
+          "direction": [0.034708, 0.052368, 0.998025],
+          "row_dir": [0.833542, -0.552456, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-10.0, -11.8, 3.8],
+          "direction": [-0.121869, 0.103749, 0.987109],
+          "row_dir": [0.64823, 0.761445, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-10.0, 11.8, 3.8],
+          "direction": [-0.121869, -0.103749, 0.987109],
+          "row_dir": [-0.64823, 0.761445, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3]
+      ],
+      "source": null
+    }
+  ]
+}

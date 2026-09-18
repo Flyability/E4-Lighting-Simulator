@@ -1,4 +1,4 @@
-"""Export helpers: individual-LED JSON, LED STL and custom-group DXF.
+"""Export helpers: world-space LED JSON, LED STEP and panel DXF.
 
 Extracted verbatim from ``ui.app.main``; ``build(ctx)`` receives the GUI handles and
 callbacks it needs and returns the closures main() keeps using.
@@ -14,71 +14,47 @@ from lighting_simulator.domain.geometry import as_vec3 as _as_vec3
 
 def build(ctx):
     current_leds = ctx.current_leds
-    individual_leds = ctx.individual_leds
+    state = ctx.state
 
     def export_individual_leds_simple():
-        """Export all individual LEDs to a simple JSON format (preserves exact coordinates)."""
-        if len(individual_leds) == 0:
-            print("⚠️ No individual LEDs to export")
+        """Export every LED of the scene in world coordinates (position, normal, size, beam) as JSON."""
+        leds = [led for led in current_leds if getattr(led, 'enabled', True)]
+        if not leds:
+            print("⚠️ No LEDs in the scene to export")
             return
-        
-        # Export directory
+
         export_dir = "exports"
-        if not os.path.exists(export_dir):
-            os.makedirs(export_dir)
-        
-        # Collect current LED data (exact coordinates, no transformations)
+        os.makedirs(export_dir, exist_ok=True)
+
         leds_export = []
-        for led_data in individual_leds:
-            led_export = {
-                "id": led_data['id'],
-                "enabled": led_data['enable'].value,
-                "led_on": led_data['led_on'],
-                "position": {
-                    "x": float(led_data['pos_x'].value),
-                    "y": float(led_data['pos_y'].value),
-                    "z": float(led_data['pos_z'].value)
-                },
-                "rotation": {
-                    "x": float(led_data['rot_x'].value),
-                    "y": float(led_data['rot_y'].value),
-                    "z": float(led_data['rot_z'].value)
-                },
-                "size": float(led_data['size'].value),
-                "viewing_angle": float(led_data['viewing_angle'].value),
-                "square_roll": float(led_data['square_roll'].value),
-                "beam_tilt": float(led_data['beam_tilt'].value)
-            }
-            
-            # Add metadata if present (template source info)
-            if 'template_source' in led_data:
-                led_export['template_source'] = led_data['template_source']
-            if 'group_index' in led_data:
-                led_export['group_index'] = led_data['group_index']
-            
-            leds_export.append(led_export)
-        
-        # Generate filename with timestamp
+        for i, led in enumerate(leds):
+            n = np.asarray(getattr(led, 'mesh_normal', led.direction), dtype=float)
+            leds_export.append({
+                "id": i,
+                "on": bool(getattr(led, 'led_on', True)),
+                "role": getattr(led, 'role', 'both'),
+                "position_cm": [float(v) for v in led.position],
+                "normal": [float(v) for v in n],
+                "beam_direction": [float(v) for v in led.direction],
+                "size_cm": float(led.width),
+                "beam_angle_deg": float(led.viewing_angle),
+                "lumens": None if led.lumens is None else float(led.lumens),
+            })
+
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"individual_leds_{timestamp}.json"
-        filepath = os.path.join(export_dir, filename)
-        
-        # Save to file
-        export_data = {
-            "format_version": "1.0",
-            "description": "Individual LEDs export - exact coordinates (no transformations)",
-            "export_date": timestamp,
-            "num_leds": len(leds_export),
-            "leds": leds_export
-        }
-        
+        filepath = os.path.join(export_dir, f"leds_world_{timestamp}.json")
         with open(filepath, "w") as f:
-            json.dump(export_data, f, indent=2)
-        
-        print(f"✓ Exported {len(leds_export)} individual LED(s) to: {filename}")
+            json.dump({
+                "format_version": "2.0",
+                "description": "All scene LEDs in world coordinates (cm), after panel placement and mirroring",
+                "export_date": timestamp,
+                "num_leds": len(leds_export),
+                "leds": leds_export,
+            }, f, indent=2)
+        print(f"✓ Exported {len(leds_export)} LED(s) to: {filepath}")
         return filepath
-    
+
     def export_leds_to_stl():
         """Export each LED as an editable planar surface in STEP format.
         
@@ -232,14 +208,15 @@ def build(ctx):
             print("⚠️ 'ezdxf' library required.  pip install ezdxf")
             return None
         
-        # Gather custom-group LEDs that are active
+        # Selected panel's LEDs if any, else every enabled LED in the scene
+        sel = state.selected
         custom_leds = [
             led for led in current_leds
-            if getattr(led, 'is_custom', False)
-            and not (hasattr(led, 'enabled') and not led.enabled)
+            if getattr(led, 'enabled', True)
+            and (sel is None or getattr(led, 'owner', None) == ('panel', sel))
         ]
         if not custom_leds:
-            print("⚠️ No active custom-group LEDs in the scene.")
+            print("⚠️ No active LEDs to export (select a panel or enable some LEDs).")
             return None
         
         # --- Helper: normalised normal vector ---

@@ -8,8 +8,6 @@ import os
 import time
 import numpy as np
 from lighting_simulator.camera.fov import camera_fov_wall_trapezoid as _camera_fov_wall_trapezoid
-from lighting_simulator.domain.guides import dynamic_group_world_geometry as _dynamic_group_world_geometry
-from lighting_simulator.domain.led_factory import create_leds
 from lighting_simulator.domain.optics import effective_lambertian_exponent as _get_effective_n
 from lighting_simulator.raytracing.boxes import ray_box_intersection_batch as _ray_box_intersection_batch_np
 from lighting_simulator.raytracing.mesh import (
@@ -20,8 +18,7 @@ from lighting_simulator.scene.stl import _rot4_x, _rot4_y, _rot4_z
 
 
 def build(ctx):
-    _expand_mirror_configs = ctx._expand_mirror_configs
-    _panel_slot_data = ctx._panel_slot_data
+    state = ctx.state
     apply_view_mode = ctx.apply_view_mode
     calibration_factor_slider = ctx.calibration_factor_slider
     camera_fov_h = ctx.camera_fov_h
@@ -29,11 +26,9 @@ def build(ctx):
     camera_pitch = ctx.camera_pitch
     camera_pos_x = ctx.camera_pos_x
     camera_pos_y = ctx.camera_pos_y
-    custom_groups = ctx.custom_groups
     diffuser_angle_slider = ctx.diffuser_angle_slider
     diffuser_enable_chk = ctx.diffuser_enable_chk
     diffuser_transmission_slider = ctx.diffuser_transmission_slider
-    individual_leds = ctx.individual_leds
     intensity_rays_slider = ctx.intensity_rays_slider
     intensity_to_color = ctx.intensity_to_color
     led_lumens_slider = ctx.led_lumens_slider
@@ -85,85 +80,7 @@ def build(ctx):
         # Create grid for FOV region
         fov_grid = np.zeros((grid_height, grid_width))
         
-        viewing_angle = 120.0  # fallback beam angle for LEDs without their own
-
-        # Build custom groups configs list
-        custom_groups_configs = []
-        for group in custom_groups:
-            config = {
-                'enabled': group['enable'].value,
-                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
-                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
-                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                'led_states': group['led_states'],
-                'led_roles': group.get('led_roles') or [],
-            }
-            # Add dynamic group info if present
-            if group.get('is_dynamic', False):
-                config['num_leds'] = group.get('num_leds', 0)
-                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
-                config['led_positions'] = translated_positions
-                config['led_rotations'] = rotated_directions
-                config['led_sizes'] = group.get('led_sizes', [])
-                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                if rotated_row_dirs:
-                    config['led_row_directions'] = rotated_row_dirs
-            # Pass lumens override for custom group
-            if group.get('lumens_override') and group['lumens_override'].value:
-                config['lumens_override'] = float(group['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            if group.get('panel_slot') is not None:
-                config['owner'] = ('slot', group['panel_slot'])
-            else:
-                config['owner'] = ('custom_group', group['id'])
-            custom_groups_configs.append(config)
-        
-        # Build individual LEDs configs list
-        individual_leds_configs = []
-        for led in individual_leds:
-            config = {
-                'enabled': led['enable'].value,
-                'led_on': led.get('led_on', True),
-                'role': led.get('role', 'both'),
-                'pos_x': led['pos_x'].value,
-                'pos_y': led['pos_y'].value,
-                'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value,
-                'rot_y': led['rot_y'].value,
-                'rot_z': led['rot_z'].value,
-                'size': led['size'].value,
-                'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value,
-                'beam_tilt': led['beam_tilt'].value,
-            }
-            # Pass lumens override for individual LED
-            if led.get('lumens_override') and led['lumens_override'].value:
-                config['lumens_override'] = float(led['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            # Pass external lens settings
-            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
-                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
-                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
-            for _si, _pdata in enumerate(_panel_slot_data):
-                if _pdata and led in _pdata.get('individual_leds', []):
-                    config['owner'] = ('slot', _si)
-                    break
-            if 'owner' not in config and led.get('panel_slot') is not None:
-                config['owner'] = ('slot', led['panel_slot'])
-            individual_leds_configs.append(config)
-        
-        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
-        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
-
-        leds = create_leds(
-            viewing_angle,
-            default_lumens=float(led_lumens_slider.value),
-            custom_groups_configs=custom_groups_configs,
-            individual_leds_configs=individual_leds_configs,
-        )
+        leds = state.leds(lumens=float(led_lumens_slider.value))
         apply_view_mode(leds)
         
         # ── Apply diffuser lens effect (FOV camera) ──

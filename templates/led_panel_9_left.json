@@ -1,0 +1,117 @@
+{
+  "schema_version": 2,
+  "name": "LED_Panel_9_Left",
+  "description": "Panel template converted from custom_groups_templates/LED_Panel_9_Left.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "LED_Panel_9_Left",
+      "leds": [
+        {
+          "position": [14.818, 12.026, -0.186],
+          "direction": [0.706948, -0.014998, 0.707107],
+          "row_dir": [-0.02121, -0.999775, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [15.394, 12.156, -1.63],
+          "direction": [0.999768, -0.02153, 0.0],
+          "row_dir": [-0.02153, -0.999768, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [14.496, 12.282, -2.82],
+          "direction": [0.70701, -0.011687, -0.707107],
+          "row_dir": [-0.016528, -0.999863, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [14.223, 15.26, -0.217],
+          "direction": [0.655317, 0.265631, 0.707107],
+          "row_dir": [0.375659, -0.926758, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [14.745, 15.687, -1.19],
+          "direction": [0.92677, 0.375629, 0.0],
+          "row_dir": [0.375629, -0.92677, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [13.898, 15.541, -2.414],
+          "direction": [0.656803, 0.261936, -0.707107],
+          "row_dir": [0.370433, -0.928859, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [12.438, 17.956, 0.305],
+          "direction": [0.500424, 0.499576, 0.707107],
+          "row_dir": [0.706507, -0.707706, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [12.767, 18.659, -0.589],
+          "direction": [0.704289, 0.709914, 0.0],
+          "row_dir": [0.709914, -0.704289, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [12.102, 18.304, -1.881],
+          "direction": [0.506012, 0.493915, -0.707107],
+          "row_dir": [0.698501, -0.715609, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 1.0,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 3, 6],
+        [1, 4, 7],
+        [2, 5, 8]
+      ],
+      "source": null
+    }
+  ]
+}

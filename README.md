@@ -24,7 +24,7 @@ python -m pytest tests           # engine regression tests
 | `scene/` | Layout / platform files (`layouts/*.json`, `platforms/*.json`, schema v2 in `scene/layout.py`) → LEDs + STL occluder (`build_scene_from_config`, `build_scene_from_layout`); `convert_v1` upgrades pre-v2 configs |
 | `analysis/` | `uniformity_metrics` (U0, U1, CV, ΔEV) and legend HTML |
 | `pipeline.py` | Headless facade: `simulate_wall(cfg, settings)` / `simulate_room(...)` → grid + metrics |
-| `ui/app.py` | The Viser GUI (`main`). Only this module imports Viser |
+| `ui/app.py` | The Viser GUI (`main`). Only `ui/` imports Viser. `ui/layout_state.py` holds the one `Layout` the GUI edits (panels + selection), `ui/panels_tab.py` the *Panels & LEDs* tab and the *Selected* inspector |
 
 Everything below `ui/` is UI-free and importable without Viser.
 
@@ -43,6 +43,14 @@ pose, `occludes`) and the VIO camera poses. A layout links to one by name (`"pla
 settings, not part of either file. Pre-v2 configs are converted on load;
 `scripts/convert_configs_v2.py` batch-converts a folder (the old files live in
 `tests/data/v1_configs/` as fixtures).
+
+A **template** (`templates/<name>.json`) is a layout whose panels sit at the origin: *Panels &
+LEDs → Add panel from template* drops its panel(s) into the scene, *Save As → Panel template*
+stores the selected panel with its LEDs in panel coordinates. In the GUI there is exactly one
+kind of object — the panel: a single LED is a 1-LED panel, a 12-LED board is a panel, and
+*Mirror* on a panel gives its left/right twin (the old "custom groups", "individual LEDs" and
+the Elios 3 slot configurator are gone). `scripts/convert_templates_v2.py` converted the legacy
+`custom_groups_templates/` (now `tests/data/v1_templates/`).
 
 ## Headless example (basis for optimisation loops)
 
@@ -63,7 +71,8 @@ def objective(cfg):
 
 `scripts/ui_smoke.py` drives the real GUI callbacks headlessly (load config →
 wall map → room map) and is a quick end-to-end check after UI edits;
-`scripts/ui_optim_smoke.py` does the same for the Optimize tab. `scripts/benchmark_gpu.py`
+`scripts/ui_panels_smoke.py` covers the panel system (templates, mirror, designer, save/reload) and
+`scripts/ui_optim_smoke.py` the Optimize tab. `scripts/benchmark_gpu.py`
 and `scripts/test_gpu.py` compare GPU vs CPU tracing; `scripts/beam_calibration.py` is a
 standalone beam-profile calibration tool.
 

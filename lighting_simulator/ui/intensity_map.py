@@ -14,10 +14,8 @@ from lighting_simulator.camera.fov import (
     camera_fov_wall_trapezoid as _camera_fov_wall_trapezoid, points_in_fisheye_fov, points_in_pinhole_fov,
     vio_hfov_vfov_deg,
 )
-from lighting_simulator.domain.guides import dynamic_group_world_geometry as _dynamic_group_world_geometry
-from lighting_simulator.domain.led_factory import create_leds
-from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
-from lighting_simulator.scene.stl import global_z_rotation_4x4, stl_mesh_data as stl_mesh_data_payload
+from lighting_simulator.scene.builder import apply_diffuser
+from lighting_simulator.scene.stl import stl_mesh_data as stl_mesh_data_payload
 from lighting_simulator.simulation import (
     EmissionSettings, RoomSettings, WallSettings, room_wall_cell_centers, wall_grid_cell_centers_cm,
 )
@@ -28,8 +26,7 @@ from lighting_simulator.ui.mesh_lighting import _build_stl_transform
 
 
 def build(ctx):
-    _expand_mirror_configs = ctx._expand_mirror_configs
-    _panel_slot_data = ctx._panel_slot_data
+    state = ctx.state
     apply_view_mode = ctx.apply_view_mode
     view_mode_dropdown = ctx.view_mode_dropdown
     bw_scale_chk = ctx.bw_scale_chk
@@ -41,16 +38,10 @@ def build(ctx):
     camera_pos_y = ctx.camera_pos_y
     cell_readout_chk = ctx.cell_readout_chk
     cell_readout_html = ctx.cell_readout_html
-    custom_groups = ctx.custom_groups
     custom_reflectance_slider = ctx.custom_reflectance_slider
     diffuser_angle_slider = ctx.diffuser_angle_slider
     diffuser_enable_chk = ctx.diffuser_enable_chk
     diffuser_transmission_slider = ctx.diffuser_transmission_slider
-    global_pos_x_slider = ctx.global_pos_x_slider
-    global_pos_y_slider = ctx.global_pos_y_slider
-    global_pos_z_slider = ctx.global_pos_z_slider
-    global_rotation_z_slider = ctx.global_rotation_z_slider
-    individual_leds = ctx.individual_leds
     intensity_grid_size = ctx.intensity_grid_size
     intensity_handles = ctx.intensity_handles
     intensity_rays_slider = ctx.intensity_rays_slider
@@ -393,96 +384,17 @@ def build(ctx):
         )
 
     def _build_current_leds_and_absorbers():
-        """Build LEDs (and the STL occluder payload) from current GUI state."""
-        viewing_angle = 120.0  # fallback beam angle for LEDs without their own
-
-        custom_groups_configs = []
-        for group in custom_groups:
-            config = {
-                'enabled': group['enable'].value,
-                'position': (group['pos_x'].value, group['pos_y'].value, group['pos_z'].value),
-                'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
-                'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
-                'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                'led_states': group['led_states'],
-                'led_roles': group.get('led_roles') or [],
-            }
-            if group.get('is_dynamic', False):
-                config['num_leds'] = group.get('num_leds', 0)
-                translated_positions, rotated_directions, rotated_row_dirs = _dynamic_group_world_geometry(group)
-                config['led_positions'] = translated_positions
-                config['led_rotations'] = rotated_directions
-                config['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                config['led_beam_tilts'] = group.get('led_beam_tilts') or []
-                if rotated_row_dirs:
-                    config['led_row_directions'] = rotated_row_dirs
-            if group.get('lumens_override') and group['lumens_override'].value:
-                config['lumens_override'] = float(group['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            if group.get('panel_slot') is not None:
-                config['owner'] = ('slot', group['panel_slot'])
-            else:
-                config['owner'] = ('custom_group', group['id'])
-            custom_groups_configs.append(config)
-
-        individual_leds_configs = []
-        for led in individual_leds:
-            config = {
-                'enabled': led['enable'].value,
-                'led_on': led.get('led_on', True),
-                'role': led.get('role', 'both'),
-                'pos_x': led['pos_x'].value, 'pos_y': led['pos_y'].value, 'pos_z': led['pos_z'].value,
-                'rot_x': led['rot_x'].value, 'rot_y': led['rot_y'].value, 'rot_z': led['rot_z'].value,
-                'size': led['size'].value, 'viewing_angle': led['viewing_angle'].value,
-                'square_roll': led['square_roll'].value, 'beam_tilt': led['beam_tilt'].value,
-            }
-            if led.get('lumens_override') and led['lumens_override'].value:
-                config['lumens_override'] = float(led['lumens_value'].value)
-            else:
-                config['lumens_override'] = None
-            # Pass external lens settings
-            if led.get('ext_lens_enable') and led['ext_lens_enable'].value:
-                config['ext_lens_angle'] = float(led['ext_lens_angle'].value)
-                config['ext_lens_efficiency'] = float(led['ext_lens_efficiency'].value) / 100.0
-            for _si, _pdata in enumerate(_panel_slot_data):
-                if _pdata and led in _pdata.get('individual_leds', []):
-                    config['owner'] = ('slot', _si)
-                    break
-            if 'owner' not in config and led.get('panel_slot') is not None:
-                config['owner'] = ('slot', led['panel_slot'])
-            individual_leds_configs.append(config)
-
-        # Inject the live XZ-mirrored copy of the mirror-primary panel (if any)
-        _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
-
-        leds = create_leds(
-            viewing_angle,
-            default_lumens=float(led_lumens_slider.value),
-            custom_groups_configs=custom_groups_configs,
-            individual_leds_configs=individual_leds_configs,
-        )
+        """LEDs of the layout in the current operating mode + the STL occluder payload."""
+        leds = state.leds(lumens=float(led_lumens_slider.value))
         apply_view_mode(leds)
-
-        _g_rot_z_deg = float(global_rotation_z_slider.value)
-        apply_global_transform(
-            leds, _g_rot_z_deg,
-            (global_pos_x_slider.value, global_pos_y_slider.value, global_pos_z_slider.value),
-        )
-
         if diffuser_enable_chk.value:
             apply_diffuser(leds, diffuser_angle_slider.value,
                            float(diffuser_transmission_slider.value) / 100.0)
-
         absorbers = []  # box occluders are gone; the STL mesh is the only occluder
-
         stl_mesh_for_raytracing = None
         if stl_absorber_enable.value and stl_mesh_data[0] is not None:
             transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
-            if abs(_g_rot_z_deg) > 0.01:
-                transform = global_z_rotation_4x4(_g_rot_z_deg) @ transform
             stl_mesh_for_raytracing = stl_mesh_data_payload(stl_mesh_data[0], transform)
-
         return leds, absorbers, stl_mesh_for_raytracing
 
     def update_intensity_map():

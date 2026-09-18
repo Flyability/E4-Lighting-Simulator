@@ -46,14 +46,13 @@ def test_duct_ring_arc_generates_lattice_and_mirror():
     x[-1] = 0  # switch one LED off
     out = problem.decode(x)
     groups = out['custom_groups']
-    assert len(groups) == 2 and groups[1]['name'] == "d_mirror"
+    assert len(groups) == 1 and groups[0]['mirror']
     assert groups[0]['led_rows'] == [[0, 1, 2], [3, 4, 5]]
     assert sum(groups[0]['led_states']) == 5
-    pos = np.array(groups[0]['led_positions'])
-    mirrored = np.array(groups[1]['led_positions'])
-    np.testing.assert_allclose(mirrored[:, 1], -pos[:, 1])
     scene = build_scene_from_config(out)
     assert len(scene.active_leds) == 10
+    pos = np.array([l.position for l in scene.active_leds])
+    np.testing.assert_allclose(sorted(pos[:, 1]), sorted(-pos[:, 1]), atol=1e-9)
 
 
 def test_duct_ring_variable_counts_keep_per_led_variables_in_place():
@@ -108,7 +107,12 @@ def test_duct_panel_pose_slides_existing_layout_over_the_duct():
     np.testing.assert_allclose(np.asarray(group_config_to_factory(same['custom_groups'][gi])['led_rotations'], float),
                                base_dirs, atol=1e-6)
     mirror = np.asarray(group_config_to_factory(same['custom_groups'][1])['led_positions'], float)
-    np.testing.assert_allclose(mirror, out * np.array([1.0, -1.0, 1.0]), atol=1e-6)
+    assert same['custom_groups'][gi]['mirror'] and not same['custom_groups'][1]['enabled']
+    scene = build_scene_from_config(same)
+    P = np.array([l.position for l in scene.active_leds])
+    assert len(P) == 2 * sum(same['custom_groups'][gi]['led_states'])
+    for p in P:  # every LED has its XZ twin
+        assert np.linalg.norm(P - p * np.array([1.0, -1.0, 1.0]), axis=1).min() < 1e-6
 
     x = problem.x0.copy()
     x[0] += 20.0  # rotate 20 deg around the duct

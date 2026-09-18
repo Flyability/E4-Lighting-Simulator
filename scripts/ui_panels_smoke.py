@@ -1,5 +1,5 @@
-"""Drive the config / panel system headlessly: new project, add groups (empty, template, individual),
-panel slots (solid + individual), save/load project and template, mirror.
+"""Drive the panel system headlessly: load / new project, add panels from templates and a single LED,
+select / mirror / move / remove a panel, save + reload the layout and a panel template.
 
 Usage: PYTHONPATH=. python scripts/ui_panels_smoke.py
 """
@@ -23,6 +23,19 @@ def _capturing_init(self, *a, **k):
 
 
 viser.ViserServer.__init__ = _capturing_init
+
+from lighting_simulator.ui.layout_state import LayoutState  # noqa: E402
+
+_states = []
+_orig_state_init = LayoutState.__init__
+
+
+def _capturing_state_init(self, *a, **k):
+    _orig_state_init(self, *a, **k)
+    _states.append(self)
+
+
+LayoutState.__init__ = _capturing_state_init
 
 import lighting_simulator.ui.app as app  # noqa: E402
 
@@ -63,70 +76,68 @@ def click(label, idx=0):
 
 
 def n_groups():
-    # group folders are hidden but exist; count "Remove Group" buttons instead
-    return len(find_all("Remove Group", viser.GuiButtonHandle))
+    # one "Select" button per panel in the "Panels in the scene" list
+    return len(find_all("Select", viser.GuiButtonHandle))
 
 
 def n_leds():
-    return len(find_all("Remove LED", viser.GuiButtonHandle))
+    return len(app_state.leds())
 
 
-# 1. load a config with custom groups, then start a new project
+app_state = _states[0]  # the LayoutState created by main()
+
+# 1. load a layout with two panels, then start a new project
 find("Select Configuration").value = "ludos_panels_n4"
 click("📂 Load Configuration")
 time.sleep(1)
-print(f"[smoke] loaded ludos_panels_n4: {n_groups()} groups")
+print(f"[smoke] loaded ludos_panels_n4: {n_groups()} panels, {n_leds()} LEDs")
 assert n_groups() == 2
 click("🆕 New Project (Empty)")
 time.sleep(0.5)
-print(f"[smoke] new project: {n_groups()} groups, {n_leds()} LEDs")
-assert n_groups() == 0
+print(f"[smoke] new project: {n_groups()} panels, {n_leds()} LEDs")
+assert n_groups() == 0 and n_leds() == 0
 
-# 2. empty custom group + template as group + template as individual LEDs
-find("From Template").value = "Empty"
-click("➕ Add Custom Group")
-templates = [t for t in find("From Template").options if t != "Empty"]
+# 2. panel from template (single + multi-panel template) + a single LED
+templates = [t for t in find("Template").options if t != "(none)"]
 print("[smoke] templates:", templates[:5], "...")
-find("From Template").value = "oris"
-find("Load Mode").value = "As Group (Solid)"
-click("➕ Add Custom Group")
-find("From Template").value = "oris"
-find("Load Mode").value = "As Individual LEDs (Editable)"
-click("➕ Add Custom Group")
+find("Template").value = "oris"
+click("➕ Add panel from template")
+find("Template").value = "elios3"
+click("➕ Add panel from template")
+click("➕ Add single LED (1-LED panel)")
 time.sleep(0.5)
-print(f"[smoke] after adds: {n_groups()} groups, {n_leds()} individual LEDs")
-assert n_groups() >= 2 and n_leds() > 0
+print(f"[smoke] after adds: {n_groups()} panels, {n_leds()} LEDs")
+assert n_groups() == 6 and n_leds() == 12 + 48 + 1
 
-# 3. panel slots: solid into slot 0, individual into slot 1, then clear slot 0
-slot_dd = find_all("Template")
-slot_mode = find_all("Mode")
-slot_dd[0].value = "oris"
-slot_mode[0].value = "Solid (Group)"
-click("✅ Load Panel", 0)
-slot_dd[1].value = "oris"
-slot_mode[1].value = "Individual LEDs"
-click("✅ Load Panel", 1)
-time.sleep(0.5)
-g_after_slots, l_after_slots = n_groups(), n_leds()
-print(f"[smoke] after slots: {g_after_slots} groups, {l_after_slots} LEDs")
-click("🗑️ Remove Panel", 0)
+# 3. select a panel, mirror it, move it, remove one
+click("Select", 0)
 time.sleep(0.3)
-print(f"[smoke] after clearing slot 0: {n_groups()} groups")
-assert n_groups() < g_after_slots
+find("Mirror to the other side (left/right twin)").value = True
+time.sleep(0.3)
+assert n_leds() == 12 * 2 + 48 + 1, n_leds()
+find("Position (cm)").value = (10.0, -5.0, 2.0)
+time.sleep(0.3)
+assert tuple(app_state.panels[0].position) == (10.0, -5.0, 2.0)
+click("Remove", 5)  # the 1-LED panel
+time.sleep(0.3)
+print(f"[smoke] after mirror/move/remove: {n_groups()} panels, {n_leds()} LEDs")
+assert n_groups() == 5 and n_leds() == 12 * 2 + 48
 
-# 4. save project + template, reload project
+# 4. save layout + panel template, reload layout
 import atexit
 atexit.register(lambda: [os.path.exists(p) and os.remove(p) for p in
-                         ("layouts/smoke_panels_tmp.json", "custom_groups_templates/smoke_tpl_tmp.json")])
+                         ("layouts/smoke_panels_tmp.json", "templates/smoke_tpl_tmp.json")])
 find("Project Name").value = "smoke_panels_tmp"
-find("Save As").value = "Full Configuration"
+find("Save As").value = "Layout"
 click("💾 Save Project")
+click("Select", 0)
+time.sleep(0.3)
 find("Project Name").value = "smoke_tpl_tmp"
-find("Save As").value = "Custom Group Template"
+find("Save As").value = "Panel template (selected panel)"
 click("💾 Save Project")
 time.sleep(0.3)
-assert os.path.exists("layouts/smoke_panels_tmp.json"), "project not saved"
-assert os.path.exists("custom_groups_templates/smoke_tpl_tmp.json"), "template not saved"
+assert os.path.exists("layouts/smoke_panels_tmp.json"), "layout not saved"
+assert os.path.exists("templates/smoke_tpl_tmp.json"), "template not saved"
 before = (n_groups(), n_leds())
 click("🆕 New Project (Empty)")
 find("Select Configuration").options = find("Select Configuration").options + ("smoke_panels_tmp",) \
@@ -136,17 +147,43 @@ click("📂 Load Configuration")
 time.sleep(1)
 after = (n_groups(), n_leds())
 print(f"[smoke] save/reload round trip: {before} -> {after}")
-# Schema v2 has no individual LEDs: template-sourced ones come back as one panel, standalone
-# ones as one-LED panels, so every LED is still there but all of them live in groups now.
+assert before == after, "round trip changed the scene"
 import json as _json
 _lay = _json.load(open("layouts/smoke_panels_tmp.json"))
-assert _lay["schema_version"] == 2 and after[1] == 0, "round trip changed the scene unexpectedly"
-assert sum(len(p["leds"]) for p in _lay["panels"]) == 12 * before[0] + before[1], "LED count changed on save"
-assert after[0] == len(_lay["panels"]), "not every panel came back"
+assert _lay["schema_version"] == 2 and len(_lay["panels"]) == 5 and _lay["panels"][0]["mirror"] is True
+_tpl = _json.load(open("templates/smoke_tpl_tmp.json"))
+assert len(_tpl["panels"]) == 1 and len(_tpl["panels"][0]["leds"]) == 12 and _tpl["panels"][0]["mirror"] is False
 
 # 5. wall map still works with this scene
 find("Show intensity on wall").value = True
 find("Rays per pixel (↑quality, ↓speed)").value = 20
 click("Update Intensity Map")
+
+# 6. Panel Designer: new panel, edit (LEDs replaced), cancel (untouched), duplicate, LED toggle
+click("🆕 New Project (Empty)")
+time.sleep(0.3)
+click("✏️ New panel in the Designer")
+time.sleep(0.5)
+find("Panel name").value = "smoke designer"
+click("Add LED"); click("Add LED"); click("Add LED")
+click("Save")
+time.sleep(0.5)
+print(f"[smoke] designer new: {n_groups()} panels, {n_leds()} LEDs, names={[p.name for p in app_state.panels]}")
+assert n_groups() == 1 and n_leds() == 3
+click("Select", 0); time.sleep(0.3)
+click("✏️ Edit LEDs in the Designer"); time.sleep(0.5)
+click("Add LED"); click("Save"); time.sleep(0.5)
+assert n_groups() == 1 and n_leds() == 4
+click("Select", 0); time.sleep(0.3)
+click("✏️ Edit LEDs in the Designer"); time.sleep(0.5)
+click("Add LED"); click("Cancel"); time.sleep(0.5)
+assert n_leds() == 4, "Cancel must leave the panel untouched"
+click("Select", 0); time.sleep(0.3)
+click("Duplicate panel"); time.sleep(0.3)
+assert n_groups() == 2 and n_leds() == 8
+click("Select", 0); time.sleep(0.3)
+click("L1"); time.sleep(0.3)
+assert app_state.panels[0].leds[0].on is False
+print(f"[smoke] designer edit/cancel/duplicate/toggle OK: {n_groups()} panels, {n_leds()} LEDs")
 
 print("[smoke] errors:", errors or "none")

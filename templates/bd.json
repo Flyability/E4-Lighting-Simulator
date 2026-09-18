@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "name": "bd",
+  "description": "Panel template converted from custom_groups_templates/bd.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "bd",
+      "leds": [
+        {
+          "position": [0.0, 0.0, 0.1],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [-1.0, 0.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.5, 1.0, -1.0],
+          "direction": [0.939693, 0.17101, 0.296198],
+          "row_dir": [0.179044, -0.983841, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.5, 0.0, -1.5],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, -2.0],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [1.0, 0.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3]
+      ],
+      "source": null
+    }
+  ]
+}

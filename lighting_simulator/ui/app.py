@@ -30,7 +30,6 @@ import trimesh
 import webbrowser as _wb
 import socket as _socket
 
-from lighting_simulator.domain.led_factory import create_leds
 from lighting_simulator.domain.led import apply_operating_mode
 from lighting_simulator.domain.geometry import as_vec3 as _as_vec3
 from lighting_simulator.domain.optics import effective_lambertian_exponent as _get_effective_n
@@ -43,7 +42,6 @@ from lighting_simulator.domain.guides import (
     restore_group_guide,
     serialize_guide,
 )
-from lighting_simulator.domain.mirroring import expand_mirror_configs
 from lighting_simulator.camera.fov import (
     camera_fov_wall_trapezoid as _camera_fov_wall_trapezoid,
     fov_plane_mask_to_quads_and_contour,
@@ -79,9 +77,10 @@ from lighting_simulator.ui import intensity_map as _intensity_map
 from lighting_simulator.ui import fov_capture as _fov_capture
 from lighting_simulator.ui import exports as _exports
 from lighting_simulator.ui import config_io as _config_io
-from lighting_simulator.ui import panels as _panels
+from lighting_simulator.ui import panels_tab as _panels_tab
+from lighting_simulator.ui.layout_state import LayoutState
 from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
-from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
+from lighting_simulator.scene.builder import apply_diffuser
 from lighting_simulator.scene.layout import (
     Layout, Platform, convert_v1, layout_to_v1, load_layout, load_platform, save_json,
 )
@@ -149,7 +148,7 @@ def main():
     print("  LED Lighting Simulation - Interactive Tool")
     print("="*60)
     print("\n📋 To get started:")
-    print("  1. Create a 🆕 New Project (empty, add custom groups)")
+    print("  1. Create a 🆕 New Project (empty, then add panels in the Panels & LEDs tab)")
     print("  2. Or 📂 Load an existing configuration (e.g., Elios 3)")
     print("\n💡 All LEDs are disabled until you load or create a project.")
     print("="*60 + "\n")
@@ -165,38 +164,18 @@ def main():
     config_dir = _data_dir("layouts")          # schema-v2 layouts (legacy configs/*.json still load)
     platforms_dir = _data_dir("platforms")
     legacy_config_dir = _data_dir("configs")
-    custom_groups_templates_dir = _data_dir("custom_groups_templates")
-    for _d in (config_dir, platforms_dir, custom_groups_templates_dir):
+    templates_dir = _data_dir("templates")     # panel templates (schema-v2 layouts, panel-local LEDs)
+    for _d in (config_dir, platforms_dir, templates_dir):
         os.makedirs(_d, exist_ok=True)
     print(f"  📁  Layouts: {os.path.abspath(config_dir)}   platforms: {os.path.abspath(platforms_dir)}")
-    current_platform_name = [None]  # platform file the loaded layout links to (None = inline)
+
+    # The scene: one Layout (panels of panel-local LEDs) + selection, see ui/layout_state.py
+    state = LayoutState()
 
     # Flag to track if a project is loaded
     project_loaded = [False]  # Use list for mutability in nested functions
     current_config_name = [""]  # Track which configuration is loaded
     loading_in_progress = [False]  # Flag to prevent callbacks during config loading
-    
-    # Custom groups - list of dictionaries, each containing group configuration
-    custom_groups = []  # Each group: {id, enable, pos_x, pos_y, pos_z, rot, led_states, buttons, folder}
-    next_custom_group_id = [0]  # Counter for unique IDs (use list to allow modification in nested functions)
-    
-    # Individual LEDs - list of single LED configurations
-    individual_leds = []  # Each LED: {id, enable, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, size, folder}
-    next_individual_led_id = [0]  # Counter for unique IDs
-    
-    # Template folders - track loaded templates with master controls
-    template_folders = []  # List of template folder handles to remove on new project/load
-    
-    # Panel Configurator state (populated later when UI is created)
-    _panel_slot_data = [None, None, None, None]
-    _panel_dropdowns = []
-    _panel_mode_dropdowns = []
-
-    # Live panel mirroring: the selected "primary" panel is reflected across
-    # the XZ plane at scene-build time; its counterpart panel is disabled.
-    _mirror_primary = [None]           # owner tuple ('slot', idx) / ('custom_group', id)
-    _mirror_disabled_handles = []      # enable checkboxes we turned off (to restore)
-    _mirror_counterpart_name = [None]  # display name of the disabled panel
 
     # --- UI layout: docked/floating panels + main-panel tabs (viser 1.1+) ---
     server.gui.set_panel_label("Controls")
@@ -231,14 +210,7 @@ def main():
     inspector_panel.float(x=-12, y=48)
     inspector_panel.set_width(340)
 
-    selected_owner = [None]
     _just_clicked_mesh = [False]
-    _inspector_handles = []
-    _inspector_syncing = [False]
-    _select_panel_impl = [lambda owner: None]
-
-    def select_panel(owner):
-        _select_panel_impl[0](owner)
 
     def flash_lumens():
         return float(flash_lumens_input.value)
@@ -248,25 +220,6 @@ def main():
         flash = view_mode_dropdown.value == _VIEW_FLASH
         return apply_operating_mode(leds, flash, flash_lumens() if flash else None)
 
-    def save_custom_group_template(name, groups_list, individual_leds_list):
-        """Save all custom groups and individual LEDs as a reusable template."""
-        path = os.path.join(custom_groups_templates_dir, f"{name.lower().replace(' ', '_')}.json")
-        template = {
-            "name": name,
-            "groups": groups_list,
-            "individual_leds": individual_leds_list
-        }
-        with open(path, "w") as f:
-            json.dump(template, f, indent=4, default=_json_default)
-        print(f"✓ Template saved with {len(groups_list)} custom group(s) and {len(individual_leds_list)} individual LED(s): {name}")
-    
-    def get_available_templates():
-        """Get list of available custom group templates."""
-        if not os.path.exists(custom_groups_templates_dir):
-            return []
-        files = [f for f in os.listdir(custom_groups_templates_dir) if f.lower().endswith(".json")]
-        return sorted((f[:-5] for f in files), key=str.lower)
-    
     # --- GUI Controls ---
     with tab_project:
         _project_folder = server.gui.add_folder("Project Management")
@@ -310,8 +263,10 @@ def main():
         save_name_input = server.gui.add_text("Project Name", initial_value="")
         save_type_dropdown = server.gui.add_dropdown(
             "Save As",
-            options=["Full Configuration", "Custom Group Template"],
-            initial_value="Full Configuration"
+            options=["Layout", "Panel template (selected panel)"],
+            initial_value="Layout",
+            hint="Layout: the whole scene (panels + flux + platform link) into layouts/. "
+                 "Panel template: only the selected panel, with LEDs in panel coordinates, into templates/."
         )
         save_project_btn = server.gui.add_button("💾 Save Project")
 
@@ -337,9 +292,7 @@ def main():
             print(f"Loading layout: {lay.name} ({len(lay.panels)} panel(s), "
                   f"{sum(1 for p in lay.panels if p.mirror)} mirrored)")
             current_config_name[0] = lay.name or os.path.splitext(os.path.basename(path))[0]
-            project_loaded[0] = True
-            apply_config(layout_to_v1(lay, platforms_dir=platforms_dir))
-            current_platform_name[0] = lay.platform if isinstance(lay.platform, str) else None
+            apply_layout(lay, platforms_dir=platforms_dir)
             _sync_platform_dropdown()
             led_lumens_slider.value = int(round(lay.flux.vio_lumens))
             if lay.flux.flash_lumens:
@@ -347,121 +300,43 @@ def main():
             print(f"✓ Layout loaded: {lay.name}")
 
         def current_layout(name=None):
-            """The scene as a v2 Layout (flux from the Display tab, platform link if one is selected)."""
-            lay = convert_v1(get_current_config(), default_lumens=float(led_lumens_slider.value))
+            """The scene as a v2 Layout (flux from the Display tab, platform link or inline platform)."""
+            lay = copy.deepcopy(state.layout)
+            lay.flux.vio_lumens = float(led_lumens_slider.value)
             lay.flux.flash_lumens = float(flash_lumens_input.value)
-            if current_platform_name[0]:
-                lay.platform = current_platform_name[0]
+            if state.platform_name:
+                lay.platform = state.platform_name
+            else:
+                inline = convert_v1(get_current_config()).platform
+                lay.platform = inline if isinstance(inline, Platform) else None
             if name:
                 lay.name = name
             return lay
 
         @save_project_btn.on_click
         def _(_):
-            nonlocal template_dropdown
             name = save_name_input.value.strip()
             if not name:
                 print("Error: Please enter a project name.")
                 return
-            
-            save_type = save_type_dropdown.value
-            
-            if save_type == "Full Configuration":
+            if save_type_dropdown.value == "Layout":
                 path = os.path.join(config_dir, f"{name.lower().replace(' ', '_')}.json")
                 save_json(current_layout(name), path)
                 current_config_name[0] = name
                 print(f"✓ Layout saved: {path}")
                 config_dropdown.options = get_available_configs()
             else:
-                # Save as custom group template - save groups separately
-                if len(custom_groups) > 0 or len(individual_leds) > 0:
-                    # Save custom groups
-                    custom_groups_data = []
-                    for group in custom_groups:
-                        group_cfg = {
-                            'enabled': group['enable'].value,
-                            'position': [group['pos_x'].value, group['pos_y'].value, group['pos_z'].value],
-                            'rotation_x': group['rot_roll'].value if 'rot_roll' in group else 0,
-                            'rotation_y': group['rot_tilt_ud'].value if 'rot_tilt_ud' in group else 0,
-                            'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
-                            'led_states': group['led_states'][:],
-                            'led_roles': list(group.get('led_roles') or ['both'] * len(group['led_states'])),
-                        }
-                        # Save dynamic group properties if present
-                        if group.get('is_dynamic', False):
-                            group_cfg['is_dynamic'] = True
-                            group_cfg['num_leds'] = group.get('num_leds', 12)
-                            # CRITICAL: Save ORIGINAL positions (not the current rotated ones!)
-                            # This ensures template always contains undeformed geometry
-                            group_cfg['led_positions'] = group.get('original_led_positions', group.get('led_positions', []))
-                            group_cfg['led_rotations'] = group.get('original_led_rotations', group.get('led_rotations', []))
-                            group_cfg['led_row_directions'] = group.get('original_led_row_directions', group.get('led_row_directions', []))
-                            group_cfg['led_sizes'] = group.get('led_sizes', [])
-                            group_cfg['led_viewing_angles'] = group.get('led_viewing_angles', [])
-                            group_cfg['led_rows'] = group.get('led_rows', [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]])
-                            group_cfg['led_euler_angles'] = group.get('led_euler_angles', [])
-                            group_cfg['led_beam_tilts'] = group.get('led_beam_tilts', [])
-                            group_cfg['led_lumens'] = group.get('led_lumens', [])
-                        # Save lumens override for template
-                        group_cfg['lumens_override_enabled'] = group.get('lumens_override') and group['lumens_override'].value
-                        group_cfg['lumens_value'] = group['lumens_value'].value if group.get('lumens_value') else 100
-                        if _guide_is_enabled(group):
-                            group_cfg['guide'] = serialize_guide(group['guide'])
-                        custom_groups_data.append(group_cfg)
-                    
-                    # Save individual LEDs
-                    individual_leds_data = []
-                    for led in individual_leds:
-                        individual_leds_data.append({
-                            'enabled': led['enable'].value,
-                            'led_on': led['led_on'],
-                            'pos_x': led['pos_x'].value,
-                            'pos_y': led['pos_y'].value,
-                            'pos_z': led['pos_z'].value,
-                            'rot_x': led['rot_x'].value,
-                            'rot_y': led['rot_y'].value,
-                            'rot_z': led['rot_z'].value,
-                            'size': led['size'].value,
-                            'viewing_angle': led['viewing_angle'].value,
-                            'square_roll': led['square_roll'].value,
-                            'beam_tilt': led['beam_tilt'].value,
-                            'role': led.get('role', 'both'),
-                            'lumens_override_enabled': led.get('lumens_override') and led['lumens_override'].value,
-                            'lumens_value': led['lumens_value'].value if led.get('lumens_value') else 100,
-                        })
-                    
-                    # Save as template with separate groups
-                    save_custom_group_template(name, custom_groups_data, individual_leds_data)
-                    # Refresh template dropdown list
-                    _fresh = get_available_templates()
-                    template_dropdown.options = ["Empty"] + _fresh
-                    for _pdd in _panel_dropdowns:
-                        _cur = _pdd.value
-                        _pdd.options = ["-- Nessuno --"] + _fresh
-                        _pdd.value = _cur if _cur in _pdd.options else "-- Nessuno --"
-                    
-                    print(f"✓ Template saved: {len(custom_groups_data)} group(s) + {len(individual_leds_data)} individual LED(s)")
-                else:
-                    print("Error: No custom groups or individual LEDs to save as template")
+                panel = state.selected_panel()
+                if panel is None:
+                    print("Error: select a panel (click it in the 3-D view) to save it as a template.")
+                    return
+                _panels_ns.save_panel_as_template(panel, name)
+                _panels_ns.refresh_templates()
 
     with global_tab:
         server.gui.add_markdown("**Geometry**")
         wall_dist_slider = server.gui.add_slider(
             "Wall distance (cm)", min=10, max=1500, step=5, initial_value=50
-        )
-        server.gui.add_html("<hr style='margin:8px 0;'><b>Global Rotation:</b>")
-        global_rotation_z_slider = server.gui.add_slider(
-            "Rotate configuration (°)", min=-180, max=180, step=1, initial_value=0
-        )
-        server.gui.add_html("<hr style='margin:8px 0;'><b>Global Position:</b>")
-        global_pos_x_slider = server.gui.add_slider(
-            "Global offset X (cm)", min=-100, max=100, step=0.5, initial_value=0
-        )
-        global_pos_y_slider = server.gui.add_slider(
-            "Global offset Y (cm)", min=-100, max=100, step=0.5, initial_value=0
-        )
-        global_pos_z_slider = server.gui.add_slider(
-            "Global offset Z (cm)", min=-100, max=100, step=0.5, initial_value=0
         )
         server.gui.add_html("<hr style='margin:8px 0;'><b>Wall Settings:</b>")
         intensity_grid_size = server.gui.add_slider(
@@ -661,7 +536,7 @@ def main():
 
         def _sync_platform_dropdown():
             platform_dropdown.options = [_NO_PLATFORM] + get_available_platforms()
-            want = current_platform_name[0] or _NO_PLATFORM
+            want = state.platform_name or _NO_PLATFORM
             platform_dropdown.value = want if want in platform_dropdown.options else _NO_PLATFORM
 
         server.gui.add_html("<hr style='margin:8px 0;'><div style='font-weight:600;margin-bottom:6px;'>Frame model (STL / STEP)</div>")
@@ -906,11 +781,6 @@ def main():
                     if rot_z != 0:
                         T_rot = T_rot @ _rot4_z(np.radians(rot_z))
                     
-                    # Apply global Z rotation on top of STL-local rotation
-                    g_rot_deg = global_rotation_z_slider.value
-                    if abs(g_rot_deg) > 0.01:
-                        T_rot = _rot4_z(np.radians(g_rot_deg)) @ T_rot
-
                     # Combined transform: Scale -> Rotate -> Translate -> cm-to-meters
                     # Instead of building 4 separate matrices and multiplying, build directly
                     R = T_rot[:3, :3]
@@ -918,13 +788,7 @@ def main():
                     
                     # Transform vertices: v' = (R * scale_m) @ v + translate_m
                     RS = R * scale_m  # 3x3 scaled rotation
-                    # Also rotate the translation vector by global rotation
-                    translate_cm = np.array([pos_x, pos_y, pos_z])
-                    if abs(g_rot_deg) > 0.01:
-                        cg2, sg2 = np.cos(np.radians(g_rot_deg)), np.sin(np.radians(g_rot_deg))
-                        translate_cm = np.array([cg2*pos_x - sg2*pos_y, sg2*pos_x + cg2*pos_y, pos_z])
-                    translate_m = translate_cm * 0.01  # cm to meters
-                    
+                    translate_m = np.array([pos_x, pos_y, pos_z]) * 0.01  # cm to meters
                     vertices_transformed = (orig_vertices @ RS.T) + translate_m
                     vertices_transformed = vertices_transformed.astype(np.float32)
                     
@@ -1207,13 +1071,6 @@ def main():
     # Store current LED objects (for reuse in room intensity calculation)
     current_leds = []
 
-    # Custom LED Groups folder (dynamic groups)
-    with tab_panels:
-        custom_groups_folder = server.gui.add_folder("Custom LED Groups")
-        server.gui.add_markdown("Click a panel or LED group in the 3D view to edit its parameters.")
-        open_panel_designer_btn = server.gui.add_button("Create New Panel", color="green")
-    template_dropdown = None  # Will be initialized later
-
     # Panel designer state is deliberately separate from scene groups.  This
     # lets Cancel leave the currently placed panel completely untouched.
     designer_mode = [False]
@@ -1231,367 +1088,58 @@ def main():
     designer_syncing = [False]
     static_scene_handles = []  # /grid + /axes (filled when static scene is built)
     
-    with custom_groups_folder:
-        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Add New Custom Group</div>")
-        
-        template_dropdown = server.gui.add_dropdown(
-            "From Template",
-            options=["Empty"] + get_available_templates(),
-            initial_value="Empty"
-        )
-        
-        load_mode_dropdown = server.gui.add_dropdown(
-            "Load Mode",
-            options=["As Group (Solid)", "As Individual LEDs (Editable)"],
-            initial_value="As Group (Solid)"
-        )
-        
+    with tab_panels:
+        export_folder = server.gui.add_folder("Export", expand_by_default=False)
+    with export_folder:
         server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>"
-                           "• Group: Fast, moves as one unit<br>"
-                           "• Individual LEDs: Edit each LED position/rotation/size separately</div>")
-        
-        add_custom_group_btn = server.gui.add_button("➕ Add Custom Group", color="green")
-        
-        @add_custom_group_btn.on_click
-        def _(_):
-            selected_template = template_dropdown.value
-            load_mode = load_mode_dropdown.value
-            
-            if selected_template == "Empty":
-                # Create empty custom group
-                create_custom_group()
-                print("✓ Empty custom group added")
-            else:
-                # Load from template
-                if load_mode == "As Individual LEDs (Editable)":
-                    # Load template as individual LEDs
-                    load_template_as_individual_leds(selected_template)
-                else:
-                    # Load as solid group (default behavior)
-                    load_custom_group_from_template(selected_template)
-                # Refresh template list in case new templates were added
-                _fresh = get_available_templates()
-                template_dropdown.options = ["Empty"] + _fresh
-                for _pdd in _panel_dropdowns:
-                    _cur = _pdd.value
-                    _pdd.options = ["-- Nessuno --"] + _fresh
-                    _pdd.value = _cur if _cur in _pdd.options else "-- Nessuno --"
-
-    # =====================================================================
-    #  PANEL CONFIGURATOR  – 4 Elios 3 slots with per-slot template choice
-    # =====================================================================
-    # Pre-computed Elios3 slot data (centroid + outward Z-rotation angle)
-    _ELIOS3_SLOTS = [
-        {"name": "Front +",  "centroid": [18.06, -7.92, -1.59], "angle_deg": -23.7, "config_rot": 0.7,  "config_roll":  0,  "config_lr":  10},
-        {"name": "Front -",  "centroid": [18.03,  7.97, -1.59], "angle_deg":  23.8, "config_rot": -0.7, "config_roll": -3,  "config_lr":  -6},
-        {"name": "Side -",   "centroid": [16.07, 12.57, -0.83], "angle_deg":  38.0, "config_rot": -18,  "config_roll":  0,  "config_lr":  21},
-        {"name": "Side +",   "centroid": [16.07, -12.63, -0.82], "angle_deg": -38.2, "config_rot": 18,  "config_roll":  0,  "config_lr": -21},
-    ]
-
-    def _Rz_matrix(deg):
-        """Build a 3×3 rotation matrix around Z axis."""
-        r = np.radians(deg)
-        c, s = np.cos(r), np.sin(r)
-        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-
-    # ── Panel mirroring (XZ plane) ──────────────────────────────────────
-    # The selected "primary" panel gets a live mirrored shadow generated at
-    # scene-build time (_expand_mirror_configs); the panel that used to sit
-    # on the opposite side is simply disabled.
-
-    def _owner_groups(owner):
-        """Custom-group dicts belonging to a panel owner tuple."""
-        if owner is None:
-            return []
-        kind, key = owner
-        if kind == 'slot':
-            return [g for g in custom_groups if g.get('panel_slot') == key]
-        if kind == 'custom_group':
-            return [g for g in custom_groups
-                    if g.get('id') == key and g.get('panel_slot') is None]
-        return []
-
-    def _owner_individual_leds(owner):
-        """Individual-LED dicts belonging to a slot owner (individual mode)."""
-        if owner is None or owner[0] != 'slot':
-            return []
-        key = owner[1]
-        data = _panel_slot_data[key] if 0 <= key < len(_panel_slot_data) else None
-        if data and data.get('individual_leds'):
-            return list(data['individual_leds'])
-        return [led for led in individual_leds if led.get('panel_slot') == key]
-
-    def _owner_display_name(owner):
-        kind, key = owner
-        if kind == 'slot':
-            if 0 <= key < len(_ELIOS3_SLOTS):
-                return _ELIOS3_SLOTS[key]['name']
-            return f"Slot {key + 1}"
-        for g in custom_groups:
-            if g.get('id') == key:
-                return g.get('name') or f"Group {key}"
-        return f"Group {key}"
-
-    def _owner_mean_y(owner):
-        ys = []
-        for g in _owner_groups(owner):
-            try:
-                ys.append(float(g['pos_y'].value))
-            except Exception:
-                pass
-        for led in _owner_individual_leds(owner):
-            try:
-                ys.append(float(led['pos_y'].value))
-            except Exception:
-                pass
-        return float(np.mean(ys)) if ys else None
-
-    def _mirror_candidate_owners():
-        owners = []
-        for si in range(len(_ELIOS3_SLOTS)):
-            o = ('slot', si)
-            if _owner_groups(o) or _owner_individual_leds(o):
-                owners.append(o)
-        for g in custom_groups:
-            if g.get('panel_slot') is None:
-                owners.append(('custom_group', g.get('id')))
-        return owners
-
-    def _find_mirror_counterpart(owner):
-        """Panel on the opposite side of the XZ plane (closest Y match)."""
-        yp = _owner_mean_y(owner)
-        if yp is None or abs(yp) < 0.1:
-            return None
-        best, best_err = None, None
-        for cand in _mirror_candidate_owners():
-            if cand == owner:
-                continue
-            yc = _owner_mean_y(cand)
-            if yc is None or yc * yp >= 0:
-                continue
-            err = abs(yc + yp)
-            if best_err is None or err < best_err:
-                best, best_err = cand, err
-        return best
-
-    def _clear_mirror_state():
-        """Turn mirroring off and re-enable whatever panel it had disabled."""
-        prev_loading = loading_in_progress[0]
-        loading_in_progress[0] = True
-        try:
-            for h in _mirror_disabled_handles:
-                try:
-                    h.value = True
-                except Exception:
-                    pass
-        finally:
-            loading_in_progress[0] = prev_loading
-        _mirror_disabled_handles.clear()
-        _mirror_primary[0] = None
-        _mirror_counterpart_name[0] = None
-
-    def _enable_mirror_for(owner):
-        """Make `owner` the mirror primary and disable its counterpart panel.
-
-        Returns the counterpart owner, or None if no opposite-side panel was
-        found (mirroring is still enabled in that case)."""
-        _clear_mirror_state()
-        counterpart = _find_mirror_counterpart(owner)
-        if counterpart is not None:
-            handles = [g.get('enable') for g in _owner_groups(counterpart)]
-            handles += [l.get('enable') for l in _owner_individual_leds(counterpart)]
-            if counterpart[0] == 'slot':
-                data = _panel_slot_data[counterpart[1]]
-                if data:
-                    ctl = (data.get('controls') or {}).get('enable')
-                    if ctl is not None:
-                        handles.append(ctl)
-            prev_loading = loading_in_progress[0]
-            loading_in_progress[0] = True
-            try:
-                for h in handles:
-                    if h is None:
-                        continue
-                    try:
-                        if h.value:
-                            h.value = False
-                            _mirror_disabled_handles.append(h)
-                    except Exception:
-                        pass
-            finally:
-                loading_in_progress[0] = prev_loading
-            _mirror_counterpart_name[0] = _owner_display_name(counterpart)
-        _mirror_primary[0] = owner
-        return counterpart
-
-    def _expand_mirror_configs(custom_groups_configs, individual_leds_configs):
-        """Append XZ-mirrored copies of the mirror-primary panel's configs."""
-        expand_mirror_configs(custom_groups_configs, individual_leds_configs, _mirror_primary[0])
-
-    # --- Panel Configurator UI ---
-    with tab_panels:
-        panel_config_folder = server.gui.add_folder("Panel Configurator (Elios 3 Slots)", expand_by_default=False)
-
-    # _panel_dropdowns / _panel_mode_dropdowns are created (empty) near the top of main()
-    _panel_load_btns = []
-    _panel_clear_btns = []
-
-    with panel_config_folder:
-        server.gui.add_html(
-            "<div style='color:#aaa;font-size:11px;margin-bottom:8px;'>"
-            "Assign a template to each of the 4 Elios 3 panel positions.<br>"
-            "Positions and rotations are pre-set to match the drone geometry.<br>"
-            "Tip: click a panel in 3D and use 'Mirror to other side' in the Selected tab.</div>"
-        )
-
-        for _si, _slot_info in enumerate(_ELIOS3_SLOTS):
-            with server.gui.add_folder(f"📍 {_slot_info['name']}"):
-                _tpl_dd = server.gui.add_dropdown(
-                    "Template",
-                    options=["-- Nessuno --"] + get_available_templates(),
-                    initial_value="-- Nessuno --",
-                )
-                _mode_dd = server.gui.add_dropdown(
-                    "Mode",
-                    options=["Solid (Group)", "Individual LEDs"],
-                    initial_value="Solid (Group)",
-                )
-                _load_btn = server.gui.add_button("✅ Load Panel", color="green")
-                _clear_btn = server.gui.add_button("🗑️ Remove Panel", color="red")
-
-                _panel_dropdowns.append(_tpl_dd)
-                _panel_mode_dropdowns.append(_mode_dd)
-                _panel_load_btns.append(_load_btn)
-                _panel_clear_btns.append(_clear_btn)
-
-                def _make_load_handler(si, dd, mdd):
-                    def handler(_):
-                        tpl = dd.value
-                        if tpl == "-- Nessuno --":
-                            _clear_panel_slot(si)
-                            update_scene()
-                            print(f"Panel Configurator: Slot {_ELIOS3_SLOTS[si]['name']} cleared.")
-                            return
-                        as_individual = mdd.value == "Individual LEDs"
-                        _load_template_into_slot(si, tpl, as_individual)
-                    return handler
-
-                def _make_clear_handler(si, dd):
-                    def handler(_):
-                        _clear_panel_slot(si)
-                        dd.value = "-- Nessuno --"
-                        update_scene()
-                        print(f"Panel Configurator: Slot {_ELIOS3_SLOTS[si]['name']} cleared.")
-                    return handler
-
-                _load_btn.on_click(_make_load_handler(_si, _tpl_dd, _mode_dd))
-                _clear_btn.on_click(_make_clear_handler(_si, _tpl_dd))
-
-    with tab_panels:
-        individual_leds_folder = server.gui.add_folder("Individual LEDs")
-    
-    with individual_leds_folder:
-        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Add New Individual LED</div>")
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Add single LEDs with custom position, rotation, and size</div>")
-        
-        add_individual_led_btn = server.gui.add_button("➕ Add LED", color="cyan")
-        
-        server.gui.add_html("<hr style='margin:8px 0;'>")
-        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export Individual LEDs</div>")
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Save exact coordinates without transformations</div>")
-        
-        export_individual_leds_btn = server.gui.add_button("💾 Export to JSON", color="#4CAF50")
-        
-        server.gui.add_html("<hr style='margin:8px 0;'>")
-        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export Cover Panel (STEP)</div>")
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>Editable planar surfaces in SolidWorks (selectable as a plane, extrudable). One face per LED.</div>")
-        
+                            "World-space LED list (JSON), cover panel with one planar face per LED (STEP), "
+                            "and a 2-D CNC cutting file of the selected panel (DXF).</div>")
+        export_individual_leds_btn = server.gui.add_button("💾 Export LEDs to JSON", color="#4CAF50")
         export_stl_btn = server.gui.add_button("📦 Export Panel STEP", color="#FF9800")
-        
-        server.gui.add_html("<hr style='margin:8px 0;'>")
-        server.gui.add_html("<div style='font-weight:600;margin-bottom:6px;'>Export CNC Cutting (DXF)</div>")
-        server.gui.add_html("<div style='color:#888;font-size:11px;margin-bottom:8px;'>2D DXF file for CNC cutting of the custom panel. Can be opened in AutoCAD, LibreCAD, etc.</div>")
-        
-        export_cnc_btn = server.gui.add_button("🔩 Export CNC DXF", color="#2196F3")
-        
-        @add_individual_led_btn.on_click
-        def _(_):
-            create_individual_led()
-            print("✓ Individual LED added")
-        
+        export_cnc_btn = server.gui.add_button("🔩 Export CNC DXF (selected panel)", color="#2196F3")
+
         @export_individual_leds_btn.on_click
         def _(_):
             export_individual_leds_simple()
-        
+
         @export_stl_btn.on_click
         def _(_):
             export_leds_to_stl()
-        
+
         @export_cnc_btn.on_click
         def _(_):
             export_custom_group_dxf()
-
 
     _scene_view_late = _SimpleNamespace()  # filled after ui.scene_view.build()
 
     def update_scene(*a, **k):
         return _scene_view_late.update_scene(*a, **k)
 
-    # --- Panel system (see ui/panels.py) ---
-    _panels_ns = _panels.build(_SimpleNamespace(
-        _ELIOS3_SLOTS=_ELIOS3_SLOTS,
-        _Rz_matrix=_Rz_matrix,
-        _clear_mirror_state=_clear_mirror_state,
-        _mirror_primary=_mirror_primary,
-        _panel_dropdowns=_panel_dropdowns,
-        _panel_slot_data=_panel_slot_data,
-        custom_groups=custom_groups,
-        custom_groups_folder=custom_groups_folder,
-        custom_groups_templates_dir=custom_groups_templates_dir,
-        individual_leds=individual_leds,
-        individual_leds_folder=individual_leds_folder,
-        loading_in_progress=loading_in_progress,
-        next_custom_group_id=next_custom_group_id,
-        next_individual_led_id=next_individual_led_id,
-        select_panel=select_panel,
-        selected_owner=selected_owner,
+    # --- Panels & LEDs tab + Selected inspector (see ui/panels_tab.py) ---
+    enter_designer_ref = [lambda index=None: print("Designer not ready yet")]
+    _panels_ns = _panels_tab.build(_SimpleNamespace(
+        enter_designer=enter_designer_ref,
+        flash_lumens=flash_lumens,
+        inspector_tab=inspector_tab,
+        led_lumens_slider=led_lumens_slider,
         server=server,
-        show_led_markers=show_led_markers,
+        state=state,
         tab_panels=tab_panels,
-        template_folders=template_folders,
-        update_scene=update_scene,
+        templates_dir=templates_dir,
     ))
-    _clear_panel_slot = _panels_ns._clear_panel_slot
-    _load_template_into_slot = _panels_ns._load_template_into_slot
-    create_custom_group = _panels_ns.create_custom_group
-    create_individual_led = _panels_ns.create_individual_led
-    load_custom_group_from_template = _panels_ns.load_custom_group_from_template
-    load_template_as_individual_leds = _panels_ns.load_template_as_individual_leds
+    populate_inspector = _panels_ns.populate_inspector
+    clear_inspector = _panels_ns.clear_inspector
+    save_panel_as_template = _panels_ns.save_panel_as_template
     # --- Saved-configuration I/O (see ui/config_io.py) ---
     _config_io_ns = _config_io.build(_SimpleNamespace(
-        _ELIOS3_SLOTS=_ELIOS3_SLOTS,
-        _clear_mirror_state=_clear_mirror_state,
-        _enable_mirror_for=_enable_mirror_for,
-        _mirror_primary=_mirror_primary,
-        _panel_dropdowns=_panel_dropdowns,
-        _panel_slot_data=_panel_slot_data,
+        state=state,
         _refresh_vio_fov_label=_refresh_vio_fov_label,
         clear_stl_model=clear_stl_model,
-        create_custom_group=create_custom_group,
-        create_individual_led=create_individual_led,
         current_config_name=current_config_name,
-        custom_groups=custom_groups,
-        global_pos_x_slider=global_pos_x_slider,
-        global_pos_y_slider=global_pos_y_slider,
-        global_pos_z_slider=global_pos_z_slider,
-        global_rotation_z_slider=global_rotation_z_slider,
-        individual_leds=individual_leds,
         load_stl_file=load_stl_file,
         loading_in_progress=loading_in_progress,
         project_loaded=project_loaded,
-        select_panel=select_panel,
         server=server,
-        show_led_markers=show_led_markers,
         show_vio_fov=show_vio_fov,
         stl_absorber_enable=stl_absorber_enable,
         stl_file_path=stl_file_path,
@@ -1606,8 +1154,6 @@ def main():
         stl_scale=stl_scale,
         stl_visible=stl_visible,
         stl_wireframe=stl_wireframe,
-        tab_panels=tab_panels,
-        template_folders=template_folders,
         update_scene=update_scene,
         vio_cam1_pitch=vio_cam1_pitch,
         vio_cam1_yaw=vio_cam1_yaw,
@@ -1621,6 +1167,7 @@ def main():
         vio_pos_z=vio_pos_z,
     ))
     apply_config = _config_io_ns.apply_config
+    apply_layout = _config_io_ns.apply_layout
     apply_platform_cfg = _config_io_ns.apply_platform_cfg
     get_current_config = _config_io_ns.get_current_config
     new_project = _config_io_ns.new_project
@@ -1630,7 +1177,7 @@ def main():
     def _(_):
         name = platform_dropdown.value
         if not name or name == _NO_PLATFORM:
-            current_platform_name[0] = None
+            state.platform_name = None
             print("Platform link cleared: the frame / VIO settings will be saved inline with the layout.")
             return
         plat = load_platform(os.path.join(platforms_dir, f"{name}.json"))
@@ -1639,13 +1186,13 @@ def main():
             apply_platform_cfg(layout_to_v1(Layout(platform=plat), platform=plat))
         finally:
             loading_in_progress[0] = False
-        current_platform_name[0] = name
+        state.platform_name = name
         update_scene()
         print(f"✓ Platform loaded: {name}")
 
     @save_platform_btn.on_click
     def _(_):
-        name = platform_name_input.value.strip() or current_platform_name[0]
+        name = platform_name_input.value.strip() or state.platform_name
         if not name:
             print("Error: enter a platform name.")
             return
@@ -1654,13 +1201,12 @@ def main():
         plat.name = name
         path = os.path.join(platforms_dir, f"{name.lower().replace(' ', '_')}.json")
         save_json(plat, path)
-        current_platform_name[0] = os.path.splitext(os.path.basename(path))[0]
+        state.platform_name = os.path.splitext(os.path.basename(path))[0]
         _sync_platform_dropdown()
         print(f"✓ Platform saved: {path}")
     # --- Wall intensity map (see ui/intensity_map.py) ---
     _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
-        _expand_mirror_configs=_expand_mirror_configs,
-        _panel_slot_data=_panel_slot_data,
+        state=state,
         apply_view_mode=apply_view_mode,
         bw_scale_chk=bw_scale_chk,
         calibration_factor_slider=calibration_factor_slider,
@@ -1671,16 +1217,10 @@ def main():
         camera_pos_y=camera_pos_y,
         cell_readout_chk=cell_readout_chk,
         cell_readout_html=cell_readout_html,
-        custom_groups=custom_groups,
         custom_reflectance_slider=custom_reflectance_slider,
         diffuser_angle_slider=diffuser_angle_slider,
         diffuser_enable_chk=diffuser_enable_chk,
         diffuser_transmission_slider=diffuser_transmission_slider,
-        global_pos_x_slider=global_pos_x_slider,
-        global_pos_y_slider=global_pos_y_slider,
-        global_pos_z_slider=global_pos_z_slider,
-        global_rotation_z_slider=global_rotation_z_slider,
-        individual_leds=individual_leds,
         intensity_grid_size=intensity_grid_size,
         intensity_handles=intensity_handles,
         intensity_rays_slider=intensity_rays_slider,
@@ -1764,7 +1304,6 @@ def main():
         _room_metrics_html=_room_metrics_html,
         compute_room_intensity=compute_room_intensity,
         current_leds=current_leds,
-        global_rotation_z_slider=global_rotation_z_slider,
         intensity_rays_slider=intensity_rays_slider,
         intensity_to_color=intensity_to_color,
         legend_html=legend_html,
@@ -1795,8 +1334,7 @@ def main():
     update_room_intensity_map = _room_mode_ns.update_room_intensity_map
     # --- Main-camera FOV capture (see ui/fov_capture.py) ---
     _fov_capture_ns = _fov_capture.build(_SimpleNamespace(
-        _expand_mirror_configs=_expand_mirror_configs,
-        _panel_slot_data=_panel_slot_data,
+        state=state,
         apply_view_mode=apply_view_mode,
         calibration_factor_slider=calibration_factor_slider,
         camera_fov_h=camera_fov_h,
@@ -1804,11 +1342,9 @@ def main():
         camera_pitch=camera_pitch,
         camera_pos_x=camera_pos_x,
         camera_pos_y=camera_pos_y,
-        custom_groups=custom_groups,
         diffuser_angle_slider=diffuser_angle_slider,
         diffuser_enable_chk=diffuser_enable_chk,
         diffuser_transmission_slider=diffuser_transmission_slider,
-        individual_leds=individual_leds,
         intensity_rays_slider=intensity_rays_slider,
         intensity_to_color=intensity_to_color,
         led_lumens_slider=led_lumens_slider,
@@ -1830,34 +1366,24 @@ def main():
     # --- Export helpers (see ui/exports.py) ---
     _exports_ns = _exports.build(_SimpleNamespace(
         current_leds=current_leds,
-        individual_leds=individual_leds,
+        state=state,
     ))
     export_custom_group_dxf = _exports_ns.export_custom_group_dxf
     export_individual_leds_simple = _exports_ns.export_individual_leds_simple
     export_leds_to_stl = _exports_ns.export_leds_to_stl
     # --- 3-D scene (see ui/scene_view.py) ---
     _scene_view_ns = _scene_view.build(_SimpleNamespace(
-        _ELIOS3_SLOTS=_ELIOS3_SLOTS,
-        _clear_mirror_state=_clear_mirror_state,
-        _clear_panel_slot=_clear_panel_slot,
-        _enable_mirror_for=_enable_mirror_for,
-        _expand_mirror_configs=_expand_mirror_configs,
-        _inspector_handles=_inspector_handles,
-        _inspector_syncing=_inspector_syncing,
+        state=state,
+        populate_inspector=populate_inspector,
+        clear_inspector=clear_inspector,
+        save_panel_as_template=save_panel_as_template,
+        enter_designer_ref=enter_designer_ref,
         _just_clicked_mesh=_just_clicked_mesh,
         _last_intensity_cache=_last_intensity_cache,
         _last_room_cache=_last_room_cache,
-        _mirror_counterpart_name=_mirror_counterpart_name,
-        _mirror_primary=_mirror_primary,
         _mode_toggle_syncing=_mode_toggle_syncing,
-        _owner_display_name=_owner_display_name,
-        _owner_groups=_owner_groups,
-        _owner_individual_leds=_owner_individual_leds,
-        _panel_dropdowns=_panel_dropdowns,
-        _panel_slot_data=_panel_slot_data,
         _refresh_uniformity=_refresh_uniformity,
         _refresh_vio_fov_label=_refresh_vio_fov_label,
-        _select_panel_impl=_select_panel_impl,
         apply_view_mode=apply_view_mode,
         flash_lumens=flash_lumens,
         camera_fov_h=camera_fov_h,
@@ -1870,11 +1396,9 @@ def main():
         capture_fov_btn=capture_fov_btn,
         cell_area_html=cell_area_html,
         clear_csv_pattern=clear_csv_pattern,
-        create_custom_group=create_custom_group,
         csv_clear_btn=csv_clear_btn,
         csv_import_btn=csv_import_btn,
         current_leds=current_leds,
-        custom_groups=custom_groups,
         designer_gizmo=designer_gizmo,
         designer_led_nodes=designer_led_nodes,
         designer_mode=designer_mode,
@@ -1888,15 +1412,9 @@ def main():
         draw_room_walls=draw_room_walls,
         export_lux_matrix=export_lux_matrix,
         export_lux_matrix_button=export_lux_matrix_button,
-        get_available_templates=get_available_templates,
-        global_pos_x_slider=global_pos_x_slider,
-        global_pos_y_slider=global_pos_y_slider,
-        global_pos_z_slider=global_pos_z_slider,
-        global_rotation_z_slider=global_rotation_z_slider,
         guide_handles=guide_handles,
         import_csv_pattern=import_csv_pattern,
         imported_csv_handles=imported_csv_handles,
-        individual_leds=individual_leds,
         inspector_tab=inspector_tab,
         intensity_grid_size=intensity_grid_size,
         intensity_handles=intensity_handles,
@@ -1906,7 +1424,6 @@ def main():
         led_lumens_slider=led_lumens_slider,
         legend_html=legend_html,
         loading_in_progress=loading_in_progress,
-        open_panel_designer_btn=open_panel_designer_btn,
         ray_handles=ray_handles,
         ray_length_slider=ray_length_slider,
         read_cell_at_ray=read_cell_at_ray,
@@ -1920,9 +1437,6 @@ def main():
         room_wall_handles=room_wall_handles,
         run_benchmark=run_benchmark,
         run_benchmark_button=run_benchmark_button,
-        save_custom_group_template=save_custom_group_template,
-        select_panel=select_panel,
-        selected_owner=selected_owner,
         server=server,
         show_back_wall=show_back_wall,
         show_camera_fov=show_camera_fov,
@@ -1945,7 +1459,6 @@ def main():
         stl_rot_y=stl_rot_y,
         stl_rot_z=stl_rot_z,
         stl_scale=stl_scale,
-        template_dropdown=template_dropdown,
         tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
         update_intensity_button=update_intensity_button,
@@ -1988,7 +1501,7 @@ def main():
         config_dir=config_dir,
         config_dropdown=config_dropdown,
         current_config_name=current_config_name,
-        custom_groups=custom_groups,
+        state=state,
         diffuser_angle_slider=diffuser_angle_slider,
         diffuser_enable_chk=diffuser_enable_chk,
         diffuser_transmission_slider=diffuser_transmission_slider,
@@ -2021,6 +1534,9 @@ def main():
         wall_dist_slider=wall_dist_slider,
         wall_view_size=wall_view_size,
     ))
+
+    # Any change of the layout (panel added / moved / toggled ...) redraws the 3-D scene
+    state.on_change(lambda what: update_scene())
 
     # Initial draw
     update_scene()

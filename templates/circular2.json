@@ -1,0 +1,185 @@
+{
+  "schema_version": 2,
+  "name": "circular2",
+  "description": "Panel template converted from custom_groups_templates/circular2.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "circular2",
+      "leds": [
+        {
+          "position": [0.0, 0.0, 1.0],
+          "direction": [0.87462, 0.0, 0.48481],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -0.707107, 0.707107],
+          "direction": [0.707107, -0.5, 0.5],
+          "row_dir": [-0.070667, -0.753536, -0.653598],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.707107, 0.707107],
+          "direction": [0.707107, 0.5, 0.5],
+          "row_dir": [0.703567, -0.42683, -0.568164],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 1.0, 0.0],
+          "direction": [0.87462, 0.48481, 0.0],
+          "row_dir": [0.48481, -0.87462, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -1.0, 0.0],
+          "direction": [0.87462, -0.48481, 0.0],
+          "row_dir": [-0.48481, -0.87462, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -0.707107, -0.707107],
+          "direction": [0.707107, -0.5, -0.5],
+          "row_dir": [-0.703567, -0.42683, -0.568164],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.707107, -0.707107],
+          "direction": [0.707107, 0.5, -0.5],
+          "row_dir": [0.070667, -0.753536, -0.653598],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, -1.0],
+          "direction": [0.87462, 0.0, -0.48481],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": false,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -1.414214, 1.414214],
+          "direction": [0.5, -0.612372, 0.612372],
+          "row_dir": [-0.215883, -0.772918, -0.59665],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 1.414214, 1.414214],
+          "direction": [0.5, 0.612372, 0.612372],
+          "row_dir": [0.838686, -0.166124, -0.51866],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -1.414214, -1.414214],
+          "direction": [0.5, -0.612372, -0.612372],
+          "row_dir": [-0.838686, -0.166124, -0.51866],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 1.414214, -1.414214],
+          "direction": [0.5, 0.612372, -0.612372],
+          "row_dir": [0.215883, -0.772918, -0.59665],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, 2.0],
+          "direction": [0.5, 0.0, 0.866025],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, -2.0],
+          "direction": [0.5, 0.0, -0.866025],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 2.0, 0.0],
+          "direction": [0.5, 0.866025, 0.0],
+          "row_dir": [0.866025, -0.5, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -2.0, 0.0],
+          "direction": [0.5, -0.866025, 0.0],
+          "row_dir": [-0.866025, -0.5, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      ],
+      "source": null
+    }
+  ]
+}

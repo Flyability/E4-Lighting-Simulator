@@ -37,7 +37,7 @@ def build(ctx):
     config_dir = ctx.config_dir
     config_dropdown = ctx.config_dropdown
     current_config_name = ctx.current_config_name
-    custom_groups = ctx.custom_groups
+    state = ctx.state
     diffuser_angle_slider = ctx.diffuser_angle_slider
     diffuser_enable_chk = ctx.diffuser_enable_chk
     diffuser_transmission_slider = ctx.diffuser_transmission_slider
@@ -74,7 +74,7 @@ def build(ctx):
     optim_output_dir = os.path.join("exports", "optim") if os.path.isdir("exports") \
         else os.path.join(_project_root, "exports", "optim")
     _OPTIM_NO_SPEC = "— none (build from UI) —"
-    _OPTIM_NO_GROUP = "(no custom groups)"
+    _OPTIM_NO_GROUP = "(no panels)"
     _optim_state = {
         'thread': None, 'stop': _threading.Event(), 'budget': 1,
         'best_cfg': None, 'evals': [], 'scores': [], 'bests': [], 'last_ui': 0.0,
@@ -89,10 +89,8 @@ def build(ctx):
 
     def _optim_group_labels():
         labels = []
-        for idx, g in enumerate(custom_groups):
-            name = (g.get('panel_slot_name') or g.get('template_name')
-                    or getattr(g.get('folder'), 'label', None) or f"Custom Group {g['id']}")
-            labels.append(f"{idx}: {name}")
+        for idx, p in enumerate(state.panels):
+            labels.append(f"{idx}: {p.name}")
         return labels or [_OPTIM_NO_GROUP]
 
     _MODE_REFINE = "1 · Refine the current panels"
@@ -1062,28 +1060,23 @@ def build(ctx):
     def _optim_selected_group_index():
         label = optim_group_dropdown.value or ""
         if not label or label == _OPTIM_NO_GROUP or ':' not in label:
-            raise ValueError("Select a custom group (click 'Refresh group list' after adding panels).")
+            raise ValueError("Select a panel (click 'Refresh group list' after adding panels).")
         idx = int(label.split(':', 1)[0])
-        if idx >= len(custom_groups):
+        if idx >= len(state.panels):
             raise ValueError("Group list is stale — click 'Refresh group list'.")
         return idx
 
     def _optim_group_variables(base_cfg):
         """Variables for the selected group; a fixed beam angle is written into ``base_cfg`` instead."""
         gi = _optim_selected_group_index()
-        group = custom_groups[gi]
         variables = []
         if optim_move_mode.value == _MOVE_FREE:
             variables.append({'type': 'panel_pose', 'group_index': gi,
                               'pos_delta': [float(v) for v in optim_pos_delta.value],
                               'rot_delta': [float(v) for v in optim_rot_delta.value]})
         elif optim_move_mode.value == _MOVE_DUCT:
-            if not group.get('is_dynamic'):
-                raise ValueError("Mounting on a duct needs a dynamic (designer / template) group.")
             variables.append(_refine_duct_variable(gi))
         if optim_var_tilts.value:
-            if not group.get('is_dynamic'):
-                raise ValueError("Per-LED beam tilt needs a dynamic (designer / template) group.")
             t = float(optim_tilt_range.value)
             variables.append({'type': 'beam_tilts', 'group_index': gi, 'tilt_range': [-t, t]})
         if optim_beam_mode.value == _BEAM_OPT:

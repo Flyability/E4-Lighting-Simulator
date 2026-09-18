@@ -302,7 +302,7 @@ def panel_to_v1_group(panel: Panel, name=None):
     R = panel.matrix()
     n = len(panel.leds)
     g = {
-        'enabled': panel.enabled, 'name': name or panel.name,
+        'enabled': panel.enabled, 'name': name or panel.name, 'mirror': panel.mirror,
         'position': list(panel.position), 'rotation_x': 0.0, 'rotation_y': 0.0, 'rotation_z': 0.0,
         'is_dynamic': True, 'num_leds': n,
         'led_positions': [[float(v) for v in R @ np.asarray(l.position, float)] for l in panel.leds],
@@ -325,28 +325,12 @@ def panel_to_v1_group(panel: Panel, name=None):
 
 
 def layout_to_v1(layout: Layout, platform: Platform | None = None, platforms_dir="platforms"):
-    """v1-style config dict (custom_groups / mirror_primary / stl_model / vio_cameras) for the
-    current UI runtime and the optimiser. The first mirrored panel becomes ``mirror_primary``;
-    further mirrored panels get an explicit mirrored twin group."""
-    from lighting_simulator.domain.mirroring import mirror_group_config_xz
-
-    groups, primary = [], None
-    for panel in layout.panels:
-        g = panel_to_v1_group(panel)
-        idx = len(groups)
-        groups.append(g)
-        if panel.mirror:
-            if primary is None:
-                primary = {'kind': 'custom_group', 'key': idx}
-            else:
-                m = mirror_group_config_xz(g)
-                m['name'] = f"{panel.name}_mirror"
-                m.pop('owner', None)
-                m['mirror_twin_of'] = idx  # lets convert_v1 fold it back into panel.mirror
-                groups.append(m)
+    """v1-style config dict (custom_groups / stl_model / vio_cameras) for the current UI runtime
+    and the optimiser. Group *i* is panel *i*; ``group['mirror']`` carries the XZ twin."""
+    groups = [panel_to_v1_group(p) for p in layout.panels]
     cfg = {
         'schema_version': 1, 'name': layout.name, 'description': layout.description,
-        'custom_groups': groups, 'individual_leds': [], 'mirror_primary': primary,
+        'custom_groups': groups, 'individual_leds': [], 'mirror_primary': None,
         'global_rotation_z': 0, 'global_pos_x': 0.0, 'global_pos_y': 0.0, 'global_pos_z': 0.0,
         'flux': asdict(layout.flux), 'stl_model': None,
         'vio_cameras': asdict(VioCameras()),
@@ -480,7 +464,8 @@ def convert_v1(cfg, default_lumens=168.0) -> Layout:
         owner = ('slot', slot) if slot is not None else ('custom_group', i)
         if g.get('lumens_override_enabled'):
             print(f"[layout] custom group {i}: lumens override {g.get('lumens_value')} lm dropped (flux is per mode now)")
-        panels.append(_v1_group_to_panel(g, i, owner == primary or i in twins, global_R, global_offset))
+        mirror = owner == primary or i in twins or bool(g.get('mirror'))
+        panels.append(_v1_group_to_panel(g, i, mirror, global_R, global_offset))
     for i, l in enumerate(cfg.get('individual_leds', [])):
         panels.append(_v1_individual_to_panel(l, i, global_R, global_offset))
 

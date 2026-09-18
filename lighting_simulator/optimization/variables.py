@@ -17,7 +17,6 @@ import numpy as np
 from lighting_simulator.domain.geometry import euler_xyz_matrix, normalize, rodrigues_rotation
 from lighting_simulator.domain.guides import dynamic_group_world_geometry
 from lighting_simulator.domain.led import CODE_ROLES, ROLE_CODES, normalize_roles
-from lighting_simulator.domain.mirroring import mirror_group_config_xz
 from lighting_simulator.scene.builder import euler_applies, group_runtime_state
 
 from .electrical import DriverModel
@@ -372,13 +371,9 @@ class DuctRingLayout(VariableGroup):
             'initial_pos': [0.0, 0.0, 0.0],
             'initial_rot': [0, 0, 0],
             'generated_by': 'DuctRingLayout',
+            'mirror': bool(self.mirror_xz),
         }
         cfg.setdefault('custom_groups', []).append(group)
-        if self.mirror_xz:
-            m = mirror_group_config_xz(group)
-            m['name'] = f"{self.name}_mirror"
-            m['position'] = [0.0, 0.0, 0.0]
-            cfg['custom_groups'].append(m)
 
 
 @dataclass
@@ -600,12 +595,9 @@ class DuctPanelPose(VariableGroup):
             group['led_row_directions'] = rows
         group['led_euler_angles'] = []
         if self.mirror_group_index is not None:
-            old = cfg['custom_groups'][self.mirror_group_index]
-            m = mirror_group_config_xz(group)
-            m.pop('owner', None)
-            m['name'] = old.get('name', f"{group.get('name', 'panel')}_mirror")
-            m['panel_slot'] = old.get('panel_slot')
-            cfg['custom_groups'][self.mirror_group_index] = m
+            # the partner is replaced by the live XZ twin of the moved panel
+            cfg['custom_groups'][self.mirror_group_index]['enabled'] = False
+            group['mirror'] = True
 
 
 @dataclass

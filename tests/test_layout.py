@@ -129,8 +129,8 @@ def test_layout_to_v1_round_trip_and_optimiser_base():
     ])
     ref = _signature(build_leds_from_layout(lay))
     v1 = layout_to_v1(lay)
-    assert v1['mirror_primary'] == {'kind': 'custom_group', 'key': 0}
-    assert [g['name'] for g in v1['custom_groups']] == ["a", "b", "b_mirror", "c"]
+    assert v1['mirror_primary'] is None and [g['mirror'] for g in v1['custom_groups']] == [True, True, False]
+    assert [g['name'] for g in v1['custom_groups']] == ["a", "b", "c"]
     assert v1['custom_groups'][0]['rotation_y'] == 0  # rotation baked into the LED arrays
     assert _signature(build_scene_from_config(v1, default_lumens=300).leds) == ref
     back = convert_v1(v1)

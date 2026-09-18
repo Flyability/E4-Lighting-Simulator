@@ -1,0 +1,55 @@
+{
+  "schema_version": 2,
+  "name": "Triang",
+  "description": "Panel template converted from custom_groups_templates/Triang.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "Triang",
+      "leds": [
+        {
+          "position": [0.0, 0.0, 0.5],
+          "direction": [0.707107, 0.0, 0.707107],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.5, 0.0],
+          "direction": [0.813798, 0.5, -0.296198],
+          "row_dir": [0.523491, -0.852031, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -0.5, 0.0],
+          "direction": [0.813798, -0.5, -0.296198],
+          "row_dir": [-0.523491, -0.852031, 0.0],
+          "beam_angle": 60.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2]
+      ],
+      "source": null
+    }
+  ]
+}

@@ -1,0 +1,148 @@
+{
+  "schema_version": 2,
+  "name": "ELIOS3_PANNEL",
+  "description": "Panel template converted from custom_groups_templates/ELIOS3_PANNEL.json",
+  "platform": null,
+  "flux": {
+    "vio_lumens": 168.0,
+    "flash_lumens": null
+  },
+  "panels": [
+    {
+      "name": "panel0",
+      "leds": [
+        {
+          "position": [-0.5, 0.8, -0.85],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.5, 0.0, -0.85],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.5, -0.8, -0.85],
+          "direction": [0.0, 0.0, -1.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.8, -0.55],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, -0.55],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -0.8, -0.55],
+          "direction": [0.866025, 0.0, -0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.8, 0.55],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, 0.0, 0.55],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [0.0, -0.8, 0.55],
+          "direction": [0.866025, 0.0, 0.5],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.5, 0.8, 0.85],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.5, 0.0, 0.85],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        },
+        {
+          "position": [-0.5, -0.8, 0.85],
+          "direction": [0.0, 0.0, 1.0],
+          "row_dir": [0.0, -1.0, 0.0],
+          "beam_angle": 120.0,
+          "tilt": 0.0,
+          "size": 0.5,
+          "on": true,
+          "role": "both"
+        }
+      ],
+      "enabled": true,
+      "mirror": false,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "rows": [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11]
+      ],
+      "source": null
+    }
+  ]
+}

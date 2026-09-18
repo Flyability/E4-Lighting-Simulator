@@ -58,7 +58,7 @@ def click(label):
 
 print("[smoke] GUI handles:", len(handles))
 print("[smoke] configs listed:", find("Select Configuration").options)
-find("Select Configuration").value = "elios3"
+find("Select Configuration").value = "elios3_oris"
 click("📂 Load Configuration")
 time.sleep(3)
 find("Show intensity on wall").value = True

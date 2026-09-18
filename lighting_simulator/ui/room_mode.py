@@ -18,7 +18,6 @@ def build(ctx):
     _room_metrics_html = ctx._room_metrics_html
     compute_room_intensity = ctx.compute_room_intensity
     current_leds = ctx.current_leds
-    global_rotation_z_slider = ctx.global_rotation_z_slider
     intensity_rays_slider = ctx.intensity_rays_slider
     intensity_to_color = ctx.intensity_to_color
     legend_html = ctx.legend_html
@@ -181,15 +180,6 @@ def build(ctx):
         if stl_absorber_enable.value and stl_mesh_data[0] is not None:
             mesh_ref = stl_mesh_data[0]
             transform = _build_stl_transform(stl_scale, stl_rot_x, stl_rot_y, stl_rot_z, stl_pos_x, stl_pos_y, stl_pos_z)
-            # Apply global Z rotation to STL transform (room mode)
-            _g_rot_room = global_rotation_z_slider.value
-            if abs(_g_rot_room) > 0.01:
-                T_global_room = np.eye(4)
-                _gr = np.radians(_g_rot_room)
-                T_global_room[:3, :3] = np.array([[np.cos(_gr), -np.sin(_gr), 0],
-                                                   [np.sin(_gr),  np.cos(_gr), 0],
-                                                   [0,            0,           1]])
-                transform = T_global_room @ transform
             stl_mesh_for_raytracing = {
                 'vertices': mesh_ref.vertices,
                 'faces': mesh_ref.faces,
