@@ -182,6 +182,21 @@ def build(ctx):
             b = _add(server.gui.add_button(f"L{i + 1}", color=_ROLE_COLORS.get(led.role, "#FFFFFF") if led.on else "#444444"))
             b.on_click(lambda _, i=i: _apply([i]))
 
+        angles = sorted({round(float(l.beam_angle), 1) for l in panel.leds})
+        beam = _add(server.gui.add_number(
+            "Beam angle, all LEDs (°)", float(angles[0]) if len(angles) == 1 else 0.0, min=0.0, max=180.0, step=1.0,
+            hint="Full beam angle of every LED in this panel (0 = leave as is). Per-LED values: Designer."
+                 + (f" Currently mixed: {', '.join(f'{a:g}' for a in angles)}°." if len(angles) > 1 else "")))
+
+        @beam.on_update
+        def _(_):
+            v = float(beam.value)
+            if v <= 0:
+                return
+            for l in panel.leds:
+                l.beam_angle = v
+            state.notify()
+
     def _guide_controls(panel: Panel, index):
         guide = state.guides.get(index)
         chk = _add(server.gui.add_checkbox("Anchor to duct axis (fit from LED rows)", initial_value=guide is not None,
