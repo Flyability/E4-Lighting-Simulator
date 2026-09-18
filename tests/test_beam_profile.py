@@ -73,3 +73,15 @@ def test_bad_profiles_rejected():
         BeamProfile("x", [0, 10, 5], [1, 1, 1])
     with pytest.raises(ValueError):
         BeamProfile("x", [0, 10], [0, 0])
+
+
+def test_duct_ring_emits_profile():
+    from lighting_simulator.optimization.variables import DuctRingLayout, Duct
+    var = DuctRingLayout(name="d", duct=Duct(center=(0, 0, 0), axis=(1, 0, 0), radius=8.0), n_leds=6, n_rows=2,
+                         beam_profile="XFL12K HD")
+    cfg = {'custom_groups': []}
+    var.apply(var.x0, cfg)
+    g = cfg['custom_groups'][-1]
+    assert g['led_profiles'] == ["XFL12K HD"] * g['num_leds']
+    leds = build_leds_from_config(cfg, default_lumens=100.0)
+    assert all(l.beam_profile.name == "XFL12K HD" for l in leds)

@@ -12,6 +12,7 @@ import time
 import traceback as _traceback
 import webbrowser as _wb
 import numpy as np
+from lighting_simulator.domain.beam_profile import LAMBERTIAN as _LAMBERTIAN, get_profile as _get_profile, profile_names as _profile_names
 from lighting_simulator.domain.guides import circle_line_segments_m as _circle_line_segments_m
 from lighting_simulator.simulation import gpu_backend as _gpu_backend
 from lighting_simulator.optimization import (
@@ -167,6 +168,10 @@ def build(ctx):
         optim_beam_fixed = server.gui.add_number("Beam angle (°)", 120.0, min=10.0, max=180.0, step=5.0, visible=False)
         optim_beam_range = server.gui.add_multi_slider("Beam angle range (°)", min=30, max=180, step=5,
                                                        initial_value=(90, 130), visible=False)
+        optim_beam_profile = server.gui.add_dropdown(
+            "Beam profile", options=[_BEAM_KEEP] + _profile_names(), initial_value=_BEAM_KEEP,
+            hint="Measured intensity-vs-angle curve for every LED of the group (see Selected → Beam profile). "
+                 "'Keep scene values' uses whatever the panel has; with a measured profile the beam angle is ignored.")
         optim_var_tilts = server.gui.add_checkbox("Optimise per-LED beam tilt", initial_value=False,
                                                   hint="Dynamic (designer / template) groups only")
         optim_tilt_range = server.gui.add_slider("± beam tilt (°)", min=5, max=90, step=5, initial_value=45,
@@ -257,6 +262,10 @@ def build(ctx):
         duct_beam_fixed = server.gui.add_number("Lattice beam angle (°)", 120.0, min=10.0, max=180.0, step=5.0)
         duct_beam = server.gui.add_multi_slider("Lattice beam angle range (°)", min=30, max=180, step=5,
                                                 initial_value=(90, 130), visible=False)
+        duct_beam_profile = server.gui.add_dropdown(
+            "Lattice beam profile", options=_profile_names(), initial_value=_LAMBERTIAN,
+            hint="Measured intensity-vs-angle curve for the lattice LEDs; with a measured profile the beam angle "
+                 "controls are ignored.")
         duct_tilt = server.gui.add_slider("± beam tilt toward axis (°)", min=0, max=90, step=5, initial_value=60,
                                           hint="0 = beams stay normal to the duct surface")
         duct_tilt_shared = server.gui.add_checkbox("Shared tilt for all LEDs", initial_value=False)
@@ -271,13 +280,15 @@ def build(ctx):
                                                    initial_value=(0.3, 3.0), visible=False)
 
     def _optim_beam_mode_changed(_=None):
+        profiled = duct_beam_profile.value != _LAMBERTIAN
         optim_beam_fixed.visible = optim_beam_mode.value == _BEAM_FIXED
         optim_beam_range.visible = optim_beam_mode.value == _BEAM_OPT
-        duct_beam_fixed.visible = duct_beam_mode.value == _BEAM_FIXED
-        duct_beam.visible = duct_beam_mode.value == _BEAM_OPT
+        duct_beam_mode.visible = not profiled
+        duct_beam_fixed.visible = duct_beam_mode.value == _BEAM_FIXED and not profiled
+        duct_beam.visible = duct_beam_mode.value == _BEAM_OPT and not profiled
         optim_tilt_range.visible = bool(optim_var_tilts.value)
 
-    for _h in (optim_beam_mode, duct_beam_mode, optim_var_tilts):
+    for _h in (optim_beam_mode, duct_beam_mode, optim_var_tilts, duct_beam_profile):
         _h.on_update(_optim_beam_mode_changed)
     _optim_beam_mode_changed()
 
@@ -327,7 +338,10 @@ def build(ctx):
             'led_size': float(duct_led_size.value),
             'mirror_xz': bool(duct_mirror.value),
         }
-        if duct_beam_mode.value == _BEAM_OPT:
+        if duct_beam_profile.value != _LAMBERTIAN:
+            var['beam_profile'] = duct_beam_profile.value
+            var['default_beam_angle'] = 2.0 * _get_profile(duct_beam_profile.value).max_angle_deg
+        elif duct_beam_mode.value == _BEAM_OPT:
             var['beam_angle_range'] = [float(v) for v in duct_beam.value]
         else:
             var['default_beam_angle'] = float(duct_beam_fixed.value)
@@ -946,6 +960,8 @@ def build(ctx):
             else:
                 duct_beam_mode.value = _BEAM_FIXED
                 duct_beam_fixed.value = float(v.get('default_beam_angle', 120.0))
+            _bp = v.get('beam_profile') or _LAMBERTIAN
+            duct_beam_profile.value = _bp if _bp in duct_beam_profile.options else _LAMBERTIAN
             duct_var_current.value = bool(v.get('current_range'))
             if v.get('current_range'):
                 duct_current.value = tuple(float(c) for c in v['current_range'])
@@ -1092,6 +1108,12 @@ def build(ctx):
             g = base_cfg['custom_groups'][gi]
             n = g.get('num_leds', len(g.get('led_positions', [])))
             g['led_viewing_angles'] = [float(optim_beam_fixed.value)] * n
+        if optim_beam_profile.value != _BEAM_KEEP:
+            if optim_beam_profile.value != _LAMBERTIAN and optim_beam_mode.value == _BEAM_OPT:
+                raise ValueError("A measured beam profile fixes the beam shape: set 'Beam angle' to Keep or Fixed.")
+            g = base_cfg['custom_groups'][gi]
+            n = g.get('num_leds', len(g.get('led_positions', [])))
+            g['led_profiles'] = [None if optim_beam_profile.value == _LAMBERTIAN else optim_beam_profile.value] * n
         if optim_var_roles.value and optim_flash_enable.value:
             variables.append({'type': 'led_roles', 'group_index': gi})
         elif optim_var_states.value:

@@ -105,7 +105,7 @@ data, not code:
 
 Variable groups (`type`):
 
-- `duct_ring` — LEDs mounted on a cylinder (`duct`: center, axis, radius). `placement: "arc"` keeps an `n_rows × n_cols` lattice and optimises arc centre/span, axial position, row pitch; `"free"` gives every LED its own angle/height. Optional shared or per-LED axial/tangential tilt, `beam_angle_range`, `optimize_enabled` (on/off per LED), `mirror_xz` for left/right symmetry.
+- `duct_ring` — LEDs mounted on a cylinder (`duct`: center, axis, radius). `placement: "arc"` keeps an `n_rows × n_cols` lattice and optimises arc centre/span, axial position, row pitch; `"free"` gives every LED its own angle/height. Optional shared or per-LED axial/tangential tilt, `beam_angle_range` or `beam_profile` (measured curve name, overrides the angle), `optimize_enabled` (on/off per LED), `mirror_xz` for left/right symmetry.
 - `panel_pose` — ±translation/rotation of an existing custom group of the base config.
 - `led_states` — on/off per LED of a group (or the base rig).
 - `beam_angle` — shared viewing angle of a group.

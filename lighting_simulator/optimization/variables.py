@@ -138,6 +138,8 @@ class DuctRingLayout(VariableGroup):
     beam_angle_range: tuple | None = None
     shared_beam_angle: bool = True
     default_beam_angle: float = 120.0
+    beam_profile: str | None = None
+    """Measured beam profile name for every lattice LED (``domain.beam_profile``); overrides the beam angle."""
     optimize_enabled: bool = False
     """Per-LED on/off. Ignored when the row/column counts are variables (the counts already set
     how many LEDs there are; a second knob for the same thing only confuses the search)."""
@@ -359,6 +361,7 @@ class DuctRingLayout(VariableGroup):
             'led_sizes': [self.led_size] * n_out,
             'led_viewing_angles': [float(beams[i if len(beams) > 1 else 0]) for i in range(n_out)],
             'led_beam_tilts': [0.0] * n_out,
+            'led_profiles': [self.beam_profile or None] * n_out,
             'led_states': states,
             'led_roles': roles,
             'led_rows': rows,

@@ -22,6 +22,19 @@ def _capturing_init(self, *a, **k):
 
 viser.ViserServer.__init__ = _capturing_init
 
+from lighting_simulator.ui.layout_state import LayoutState  # noqa: E402
+
+_states = []
+_orig_state_init = LayoutState.__init__
+
+
+def _capturing_state_init(self, *a, **k):
+    _orig_state_init(self, *a, **k)
+    _states.append(self)
+
+
+LayoutState.__init__ = _capturing_state_init
+
 import lighting_simulator.ui.app as app  # noqa: E402
 
 errors = []
@@ -189,6 +202,19 @@ fire_update(find("Lattice beam angle"))
 find("Lattice beam angle (°)").value = 100.0
 find("Max evaluations").value = 12
 run_and_wait("ducts (lumens only, fixed beam)")
+
+# measured beam profile on the lattice, analytic scoring; the loaded best config must carry it
+find("Lattice beam profile").value = "XFL12K HD"
+fire_update(find("Lattice beam profile"))
+find("Analytic direct light (no ray tracing)").value = True
+run_and_wait("ducts (XFL12K HD profile, analytic)")
+_lay = _states[0].layout if _states else None
+_profiles = {l.profile for p in _lay.panels for l in p.leds} if _lay else set()
+print("[smoke] profiles in loaded best layout:", _profiles)
+assert _profiles == {"XFL12K HD"}, _profiles
+find("Analytic direct light (no ray tracing)").value = False
+find("Lattice beam profile").value = "cos^n (beam angle)"
+fire_update(find("Lattice beam profile"))
 
 # tilted ducts + VIO scored on the five room walls
 find("Duct rotation X/Y/Z (°)").value = (8.0, -5.0, 0.0)
