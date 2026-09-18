@@ -77,6 +77,8 @@ class LED:
     viewing_angle: float = 60.0 # in degrees
     enabled: bool = True
     role: str = DEFAULT_ROLE
+    beam_profile: object = None
+    """Optional ``BeamProfile`` (measured I(θ) curve); None = cosⁿ model from ``viewing_angle``."""
 
     def __post_init__(self):
         # Convert position and direction to numpy arrays and ensure they are of type float

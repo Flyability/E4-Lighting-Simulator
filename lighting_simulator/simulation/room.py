@@ -168,6 +168,10 @@ def compute_room_intensity(leds, settings: RoomSettings, emission: EmissionSetti
 
     if use_gpu is None:
         use_gpu = gpu_backend.gpu_available()
+    if use_gpu and any(getattr(l, 'beam_profile', None) is not None for l, _ in active):
+        if verbose:
+            print("  measured beam profiles present → CPU tracer (GPU kernels only model cosⁿ beams)")
+        use_gpu = False
 
     t0 = time.perf_counter()
     if use_gpu:

@@ -28,8 +28,12 @@ def generate_led_rays(led, n_rays, lumens, ray_uniformity, rng):
     Returns (world_dirs (N, 3) float64, lumens_per_ray (N,)).
     """
     x_axis, y_axis, z_axis = emission_frame(led.direction)
-    n = effective_lambertian_exponent(led, ray_uniformity)
-    cos_max = np.cos(np.radians(led.viewing_angle / 2.0))
+    profile = getattr(led, 'beam_profile', None)
+    if profile is not None:
+        n, cos_max = 0.0, profile.cos_max
+    else:
+        n = effective_lambertian_exponent(led, ray_uniformity)
+        cos_max = np.cos(np.radians(led.viewing_angle / 2.0))
 
     u = rng.uniform(0, 1, (n_rays, 2))
     cos_theta = np.clip(1.0 - u[:, 0] * (1.0 - cos_max), -1.0, 1.0)
@@ -43,6 +47,12 @@ def generate_led_rays(led, n_rays, lumens, ray_uniformity, rng):
         + local_dirs[:, 2:3] * z_axis
     )
     world_dirs /= np.linalg.norm(world_dirs, axis=1, keepdims=True)
+
+    if profile is not None:
+        # uniform solid-angle sampling in the cone; weight = I(θ) / pdf, pdf = 1 / (2π (1 - cos_max))
+        theta_deg = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+        lumens_per_ray = profile.intensity_cd(theta_deg, lumens) * (2.0 * np.pi * (1.0 - cos_max)) / n_rays
+        return world_dirs, lumens_per_ray
 
     denom = 1.0 - cos_max ** (n + 1.0)
     norm_factor = (n + 1.0) * (1.0 - cos_max) / denom if denom > 1e-12 else 1.0

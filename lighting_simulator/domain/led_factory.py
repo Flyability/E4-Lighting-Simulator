@@ -1,5 +1,6 @@
 import numpy as np
 
+from .beam_profile import get_profile
 from .geometry import default_row_direction, rotate_vector
 from .led import LED, normalize_role, normalize_roles
 from .placement import LEDPlacement
@@ -177,6 +178,7 @@ def _create_dynamic_group_leds(config, viewing_angle, default_lumens, start_inde
     viewing_angles = config.get('led_viewing_angles') or []
     row_directions = config.get('led_row_directions') or []
     beam_tilts = config.get('led_beam_tilts') or []
+    profiles = config.get('led_profiles') or []
     led_states = config.get('led_states') or []
     n_leds = int(config.get('num_leds', 0))
     led_roles = normalize_roles(config.get('led_roles'), n_leds)
@@ -218,6 +220,7 @@ def _create_dynamic_group_leds(config, viewing_angle, default_lumens, start_inde
             lumens=_resolve_lumens(config, index, default_lumens),
             enabled=led_states[index] if index < len(led_states) else True,
             role=led_roles[index],
+            beam_profile=get_profile(profiles[index]) if index < len(profiles) else None,
         )
         leds.append(_placement(
             led,

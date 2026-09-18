@@ -37,6 +37,7 @@ import numpy as np
 from lighting_simulator.domain.geometry import (
     default_row_direction, euler_xyz_matrix, normalize, rodrigues_rotation, rotate_vector, rotation_matrix_z,
 )
+from lighting_simulator.domain.beam_profile import get_profile
 from lighting_simulator.domain.led import LED, normalize_role
 from lighting_simulator.domain.placement import LEDPlacement
 
@@ -58,6 +59,8 @@ class LedSpec:
     size: float = 1.0
     on: bool = True
     role: str = 'both'
+    profile: str | None = None
+    """Measured beam profile name (see ``domain.beam_profile``); None = cosⁿ model from ``beam_angle``."""
 
     def __post_init__(self):
         self.position = _v3(self.position)
@@ -65,6 +68,7 @@ class LedSpec:
         self.row_dir = tuple(float(x) for x in normalize(self.row_dir)) if self.row_dir is not None else None
         self.beam_angle, self.tilt, self.size = float(self.beam_angle), float(self.tilt), float(self.size)
         self.on, self.role = bool(self.on), normalize_role(self.role)
+        self.profile = self.profile or None
 
     def resolved_row_dir(self):
         return np.asarray(self.row_dir if self.row_dir is not None else default_row_direction(self.direction), float)
@@ -263,7 +267,8 @@ def _mirror_leds(placements, start_index):
         led = LED(position=XZ_MIRROR @ np.asarray(p.led.position, float),
                   direction=XZ_MIRROR @ np.asarray(p.led.direction, float),
                   lumens=p.led.lumens, color=p.led.color, width=p.led.width,
-                  viewing_angle=p.led.viewing_angle, enabled=p.led.enabled, role=p.led.role)
+                  viewing_angle=p.led.viewing_angle, enabled=p.led.enabled, role=p.led.role,
+                  beam_profile=p.led.beam_profile)
         out.append(LEDPlacement(led=led, index=start_index + len(out),
                                 row_direction=XZ_MIRROR @ np.asarray(p.row_direction, float),
                                 square_normal=XZ_MIRROR @ np.asarray(p.square_normal, float),
@@ -277,7 +282,8 @@ def build_panel_leds(panel: Panel, lumens, owner=None, start_index=0):
     out = []
     for l, p, n, r, b in zip(panel.leds, pos, nrm, row, beam):
         led = LED(position=np.asarray(p, float), direction=np.asarray(b, float), lumens=float(lumens),
-                  color=(1.0, 0.0, 1.0), width=l.size, viewing_angle=l.beam_angle, enabled=l.on, role=l.role)
+                  color=(1.0, 0.0, 1.0), width=l.size, viewing_angle=l.beam_angle, enabled=l.on, role=l.role,
+                  beam_profile=get_profile(l.profile))
         out.append(LEDPlacement(led=led, index=start_index + len(out), row_direction=np.asarray(r, float),
                                 square_normal=np.asarray(n, float), owner=owner, is_custom=True,
                                 is_dynamic_group=True))
@@ -311,6 +317,7 @@ def panel_to_v1_group(panel: Panel, name=None):
         'led_sizes': [l.size for l in panel.leds],
         'led_viewing_angles': [l.beam_angle for l in panel.leds],
         'led_beam_tilts': [l.tilt for l in panel.leds],
+        'led_profiles': [l.profile for l in panel.leds],
         'led_states': [l.on for l in panel.leds],
         'led_roles': [l.role for l in panel.leds],
         'led_rows': [list(r) for r in panel.rows] if panel.rows else [list(range(n))],
@@ -377,6 +384,7 @@ def _v1_group_to_panel(g, index, mirror, global_R, global_offset):
     states = list(g.get('led_states') or [])
     roles = list(g.get('led_roles') or [])
     sizes, angles, tilts = g.get('led_sizes') or [], g.get('led_viewing_angles') or [], g.get('led_beam_tilts') or []
+    profiles = g.get('led_profiles') or []
     leds = []
     for i in range(min(n, len(positions))):
         d = np.asarray(directions[i] if i < len(directions) else (1.0, 0.0, 0.0), float)
@@ -389,7 +397,8 @@ def _v1_group_to_panel(g, index, mirror, global_R, global_offset):
                             tilt=tilts[i] if i < len(tilts) else 0.0,
                             size=sizes[i] if i < len(sizes) else 0.5,
                             on=states[i] if i < len(states) else True,
-                            role=roles[i] if i < len(roles) else 'both'))
+                            role=roles[i] if i < len(roles) else 'both',
+                            profile=profiles[i] if i < len(profiles) else None))
     src = {}
     if g.get('template_name'):
         src['template'] = g['template_name']

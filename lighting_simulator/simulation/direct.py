@@ -39,11 +39,15 @@ def direct_illuminance(points_cm, inward_normals, leds, emission, lumens=None, a
         pos = np.asarray(led.position, dtype=float)
         axis = np.asarray(led.direction, dtype=float)
         axis /= max(np.linalg.norm(axis), 1e-12)
-        n = effective_lambertian_exponent(led, emission.ray_uniformity)
-        cos_max = np.cos(np.radians(float(led.viewing_angle) / 2.0))
-        denom = 1.0 - cos_max ** (n + 1.0)
-        if denom <= 1e-12:
-            continue
+        profile = getattr(led, 'beam_profile', None)
+        if profile is not None:
+            n, cos_max, denom = 0.0, profile.cos_max, 1.0
+        else:
+            n = effective_lambertian_exponent(led, emission.ray_uniformity)
+            cos_max = np.cos(np.radians(float(led.viewing_angle) / 2.0))
+            denom = 1.0 - cos_max ** (n + 1.0)
+            if denom <= 1e-12:
+                continue
         vec = pts - pos
         d_cm = np.linalg.norm(vec, axis=1)
         ok = d_cm > 1e-6
@@ -65,7 +69,10 @@ def direct_illuminance(points_cm, inward_normals, leds, emission, lumens=None, a
             lit[idx[batch_ray_mesh_intersection(origins, dirs[idx], accel, verbose=False)]] = False
         if not np.any(lit):
             continue
-        intensity = flux * (n + 1.0) * np.power(cos_theta[lit], n) / (2.0 * np.pi * denom)  # cd
+        if profile is not None:
+            intensity = profile.intensity_cd(np.degrees(np.arccos(np.clip(cos_theta[lit], -1.0, 1.0))), flux)
+        else:
+            intensity = flux * (n + 1.0) * np.power(cos_theta[lit], n) / (2.0 * np.pi * denom)  # cd
         out[lit] += intensity * cos_phi[lit] / (d_cm[lit] / 100.0) ** 2
     return out
 

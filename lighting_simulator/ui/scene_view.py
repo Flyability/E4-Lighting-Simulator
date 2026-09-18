@@ -445,7 +445,8 @@ def build(ctx):
             specs.append(LedSpec(position=(led['x'], led['y'], led['z']),
                                  direction=R @ np.array([1.0, 0.0, 0.0]), row_dir=R @ np.array([0.0, 1.0, 0.0]),
                                  beam_angle=led['view_angle'], tilt=led.get('tilt', 0.0), size=led['size'],
-                                 on=led.get('on', True), role=led.get('role', 'both')))
+                                 on=led.get('on', True), role=led.get('role', 'both'),
+                                 profile=led.get('profile')))
         return specs
 
     def _designer_panel():
@@ -672,7 +673,7 @@ def build(ctx):
                 rx, ry, rz = _designer_euler_from_axes(l.direction, l.resolved_row_dir())
                 state_d['leds'].append({'x': l.position[0], 'y': l.position[1], 'z': l.position[2],
                                         'rx': rx, 'ry': ry, 'rz': rz, 'size': l.size, 'view_angle': l.beam_angle,
-                                        'tilt': l.tilt, 'on': l.on, 'role': l.role})
+                                        'tilt': l.tilt, 'on': l.on, 'role': l.role, 'profile': l.profile})
         if state_d['leds']:
             state_d['selected_led'] = 0
         designer_state[0] = state_d

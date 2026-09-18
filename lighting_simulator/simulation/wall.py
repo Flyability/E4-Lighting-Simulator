@@ -168,6 +168,10 @@ def compute_wall_intensity(leds, settings: WallSettings, emission: EmissionSetti
 
     if use_gpu is None:
         use_gpu = gpu_backend.gpu_available()
+    if use_gpu and any(getattr(l, 'beam_profile', None) is not None for l, _ in active):
+        if verbose:
+            print("  measured beam profiles present → CPU tracer (GPU kernels only model cosⁿ beams)")
+        use_gpu = False
 
     if use_gpu:
         leds_data, per_led_lumens = _gpu_led_payload(active, emission.default_lumens)

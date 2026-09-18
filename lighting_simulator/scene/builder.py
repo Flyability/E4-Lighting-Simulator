@@ -93,6 +93,7 @@ def group_config_to_factory(group_cfg, owner=None, row_enabled=None):
             'led_rotations': directions,
             'led_viewing_angles': list(group_cfg.get('led_viewing_angles', [])),
             'led_beam_tilts': list(group_cfg.get('led_beam_tilts') or []),
+            'led_profiles': list(group_cfg.get('led_profiles') or []),
             'led_sizes': list(group_cfg.get('led_sizes', [])),
             'led_lumens': list(group_cfg.get('led_lumens', [])),
         })
@@ -142,9 +143,13 @@ def apply_global_transform(leds, rotation_z_deg=0.0, offset_cm=(0.0, 0.0, 0.0)):
 
 
 def apply_diffuser(leds, angle_deg, transmission):
-    """Widen every LED's beam to at least ``angle_deg`` and scale flux by ``transmission``."""
+    """Widen every LED's beam to at least ``angle_deg`` and scale flux by ``transmission``.
+
+    A diffuser redefines the beam, so any measured ``beam_profile`` is dropped in favour of the cosⁿ cone.
+    """
     for led in leds:
         led.viewing_angle = max(led.viewing_angle, float(angle_deg))
+        led.beam_profile = None
         if led.lumens is not None:
             led.lumens = led.lumens * float(transmission)
 

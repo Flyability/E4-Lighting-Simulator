@@ -12,6 +12,7 @@ import copy
 import os
 from types import SimpleNamespace
 
+from lighting_simulator.domain.beam_profile import LAMBERTIAN, get_profile, profile_names
 from lighting_simulator.domain.led import ROLES
 from lighting_simulator.scene.layout import Layout, Panel, load_layout, save_json
 
@@ -196,6 +197,30 @@ def build(ctx):
             for l in panel.leds:
                 l.beam_angle = v
             state.notify()
+
+        names = profile_names()
+        used = {l.profile or LAMBERTIAN for l in panel.leds}
+        cur = next(iter(used)) if len(used) == 1 else LAMBERTIAN
+        prof = _add(server.gui.add_dropdown(
+            "Beam profile, all LEDs", options=names, initial_value=cur if cur in names else LAMBERTIAN,
+            hint="Measured intensity-vs-angle curve of the emitter (datasheet polar plot) instead of the cosⁿ model. "
+                 "With a profile the beam angle above is ignored. Add your own as beam_profiles/<name>.json."
+                 + (f" Currently mixed: {', '.join(sorted(used))}." if len(used) > 1 else "")))
+
+        @prof.on_update
+        def _(_):
+            name = None if prof.value == LAMBERTIAN else prof.value
+            for l in panel.leds:
+                l.profile = name
+            state.notify()
+            populate_inspector(index)
+
+        p_obj = get_profile(cur)
+        if p_obj is not None:
+            _add(server.gui.add_html(
+                f"<div style='font-size:10px;color:#888;margin:-4px 0 4px;'>{p_obj.name}: 50 % at "
+                f"{p_obj.half_intensity_angle_deg():.0f}° full angle, emits to ±{p_obj.max_angle_deg:.0f}°. "
+                "Ray tracing falls back to the CPU for profiled LEDs; the analytic map is exact.</div>"))
 
     def _guide_controls(panel: Panel, index):
         guide = state.guides.get(index)
