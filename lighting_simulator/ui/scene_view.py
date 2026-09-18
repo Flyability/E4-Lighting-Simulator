@@ -23,6 +23,7 @@ from lighting_simulator.domain.led import ROLES, led_role
 from lighting_simulator.domain.led_factory import create_leds
 from lighting_simulator.domain.optics import effective_lambertian_exponent as _get_effective_n
 from lighting_simulator.raytracing.mesh import ray_mesh_intersection as _ray_mesh_intersection
+from lighting_simulator.simulation.settings import RoomSettings as _RoomSettings
 from lighting_simulator.ui.mesh_lighting import _build_stl_transform
 
 
@@ -48,22 +49,6 @@ def build(ctx):
     _refresh_uniformity = ctx._refresh_uniformity
     _refresh_vio_fov_label = ctx._refresh_vio_fov_label
     _select_panel_impl = ctx._select_panel_impl
-    abs0_off_x = ctx.abs0_off_x
-    abs0_off_y = ctx.abs0_off_y
-    abs0_off_z = ctx.abs0_off_z
-    abs1_off_x = ctx.abs1_off_x
-    abs1_off_y = ctx.abs1_off_y
-    abs1_off_z = ctx.abs1_off_z
-    abs2_off_x = ctx.abs2_off_x
-    abs2_off_y = ctx.abs2_off_y
-    abs2_off_z = ctx.abs2_off_z
-    abs2_rot_z = ctx.abs2_rot_z
-    abs3_off_x = ctx.abs3_off_x
-    abs3_off_y = ctx.abs3_off_y
-    abs3_off_z = ctx.abs3_off_z
-    abs3_rot_z = ctx.abs3_rot_z
-    absorber_handles = ctx.absorber_handles
-    absorbers_enable = ctx.absorbers_enable
     apply_view_mode = ctx.apply_view_mode
     flash_lumens = ctx.flash_lumens
     camera_fov_h = ctx.camera_fov_h
@@ -75,7 +60,6 @@ def build(ctx):
     capture_camera_fov_image = ctx.capture_camera_fov_image
     capture_fov_btn = ctx.capture_fov_btn
     cell_area_html = ctx.cell_area_html
-    circle_center_slider = ctx.circle_center_slider
     clear_csv_pattern = ctx.clear_csv_pattern
     create_custom_group = ctx.create_custom_group
     csv_clear_btn = ctx.csv_clear_btn
@@ -100,8 +84,6 @@ def build(ctx):
     global_pos_y_slider = ctx.global_pos_y_slider
     global_pos_z_slider = ctx.global_pos_z_slider
     global_rotation_z_slider = ctx.global_rotation_z_slider
-    group_buttons = ctx.group_buttons
-    group_colors_hex = ctx.group_colors_hex
     guide_handles = ctx.guide_handles
     import_csv_pattern = ctx.import_csv_pattern
     imported_csv_handles = ctx.imported_csv_handles
@@ -111,26 +93,11 @@ def build(ctx):
     intensity_handles = ctx.intensity_handles
     intensity_rays_slider = ctx.intensity_rays_slider
     intensity_threshold_slider = ctx.intensity_threshold_slider
-    led_buttons = ctx.led_buttons
     led_handles = ctx.led_handles
     led_lumens_slider = ctx.led_lumens_slider
-    led_states = ctx.led_states
     legend_html = ctx.legend_html
     loading_in_progress = ctx.loading_in_progress
-    offset_front_neg_x = ctx.offset_front_neg_x
-    offset_front_neg_y = ctx.offset_front_neg_y
-    offset_front_neg_z = ctx.offset_front_neg_z
-    offset_front_pos_x = ctx.offset_front_pos_x
-    offset_front_pos_y = ctx.offset_front_pos_y
-    offset_front_pos_z = ctx.offset_front_pos_z
-    offset_side_neg_x = ctx.offset_side_neg_x
-    offset_side_neg_y = ctx.offset_side_neg_y
-    offset_side_neg_z = ctx.offset_side_neg_z
-    offset_side_pos_x = ctx.offset_side_pos_x
-    offset_side_pos_y = ctx.offset_side_pos_y
-    offset_side_pos_z = ctx.offset_side_pos_z
     open_panel_designer_btn = ctx.open_panel_designer_btn
-    radius_slider = ctx.radius_slider
     ray_handles = ctx.ray_handles
     ray_length_slider = ctx.ray_length_slider
     read_cell_at_ray = ctx.read_cell_at_ray
@@ -142,19 +109,6 @@ def build(ctx):
     room_side_dist = ctx.room_side_dist
     room_top_bottom_dist = ctx.room_top_bottom_dist
     room_wall_handles = ctx.room_wall_handles
-    rot_front_neg = ctx.rot_front_neg
-    rot_front_pos = ctx.rot_front_pos
-    rot_side_neg = ctx.rot_side_neg
-    rot_side_pos = ctx.rot_side_pos
-    rot_y_front_neg = ctx.rot_y_front_neg
-    rot_y_front_pos = ctx.rot_y_front_pos
-    rot_y_side_neg = ctx.rot_y_side_neg
-    rot_y_side_pos = ctx.rot_y_side_pos
-    row1_chk = ctx.row1_chk
-    row2_chk = ctx.row2_chk
-    row3_chk = ctx.row3_chk
-    row4_chk = ctx.row4_chk
-    row_buttons = ctx.row_buttons
     run_benchmark = ctx.run_benchmark
     run_benchmark_button = ctx.run_benchmark_button
     save_custom_group_template = ctx.save_custom_group_template
@@ -185,7 +139,6 @@ def build(ctx):
     template_dropdown = ctx.template_dropdown
     tilt_fov_deg = ctx.tilt_fov_deg
     uniformity_percentile_slider = ctx.uniformity_percentile_slider
-    update_all_led_buttons = ctx.update_all_led_buttons
     update_intensity_button = ctx.update_intensity_button
     update_intensity_map = ctx.update_intensity_map
     update_room_button = ctx.update_room_button
@@ -196,7 +149,6 @@ def build(ctx):
     flash_current_input = ctx.flash_current_input
     led_voltage_input = ctx.led_voltage_input
     led_efficacy_input = ctx.led_efficacy_input
-    viewing_angle_slider = ctx.viewing_angle_slider
     vio_cam1_pitch = ctx.vio_cam1_pitch
     vio_cam1_yaw = ctx.vio_cam1_yaw
     vio_cam2_pitch = ctx.vio_cam2_pitch
@@ -829,15 +781,14 @@ def build(ctx):
                 pass
 
     def _clear_normal_dynamic_scene():
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, guide_handles
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles + guide_handles:
+        nonlocal led_handles, ray_handles, camera_fov_handles, vio_fov_handles, guide_handles
+        for handle in led_handles + ray_handles + camera_fov_handles + vio_fov_handles + guide_handles:
             try:
                 handle.remove()
             except (KeyError, AttributeError):
                 pass
         led_handles.clear()
         ray_handles.clear()
-        absorber_handles.clear()
         camera_fov_handles.clear()
         vio_fov_handles.clear()
         guide_handles.clear()
@@ -1182,76 +1133,6 @@ def build(ctx):
                         pass
                     select_panel(None)
 
-            elif kind == 'base_group':
-                names = ["Front+", "Front-", "Side+", "Side-"]
-                rot_z = [rot_front_pos, rot_front_neg, rot_side_pos, rot_side_neg]
-                rot_y = [rot_y_front_pos, rot_y_front_neg, rot_y_side_pos, rot_y_side_neg]
-                off_x = [offset_front_pos_x, offset_front_neg_x, offset_side_pos_x, offset_side_neg_x]
-                off_y = [offset_front_pos_y, offset_front_neg_y, offset_side_pos_y, offset_side_neg_y]
-                off_z = [offset_front_pos_z, offset_front_neg_z, offset_side_pos_z, offset_side_neg_z]
-                if key < 0 or key > 3:
-                    _inspector_add(server.gui.add_markdown("Unknown base group."))
-                    return
-                _inspector_add(server.gui.add_markdown(f"**Base group: {names[key]}**"))
-                _mirror_slider(f"Rotate {names[key]} Z (°)", rot_z[key], -180, 180, 1)
-                _mirror_slider(f"Rotate {names[key]} local Y (tilt °)", rot_y[key], -180, 180, 1)
-                ymin, ymax = ((-40, 40) if key == 2 else (-40, 50) if key == 3 else (-30, 30))
-                _mirror_slider("Offset X (cm)", off_x[key], -30, 30, 0.1)
-                _mirror_slider("Offset Y (cm)", off_y[key], ymin, ymax, 0.1)
-                _mirror_slider("Offset Z (cm)", off_z[key], -30, 30, 0.1)
-                _inspector_add(server.gui.add_html("<hr style='margin:6px 0;'><b>LED Controls:</b>"))
-                color_hex = group_colors_hex[key]
-                start = key * 12
-                any_on = any(led_states[start:start + 12])
-                all_btn = _inspector_add(server.gui.add_button("ALL", color=color_hex if any_on else "#444444"))
-
-                def _on_all(_):
-                    new_state = not all(led_states[start:start + 12])
-                    for i in range(start, start + 12):
-                        led_states[i] = new_state
-                    update_all_led_buttons()
-                    update_scene()
-                    update_ui_visibility()
-                    populate_inspector(selected_owner[0])
-
-                all_btn.on_click(_on_all)
-                for row_idx in range(4):
-                    r0 = start + row_idx * 3
-                    any_row = any(led_states[r0:r0 + 3])
-                    row_btn = _inspector_add(server.gui.add_button(
-                        f"Row {row_idx + 1}", color=color_hex if any_row else "#666666"
-                    ))
-
-                    def _make_row(s):
-                        def _on(_):
-                            new_state = not all(led_states[s:s + 3])
-                            for i in range(s, s + 3):
-                                led_states[i] = new_state
-                            update_all_led_buttons()
-                            update_scene()
-                            update_ui_visibility()
-                            populate_inspector(selected_owner[0])
-                        return _on
-
-                    row_btn.on_click(_make_row(r0))
-                for li in range(12):
-                    gi = start + li
-                    on = led_states[gi]
-                    led_btn = _inspector_add(server.gui.add_button(
-                        f"L{li + 1}", color=color_hex if on else "#444444"
-                    ))
-
-                    def _make_led(idx):
-                        def _on(_):
-                            led_states[idx] = not led_states[idx]
-                            update_all_led_buttons()
-                            update_scene()
-                            update_ui_visibility()
-                            populate_inspector(selected_owner[0])
-                        return _on
-
-                    led_btn.on_click(_make_led(gi))
-
             else:
                 _inspector_add(server.gui.add_markdown(f"Unknown selection: `{kind}`"))
 
@@ -1269,7 +1150,7 @@ def build(ctx):
     
     def update_scene():
         """Redraw the scene based on current slider values (without intensity map)."""
-        nonlocal led_handles, ray_handles, absorber_handles, camera_fov_handles, vio_fov_handles, guide_handles
+        nonlocal led_handles, ray_handles, camera_fov_handles, vio_fov_handles, guide_handles
         if designer_mode[0]:
             # Designer owns the 3D view; do not rebuild (would destroy the gizmo).
             return
@@ -1317,48 +1198,19 @@ def build(ctx):
             return tmin if tmin > 0 else (tmax if tmax > 0 else None)
 
         # Clear previous objects (safely ignore already-removed handles)
-        for handle in led_handles + ray_handles + absorber_handles + camera_fov_handles + vio_fov_handles + guide_handles:
+        for handle in led_handles + ray_handles + camera_fov_handles + vio_fov_handles + guide_handles:
             try:
                 handle.remove()
             except KeyError:
                 pass  # Handle already removed by server
         led_handles.clear()
         ray_handles.clear()
-        absorber_handles.clear()
         camera_fov_handles.clear()
         vio_fov_handles.clear()
         guide_handles.clear()
-        # Get current values (fixed angles: front=0°, side=90°)
-        front_angle = 0.0  # Fixed front angle
-        side_angle = 90.0  # Fixed side angle
-        viewing_angle = viewing_angle_slider.value
-        radius = radius_slider.value
+        viewing_angle = 120.0  # fallback beam angle for LEDs without their own
         wall_dist = wall_dist_slider.value
-        circle_center_x = circle_center_slider.value
         ray_length = ray_length_slider.value
-
-        # Create LEDs
-        # Read per-group rotation slider values
-        rotations = [
-            rot_front_pos.value,
-            rot_front_neg.value,
-            rot_side_pos.value,
-            rot_side_neg.value,
-        ]
-        
-        rotations_y = [
-            rot_y_front_pos.value,
-            rot_y_front_neg.value,
-            rot_y_side_pos.value,
-            rot_y_side_neg.value,
-        ]
-        
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
 
         # Build custom groups configs list
         custom_groups_configs = []
@@ -1371,7 +1223,6 @@ def build(ctx):
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
                 'led_roles': group.get('led_roles') or [],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
             # Add dynamic group info if present
             if group.get('is_dynamic', False):
@@ -1434,20 +1285,10 @@ def build(ctx):
         _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
 
         leds = create_leds(
-            front_angle,
-            side_angle,
             viewing_angle,
-            radius,
-            circle_center_x,
             default_lumens=float(led_lumens_slider.value),
-            group_rotations=rotations,
-            group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states,
-            group_offsets=offsets,
             custom_groups_configs=custom_groups_configs,
             individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
         )
         apply_view_mode(leds)
         
@@ -1552,137 +1393,7 @@ def build(ctx):
             )
             guide_handles.append(axis_h)
 
-        # Build absorbers
-        absorbers = []
-        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
-        for i, angle_deg in enumerate(angles_deg):
-            if i not in (0, 1):
-                continue
-            angle_rad = np.radians(angle_deg)
-            gx = circle_center_x + radius * np.cos(angle_rad)
-            gy = radius * np.sin(angle_rad)
-            y_offset = 6.5 if i == 0 else -6.5
-            gy = gy + y_offset
-            
-            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
-            if np.linalg.norm(radial) == 0:
-                radial_unit = np.array((1.0, 0.0, 0.0))
-            else:
-                radial_unit = radial / np.linalg.norm(radial)
-            
-            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
-            y_base_offset = -4.2 if i == 0 else 4.2
-            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
-            base_abs_cz = 0.0
-            
-            if not absorbers_enable.value:
-                continue
-            if i == 0:
-                abs_cx = base_abs_cx + abs0_off_x.value
-                abs_cy = base_abs_cy + abs0_off_y.value
-                abs_cz = base_abs_cz + abs0_off_z.value
-            else:
-                abs_cx = base_abs_cx + abs1_off_x.value
-                abs_cy = base_abs_cy + abs1_off_y.value
-                abs_cz = base_abs_cz + abs1_off_z.value
-            
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': None,
-            })
-        
-        # Add abs2 and abs3 at origin with offsets
-        if absorbers_enable.value:
-            # Abs2 with rotation
-            abs_cx = 0.0 + abs2_off_x.value
-            abs_cy = 0.0 + abs2_off_y.value
-            abs_cz = 0.0 + abs2_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs2_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-            
-            # Abs3 with rotation
-            abs_cx = 0.0 + abs3_off_x.value
-            abs_cy = 0.0 + abs3_off_y.value
-            abs_cz = 0.0 + abs3_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs3_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-
-        # ── Apply global Z rotation to absorbers ──
-        if abs(global_rot_z_deg) > 0.01:
-            for a in absorbers:
-                cx, cy, cz = a['center']
-                new_cx = cg * cx - sg * cy
-                new_cy = sg * cx + cg * cy
-                a['center'] = (new_cx, new_cy, cz)
-                # Compose global rotation with existing quaternion rotation
-                if a.get('rotation') is not None:
-                    qw0, qx0, qy0, qz0 = a['rotation']
-                    # Quaternion for Rg around Z: (cos(a/2), 0, 0, sin(a/2))
-                    half = g_rad / 2.0
-                    gqw, gqx, gqy, gqz = np.cos(half), 0.0, 0.0, np.sin(half)
-                    # q_new = q_global * q_existing
-                    nw = gqw*qw0 - gqx*qx0 - gqy*qy0 - gqz*qz0
-                    nx = gqw*qx0 + gqx*qw0 + gqy*qz0 - gqz*qy0
-                    ny = gqw*qy0 - gqx*qz0 + gqy*qw0 + gqz*qx0
-                    nz = gqw*qz0 + gqx*qy0 - gqy*qx0 + gqz*qw0
-                    a['rotation'] = (nw, nx, ny, nz)
-                else:
-                    half = g_rad / 2.0
-                    a['rotation'] = (np.cos(half), 0.0, 0.0, np.sin(half))
-
-        # Draw absorber boxes (red) in the scene
-        for idx, a in enumerate(absorbers):
-            cx, cy, cz = a['center']
-            hx, hy, hz = a['half_sizes']
-            rot = a.get('rotation', None)
-            # Viser add_box dimensions are in meters (x,y,z)
-            dims = ((hx * 2) / 100.0, (hy * 2) / 100.0, (hz * 2) / 100.0)
-            pos_m = (cx / 100.0, cy / 100.0, cz / 100.0)
-            if rot is not None:
-                handle = server.scene.add_box(
-                    f"/absorbers/abs_{idx}",
-                    dimensions=dims,
-                    color=(1.0, 0.0, 0.0),
-                    position=pos_m,
-                    wxyz=rot,
-                )
-            else:
-                handle = server.scene.add_box(
-                    f"/absorbers/abs_{idx}",
-                    dimensions=dims,
-                    color=(1.0, 0.0, 0.0),
-                    position=pos_m,
-                )
-            absorber_handles.append(handle)
+        absorbers = []  # box occluders are gone; the STL mesh is the only occluder
 
         # Draw LEDs as squares with center source (if enabled)
         if show_led_markers.value:
@@ -2125,7 +1836,7 @@ def build(ctx):
             _sd = room_side_dist.value
             _td = room_top_bottom_dist.value
             # Same extent as draw_room_walls: 2.5x depth behind the front wall
-            _x_back_edge = _fd - (_fd - circle_center_slider.value) * 2.5
+            _x_back_edge = _fd - (_fd - _RoomSettings.led_x_center) * 2.5
             if show_back_wall.value:
                 _x_back_edge = max(_x_back_edge, -room_back_dist.value)
             overlay_walls = [
@@ -2337,32 +2048,9 @@ def build(ctx):
     update_cell_area_info()
 
     # Register callbacks
-    viewing_angle_slider.on_update(lambda _: update_scene())
     diffuser_enable_chk.on_update(lambda _: update_scene())
     diffuser_angle_slider.on_update(lambda _: update_scene())
-    rot_front_pos.on_update(lambda _: update_scene())
-    rot_front_neg.on_update(lambda _: update_scene())
-    rot_side_pos.on_update(lambda _: update_scene())
-    rot_side_neg.on_update(lambda _: update_scene())
-    rot_y_front_pos.on_update(lambda _: update_scene())
-    rot_y_front_neg.on_update(lambda _: update_scene())
-    rot_y_side_pos.on_update(lambda _: update_scene())
-    rot_y_side_neg.on_update(lambda _: update_scene())
     # Group position offset callbacks
-    offset_front_pos_x.on_update(lambda _: update_scene())
-    offset_front_pos_y.on_update(lambda _: update_scene())
-    offset_front_pos_z.on_update(lambda _: update_scene())
-    offset_front_neg_x.on_update(lambda _: update_scene())
-    offset_front_neg_y.on_update(lambda _: update_scene())
-    offset_front_neg_z.on_update(lambda _: update_scene())
-    offset_side_pos_x.on_update(lambda _: update_scene())
-    offset_side_pos_y.on_update(lambda _: update_scene())
-    offset_side_pos_z.on_update(lambda _: update_scene())
-    offset_side_neg_x.on_update(lambda _: update_scene())
-    offset_side_neg_y.on_update(lambda _: update_scene())
-    offset_side_neg_z.on_update(lambda _: update_scene())
-    radius_slider.on_update(lambda _: update_scene())
-    circle_center_slider.on_update(lambda _: update_scene())
     def _on_global_rotation_change(_):
         """Handle global rotation slider: update LEDs immediately, debounce mesh update."""
         update_scene()
@@ -2388,11 +2076,6 @@ def build(ctx):
     show_rays_output.on_update(lambda _: update_scene())
     show_led_markers.on_update(lambda _: update_scene())
     show_intensity_map.on_update(lambda _: None if _mode_toggle_syncing[0] else update_intensity_map())
-    row1_chk.on_update(lambda _: update_scene())
-    row2_chk.on_update(lambda _: update_scene())
-    row3_chk.on_update(lambda _: update_scene())
-    row4_chk.on_update(lambda _: update_scene())
-    absorbers_enable.on_update(lambda _: (update_scene(), update_ui_visibility()))
     show_camera_fov.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_fov_h.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     camera_fov_v.on_update(lambda _: (update_scene(), _refresh_uniformity()))
@@ -2412,20 +2095,6 @@ def build(ctx):
     vio_cam2_yaw.on_update(lambda _: (update_scene(), _refresh_uniformity()))
     vio_long_fov.on_update(lambda _: (_refresh_vio_fov_label(), update_scene(), _refresh_uniformity()))
     vio_landscape.on_update(lambda _: (_refresh_vio_fov_label(), update_scene(), _refresh_uniformity()))
-    abs0_off_x.on_update(lambda _: update_scene())
-    abs0_off_y.on_update(lambda _: update_scene())
-    abs0_off_z.on_update(lambda _: update_scene())
-    abs1_off_x.on_update(lambda _: update_scene())
-    abs1_off_y.on_update(lambda _: update_scene())
-    abs1_off_z.on_update(lambda _: update_scene())
-    abs2_off_x.on_update(lambda _: update_scene())
-    abs2_off_y.on_update(lambda _: update_scene())
-    abs2_off_z.on_update(lambda _: update_scene())
-    abs2_rot_z.on_update(lambda _: update_scene())
-    abs3_off_x.on_update(lambda _: update_scene())
-    abs3_off_y.on_update(lambda _: update_scene())
-    abs3_off_z.on_update(lambda _: update_scene())
-    abs3_rot_z.on_update(lambda _: update_scene())
     intensity_rays_slider.on_update(lambda _: None)  # No auto-update - manual button only
     ray_uniformity_slider.on_update(lambda _: None)  # No auto-update for expensive params
     intensity_threshold_slider.on_update(lambda _: _refresh_uniformity())
@@ -2556,50 +2225,6 @@ def build(ctx):
     flash_current_input.on_update(on_view_mode_change)
     led_voltage_input.on_update(on_view_mode_change)
     led_efficacy_input.on_update(on_view_mode_change)
-    
-    # Register LED control button callbacks
-    # Group buttons
-    for group_idx, btn in group_buttons.items():
-        def make_group_handler(g_idx):
-            def handler(_):
-                start_idx = g_idx * 12
-                end_idx = start_idx + 12
-                any_on = any(led_states[start_idx:end_idx])
-                new_state = not any_on
-                for i in range(start_idx, end_idx):
-                    led_states[i] = new_state
-                print(f"Group {g_idx} toggled: LEDs {start_idx}-{end_idx-1} set to {new_state}")
-                update_scene()
-                update_ui_visibility()
-            return handler
-        btn.on_click(make_group_handler(group_idx))
-    
-    # Row buttons
-    for (group_idx, row_idx), btn in row_buttons.items():
-        def make_row_handler(g_idx, r_idx):
-            def handler(_):
-                start_idx = g_idx * 12 + r_idx * 3
-                end_idx = start_idx + 3
-                any_on = any(led_states[start_idx:end_idx])
-                new_state = not any_on
-                for i in range(start_idx, end_idx):
-                    led_states[i] = new_state
-                print(f"Group {g_idx} Row {r_idx} toggled: LEDs {start_idx}-{end_idx-1} set to {new_state}")
-                update_scene()
-                update_ui_visibility()
-            return handler
-        btn.on_click(make_row_handler(group_idx, row_idx))
-    
-    # Individual LED buttons
-    for led_idx, btn in led_buttons.items():
-        def make_led_handler(l_idx):
-            def handler(_):
-                led_states[l_idx] = not led_states[l_idx]
-                print(f"LED {l_idx} toggled to {led_states[l_idx]}")
-                update_scene()
-                update_ui_visibility()
-            return handler
-        btn.on_click(make_led_handler(led_idx))
     
     # Button for manual intensity map update
     update_intensity_button.on_click(lambda _: update_intensity_map())

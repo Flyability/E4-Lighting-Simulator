@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import time as _time
 import numpy as np
 import trimesh
-from lighting_simulator.scene.absorbers import build_elios_absorbers, rotate_absorbers_z
 from lighting_simulator.scene.stl import global_z_rotation_4x4, stl_mesh_data as stl_mesh_data_payload
+from lighting_simulator.simulation.settings import RoomSettings as _RoomSettings
 
 
 def build(ctx):
@@ -16,22 +16,6 @@ def build(ctx):
     _build_stl_transform = ctx._build_stl_transform
     _last_room_cache = ctx._last_room_cache
     _room_metrics_html = ctx._room_metrics_html
-    abs0_off_x = ctx.abs0_off_x
-    abs0_off_y = ctx.abs0_off_y
-    abs0_off_z = ctx.abs0_off_z
-    abs1_off_x = ctx.abs1_off_x
-    abs1_off_y = ctx.abs1_off_y
-    abs1_off_z = ctx.abs1_off_z
-    abs2_off_x = ctx.abs2_off_x
-    abs2_off_y = ctx.abs2_off_y
-    abs2_off_z = ctx.abs2_off_z
-    abs2_rot_z = ctx.abs2_rot_z
-    abs3_off_x = ctx.abs3_off_x
-    abs3_off_y = ctx.abs3_off_y
-    abs3_off_z = ctx.abs3_off_z
-    abs3_rot_z = ctx.abs3_rot_z
-    absorbers_enable = ctx.absorbers_enable
-    circle_center_slider = ctx.circle_center_slider
     compute_room_intensity = ctx.compute_room_intensity
     current_leds = ctx.current_leds
     global_rotation_z_slider = ctx.global_rotation_z_slider
@@ -39,7 +23,6 @@ def build(ctx):
     intensity_to_color = ctx.intensity_to_color
     legend_html = ctx.legend_html
     legend_max_input = ctx.legend_max_input
-    radius_slider = ctx.radius_slider
     room_back_dist = ctx.room_back_dist
     room_front_dist = ctx.room_front_dist
     room_grid_size = ctx.room_grid_size
@@ -81,7 +64,7 @@ def build(ctx):
         top_bottom_dist = room_top_bottom_dist.value
         
         # Get LED position range (LEDs are at negative X)
-        led_x_min = circle_center_slider.value  # Typically -35 cm
+        led_x_min = _RoomSettings.led_x_center  # nominal LED x centre (cm) behind the origin
         
         # Wall color (solid gray like front wall)
         wall_color = (0.5, 0.5, 0.5)
@@ -188,96 +171,8 @@ def build(ctx):
             print("Error: No LEDs available. Update scene first.")
             return
         
-        # Build absorbers (still needed for room mode)
-        absorbers = []
-        
-        # Get current geometry values for absorber calculation
-        front_angle = 0.0
-        radius = radius_slider.value
-        circle_center_x = circle_center_slider.value
-        
-        angles_deg = [front_angle, -front_angle, 90.0, -90.0]
-        for i, angle_deg in enumerate(angles_deg):
-            if i not in (0, 1):
-                continue
-            angle_rad = np.radians(angle_deg)
-            gx = circle_center_x + radius * np.cos(angle_rad)
-            gy = radius * np.sin(angle_rad)
-            y_offset = 6.5 if i == 0 else -6.5
-            gy = gy + y_offset
-            
-            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
-            if np.linalg.norm(radial) == 0:
-                radial_unit = np.array((1.0, 0.0, 0.0))
-            else:
-                radial_unit = radial / np.linalg.norm(radial)
-            
-            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
-            y_base_offset = -4.2 if i == 0 else 4.2
-            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
-            base_abs_cz = 0.0
-            
-            if not absorbers_enable.value:
-                continue
-            if i == 0:
-                abs_cx = base_abs_cx + abs0_off_x.value
-                abs_cy = base_abs_cy + abs0_off_y.value
-                abs_cz = base_abs_cz + abs0_off_z.value
-            else:
-                abs_cx = base_abs_cx + abs1_off_x.value
-                abs_cy = base_abs_cy + abs1_off_y.value
-                abs_cz = base_abs_cz + abs1_off_z.value
-            
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': None,
-            })
-        
-        # Add abs2 and abs3 at origin with offsets
-        if absorbers_enable.value:
-            # Abs2 with rotation
-            abs_cx = 0.0 + abs2_off_x.value
-            abs_cy = 0.0 + abs2_off_y.value
-            abs_cz = 0.0 + abs2_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs2_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-            
-            # Abs3 with rotation
-            abs_cx = 0.0 + abs3_off_x.value
-            abs_cy = 0.0 + abs3_off_y.value
-            abs_cz = 0.0 + abs3_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs3_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-        
+        absorbers = []  # box occluders are gone; the STL mesh is the only occluder
+
         # Compute room intensity
         rays_per_pixel = int(intensity_rays_slider.value)
         
@@ -302,23 +197,6 @@ def build(ctx):
             }
             print(f"STL mesh enabled as light absorber ({len(mesh_ref.faces)} triangles)")
         
-        # ── Apply global Z rotation to absorbers (room mode) ──
-        _g_rot_room_deg = global_rotation_z_slider.value
-        if abs(_g_rot_room_deg) > 0.01:
-            _gr2 = np.radians(_g_rot_room_deg)
-            _cg2, _sg2 = np.cos(_gr2), np.sin(_gr2)
-            for a in absorbers:
-                cx, cy, cz = a['center']
-                a['center'] = (_cg2 * cx - _sg2 * cy, _sg2 * cx + _cg2 * cy, cz)
-                if a.get('rotation') is not None:
-                    qw0, qx0, qy0, qz0 = a['rotation']
-                    _hf = _gr2 / 2.0
-                    gqw, gqz = np.cos(_hf), np.sin(_hf)
-                    a['rotation'] = (gqw*qw0 - gqz*qz0, gqw*qx0 - gqz*qy0, gqw*qy0 + gqz*qx0, gqw*qz0 + gqz*qw0)
-                else:
-                    _hf = _gr2 / 2.0
-                    a['rotation'] = (np.cos(_hf), 0.0, 0.0, np.sin(_hf))
-
         grids, wall_specs = compute_room_intensity(
             leds, front_dist, side_dist, top_bottom_dist, rays_per_pixel, grid_size, 
             back_dist=room_back_dist.value if show_back_wall.value else None,

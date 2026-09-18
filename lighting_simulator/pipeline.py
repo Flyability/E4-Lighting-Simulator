@@ -59,7 +59,7 @@ def simulate_wall(cfg, settings: WallSettings, emission: EmissionSettings | None
     emission = emission or EmissionSettings()
     scene = build_scene_from_config(cfg, default_lumens=emission.default_lumens,
                                     stl_mesh=stl_mesh, diffuser=diffuser)
-    grid = compute_wall_intensity(scene.leds, settings, emission, absorbers=scene.absorbers,
+    grid = compute_wall_intensity(scene.leds, settings, emission,
                                   stl_mesh_data=scene.stl_mesh_data, use_gpu=use_gpu, verbose=verbose,
                                   parallel=parallel)
     grid = np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
@@ -73,7 +73,7 @@ def simulate_room(cfg, settings: RoomSettings, emission: EmissionSettings | None
     emission = emission or EmissionSettings()
     scene = build_scene_from_config(cfg, default_lumens=emission.default_lumens,
                                     stl_mesh=stl_mesh, diffuser=diffuser)
-    grids, wall_specs = compute_room_intensity(scene.leds, settings, emission, absorbers=scene.absorbers,
+    grids, wall_specs = compute_room_intensity(scene.leds, settings, emission,
                                                stl_mesh_data=scene.stl_mesh_data, use_gpu=use_gpu, verbose=verbose)
     all_lux = np.concatenate([np.asarray(g).reshape(-1) for g in grids.values()])
     return RoomResult(scene=scene, settings=settings, grids=grids, wall_specs=wall_specs,

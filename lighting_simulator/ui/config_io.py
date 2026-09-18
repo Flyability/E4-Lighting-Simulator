@@ -23,24 +23,6 @@ def build(ctx):
     _panel_dropdowns = ctx._panel_dropdowns
     _panel_slot_data = ctx._panel_slot_data
     _refresh_vio_fov_label = ctx._refresh_vio_fov_label
-    abs0_off_x = ctx.abs0_off_x
-    abs0_off_y = ctx.abs0_off_y
-    abs0_off_z = ctx.abs0_off_z
-    abs1_off_x = ctx.abs1_off_x
-    abs1_off_y = ctx.abs1_off_y
-    abs1_off_z = ctx.abs1_off_z
-    abs2_off_x = ctx.abs2_off_x
-    abs2_off_y = ctx.abs2_off_y
-    abs2_off_z = ctx.abs2_off_z
-    abs2_rot_z = ctx.abs2_rot_z
-    abs3_off_x = ctx.abs3_off_x
-    abs3_off_y = ctx.abs3_off_y
-    abs3_off_z = ctx.abs3_off_z
-    abs3_rot_z = ctx.abs3_rot_z
-    absorbers_enable = ctx.absorbers_enable
-    absorbers_folder = ctx.absorbers_folder
-    base_groups_active = ctx.base_groups_active
-    circle_center_slider = ctx.circle_center_slider
     clear_stl_model = ctx.clear_stl_model
     create_custom_group = ctx.create_custom_group
     create_individual_led = ctx.create_individual_led
@@ -50,39 +32,10 @@ def build(ctx):
     global_pos_y_slider = ctx.global_pos_y_slider
     global_pos_z_slider = ctx.global_pos_z_slider
     global_rotation_z_slider = ctx.global_rotation_z_slider
-    group_colors_hex = ctx.group_colors_hex
     individual_leds = ctx.individual_leds
-    led_buttons = ctx.led_buttons
-    led_config_folder = ctx.led_config_folder
-    led_states = ctx.led_states
     load_stl_file = ctx.load_stl_file
     loading_in_progress = ctx.loading_in_progress
-    offset_front_neg_x = ctx.offset_front_neg_x
-    offset_front_neg_y = ctx.offset_front_neg_y
-    offset_front_neg_z = ctx.offset_front_neg_z
-    offset_front_pos_x = ctx.offset_front_pos_x
-    offset_front_pos_y = ctx.offset_front_pos_y
-    offset_front_pos_z = ctx.offset_front_pos_z
-    offset_side_neg_x = ctx.offset_side_neg_x
-    offset_side_neg_y = ctx.offset_side_neg_y
-    offset_side_neg_z = ctx.offset_side_neg_z
-    offset_side_pos_x = ctx.offset_side_pos_x
-    offset_side_pos_y = ctx.offset_side_pos_y
-    offset_side_pos_z = ctx.offset_side_pos_z
     project_loaded = ctx.project_loaded
-    radius_slider = ctx.radius_slider
-    rot_front_neg = ctx.rot_front_neg
-    rot_front_pos = ctx.rot_front_pos
-    rot_side_neg = ctx.rot_side_neg
-    rot_side_pos = ctx.rot_side_pos
-    rot_y_front_neg = ctx.rot_y_front_neg
-    rot_y_front_pos = ctx.rot_y_front_pos
-    rot_y_side_neg = ctx.rot_y_side_neg
-    rot_y_side_pos = ctx.rot_y_side_pos
-    row1_chk = ctx.row1_chk
-    row2_chk = ctx.row2_chk
-    row3_chk = ctx.row3_chk
-    row4_chk = ctx.row4_chk
     select_panel = ctx.select_panel
     server = ctx.server
     show_led_markers = ctx.show_led_markers
@@ -103,7 +56,6 @@ def build(ctx):
     tab_panels = ctx.tab_panels
     template_folders = ctx.template_folders
     update_scene = ctx.update_scene
-    viewing_angle_slider = ctx.viewing_angle_slider
     vio_cam1_pitch = ctx.vio_cam1_pitch
     vio_cam1_yaw = ctx.vio_cam1_yaw
     vio_cam2_pitch = ctx.vio_cam2_pitch
@@ -114,16 +66,6 @@ def build(ctx):
     vio_pos_x = ctx.vio_pos_x
     vio_pos_y = ctx.vio_pos_y
     vio_pos_z = ctx.vio_pos_z
-
-    def _absorber_config():
-        """Absorber offsets from the GUI, in the saved-config schema."""
-        return {
-            "enabled": absorbers_enable.value,
-            "abs0": {"x": abs0_off_x.value, "y": abs0_off_y.value, "z": abs0_off_z.value},
-            "abs1": {"x": abs1_off_x.value, "y": abs1_off_y.value, "z": abs1_off_z.value},
-            "abs2": {"x": abs2_off_x.value, "y": abs2_off_y.value, "z": abs2_off_z.value, "rot_z": abs2_rot_z.value},
-            "abs3": {"x": abs3_off_x.value, "y": abs3_off_y.value, "z": abs3_off_z.value, "rot_z": abs3_rot_z.value},
-        }
 
     def get_current_config():
         """Retrieve current GUI values for saving."""
@@ -360,36 +302,12 @@ def build(ctx):
             })
         
         return {
-            "viewing_angle": viewing_angle_slider.value,
-            "radius": radius_slider.value,
-            "circle_center_x": circle_center_slider.value,
-            "group_rotations": [
-                rot_front_pos.value,
-                rot_front_neg.value,
-                rot_side_pos.value,
-                rot_side_neg.value,
-            ],
-            "group_rotations_y": [
-                rot_y_front_pos.value,
-                rot_y_front_neg.value,
-                rot_y_side_pos.value,
-                rot_y_side_neg.value,
-            ],
-            "group_offsets": [
-                [offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value],
-                [offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value],
-                [offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value],
-                [offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value],
-            ],
-            "row_enabled": [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            "led_states": led_states[:],
             "global_rotation_z": global_rotation_z_slider.value,
             "global_pos_x": global_pos_x_slider.value,
             "global_pos_y": global_pos_y_slider.value,
             "global_pos_z": global_pos_z_slider.value,
             "custom_groups": custom_groups_data,
             "individual_leds": individual_leds_data,
-            "absorbers": _absorber_config(),
             "stl_model": {
                 "file_path": stl_file_path.value,
                 "absorber_enable": stl_absorber_enable.value,
@@ -493,51 +411,12 @@ def build(ctx):
         clear_all_custom_groups()
         clear_all_template_folders()
         
-        viewing_angle_slider.value = cfg.get("viewing_angle", 120)
-        radius_slider.value = cfg.get("radius", 35)
-        circle_center_slider.value = cfg.get("circle_center_x", -35)
         global_rotation_z_slider.value = cfg.get("global_rotation_z", 0)
         global_pos_x_slider.value = cfg.get("global_pos_x", 0)
         global_pos_y_slider.value = cfg.get("global_pos_y", 0)
         global_pos_z_slider.value = cfg.get("global_pos_z", 0)
-        
-        rots = cfg.get("group_rotations", [0.7, -0.7, 18, -18])
-        rot_front_pos.value = rots[0]
-        rot_front_neg.value = rots[1]
-        rot_side_pos.value = rots[2]
-        rot_side_neg.value = rots[3]
-        
-        rots_y = cfg.get("group_rotations_y", [0, 0, 0, 0])
-        rot_y_front_pos.value = rots_y[0]
-        rot_y_front_neg.value = rots_y[1]
-        rot_y_side_pos.value = rots_y[2]
-        rot_y_side_neg.value = rots_y[3]
-        
-        offs = cfg.get("group_offsets", [[0.0, 1.6, 0.0], [0.0, -1.6, 0.0], [-1.3, -33.1, 0.0], [-1.3, 33.1, 0.0]])
-        offset_front_pos_x.value = offs[0][0]
-        offset_front_pos_y.value = offs[0][1]
-        offset_front_pos_z.value = offs[0][2]
-        offset_front_neg_x.value = offs[1][0]
-        offset_front_neg_y.value = offs[1][1]
-        offset_front_neg_z.value = offs[1][2]
-        offset_side_pos_x.value = offs[2][0]
-        offset_side_pos_y.value = offs[2][1]
-        offset_side_pos_z.value = offs[2][2]
-        offset_side_neg_x.value = offs[3][0]
-        offset_side_neg_y.value = offs[3][1]
-        offset_side_neg_z.value = offs[3][2]
-        
-        rows = cfg.get("row_enabled", [False, True, True, False])
-        row1_chk.value = rows[0]
-        row2_chk.value = rows[1]
-        row3_chk.value = rows[2]
-        row4_chk.value = rows[3]
-        
-        # Update global led_states and button appearances
-        # Default to all False (no base groups active) if not specified
-        nonlocal led_states
-        led_states[:] = cfg.get("led_states", [False] * 48)
-        update_all_led_buttons()
+        if any(cfg.get("led_states", [])):
+            print("⚠ This config lit the legacy Elios 3 base ring, which no longer exists: those LEDs are skipped.")
         
         # Recreate custom groups from config (skip intermediate scene updates)
         custom_groups_data = cfg.get("custom_groups", [])
@@ -1117,33 +996,6 @@ def build(ctx):
                 'groups': created_groups
             })
         
-        # Load absorbers configuration if present
-        absorbers_cfg = cfg.get("absorbers", {})
-        if absorbers_cfg:
-            absorbers_enable.value = absorbers_cfg.get('enabled', False)
-            
-            abs0_data = absorbers_cfg.get('abs0', {})
-            abs0_off_x.value = abs0_data.get('x', -1)
-            abs0_off_y.value = abs0_data.get('y', 2.5)
-            abs0_off_z.value = abs0_data.get('z', 0.0)
-            
-            abs1_data = absorbers_cfg.get('abs1', {})
-            abs1_off_x.value = abs1_data.get('x', -1)
-            abs1_off_y.value = abs1_data.get('y', -2.5)
-            abs1_off_z.value = abs1_data.get('z', 0.0)
-            
-            abs2_data = absorbers_cfg.get('abs2', {})
-            abs2_off_x.value = abs2_data.get('x', -1.8)
-            abs2_off_y.value = abs2_data.get('y', -10.5)
-            abs2_off_z.value = abs2_data.get('z', 0.0)
-            abs2_rot_z.value = abs2_data.get('rot_z', -14)
-            
-            abs3_data = absorbers_cfg.get('abs3', {})
-            abs3_off_x.value = abs3_data.get('x', -1.8)
-            abs3_off_y.value = abs3_data.get('y', 10.5)
-            abs3_off_z.value = abs3_data.get('z', 0.0)
-            abs3_rot_z.value = abs3_data.get('rot_z', 14)
-        
         # Load STL model configuration if present
         stl_cfg = cfg.get("stl_model")
         if stl_cfg:
@@ -1271,29 +1123,13 @@ def build(ctx):
         # Update UI visibility indicators
         update_ui_visibility()
 
-    def update_all_led_buttons():
-        """Sync button colors with current led_states."""
-        for i in range(48):
-            color = group_colors_hex[i // 12] if led_states[i] else "#444444"
-            led_buttons[i].color = color
-    
     def update_ui_visibility():
-        """Update UI folder visibility based on current project configuration."""
-        nonlocal led_config_folder, absorbers_folder, current_config_name
-        
-        # Check if any base LED groups are active
-        any_base_leds = any(led_states[:48])
-        base_groups_active[0] = any_base_leds
-        
-        # Show/hide LED Configuration folder based on base LED state
-        led_config_folder.visible = any_base_leds
-        
-        # Show/hide Absorbers folder only when elios3 is loaded
-        absorbers_folder.visible = current_config_name[0] == "elios3"
+        """Folder visibility hook (nothing project-dependent is left to toggle)."""
+        return None
 
     def new_project():
         """Initialize a new empty project with default geometry settings."""
-        nonlocal led_states, project_loaded, current_config_name, led_config_folder, absorbers_folder, loading_in_progress
+        nonlocal project_loaded, current_config_name, loading_in_progress
         loading_in_progress[0] = True  # Disable callbacks during reset
         
         print("Creating new empty project...")
@@ -1303,71 +1139,16 @@ def build(ctx):
         # Clear current config name
         current_config_name[0] = ""
         
-        # Disable all LEDs first (before clearing custom groups)
-        led_states[:] = [False] * 48
-        update_all_led_buttons()
-        
-        # Clear custom groups and individual LEDs (this calls update_scene() with led_states already disabled)
+        # Clear custom groups and individual LEDs
         clear_all_custom_groups()
         clear_all_individual_leds()
         clear_all_template_folders()
         
         # Reset to default geometry values
-        viewing_angle_slider.value = 120
-        radius_slider.value = 35
-        circle_center_slider.value = -35
         global_rotation_z_slider.value = 0
         global_pos_x_slider.value = 0
         global_pos_y_slider.value = 0
         global_pos_z_slider.value = 0
-        
-        # Reset all group rotations to 0
-        rot_front_pos.value = 0.0
-        rot_front_neg.value = 0.0
-        rot_side_pos.value = 0.0
-        rot_side_neg.value = 0.0
-        
-        rot_y_front_pos.value = 0.0
-        rot_y_front_neg.value = 0.0
-        rot_y_side_pos.value = 0.0
-        rot_y_side_neg.value = 0.0
-        
-        # Reset all group offsets to 0
-        offset_front_pos_x.value = 0.0
-        offset_front_pos_y.value = 0.0
-        offset_front_pos_z.value = 0.0
-        offset_front_neg_x.value = 0.0
-        offset_front_neg_y.value = 0.0
-        offset_front_neg_z.value = 0.0
-        offset_side_pos_x.value = 0.0
-        offset_side_pos_y.value = 0.0
-        offset_side_pos_z.value = 0.0
-        offset_side_neg_x.value = 0.0
-        offset_side_neg_y.value = 0.0
-        offset_side_neg_z.value = 0.0
-        
-        # Disable all rows
-        row1_chk.value = False
-        row2_chk.value = False
-        row3_chk.value = False
-        row4_chk.value = False
-        
-        # Reset absorbers
-        absorbers_enable.value = False
-        abs0_off_x.value = -1
-        abs0_off_y.value = 2.5
-        abs0_off_z.value = 0.0
-        abs1_off_x.value = -1
-        abs1_off_y.value = -2.5
-        abs1_off_z.value = 0.0
-        abs2_off_x.value = -1.8
-        abs2_off_y.value = -10.5
-        abs2_off_z.value = 0.0
-        abs2_rot_z.value = -14
-        abs3_off_x.value = -1.8
-        abs3_off_y.value = 10.5
-        abs3_off_z.value = 0.0
-        abs3_rot_z.value = 14
         
         # Clear STL model
         clear_stl_model()
@@ -1395,11 +1176,6 @@ def build(ctx):
         time.sleep(0.1)
         show_led_markers.value = True
         
-        # Explicitly hide both UI folders before updating visibility
-        led_config_folder.visible = False
-        absorbers_folder.visible = False
-        
-        # Update UI visibility indicators (should keep them hidden)
         update_ui_visibility()
         
         project_loaded[0] = True
@@ -1407,4 +1183,4 @@ def build(ctx):
     
 
 
-    return SimpleNamespace(_absorber_config=_absorber_config, apply_config=apply_config, get_current_config=get_current_config, new_project=new_project, update_all_led_buttons=update_all_led_buttons, update_ui_visibility=update_ui_visibility)
+    return SimpleNamespace(apply_config=apply_config, get_current_config=get_current_config, new_project=new_project, update_ui_visibility=update_ui_visibility)

@@ -1,11 +1,11 @@
-"""Build a simulation-ready scene (LEDs, absorbers, STL occluder) from a saved config.
+"""Build a simulation-ready scene (LEDs, STL occluder) from a saved config.
 
-The config dict is the JSON document produced by the UI's *Save Configuration*
-(see ``configs/*.json``). This module is UI-free so optimisation loops can
+The config dict is either a schema-v2 layout (``scene.layout``) or the pre-v2 JSON document
+produced by the UI's *Save Configuration*. This module is UI-free so optimisation loops can
 mutate a config, rebuild the scene and re-simulate without Viser.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 
 import numpy as np
@@ -15,21 +15,15 @@ from lighting_simulator.domain.guides import dynamic_group_world_geometry
 from lighting_simulator.domain.led_factory import create_leds
 from lighting_simulator.domain.mirroring import expand_mirror_configs
 
-from .absorbers import build_elios_absorbers, rotate_absorbers_z
 from .layout import build_leds_from_layout, is_v2, layout_from_dict
 from .stl import global_z_rotation_4x4, stl_mesh_data, stl_transform
 
-# Azimuths (deg) of the Elios 3 base LED groups on the ring.
-BASE_FRONT_ANGLE_DEG = 0.0
-BASE_SIDE_ANGLE_DEG = 90.0
-NUM_BASE_LEDS = 48
 DEFAULT_ROWS = [True] * 4
 
 
 @dataclass
 class Scene:
     leds: list
-    absorbers: list = field(default_factory=list)
     stl_mesh_data: dict | None = None
 
     @property
@@ -156,9 +150,8 @@ def apply_diffuser(leds, angle_deg, transmission):
 
 
 def build_leds_from_config(cfg, default_lumens=100.0, mirror_primary=None):
-    """LED placements from a saved config (no global transform / diffuser applied)."""
+    """LED placements from a v1 config (no global transform / diffuser applied)."""
     row_enabled = list(cfg.get('row_enabled', DEFAULT_ROWS))
-    led_states = list(cfg.get('led_states', [False] * NUM_BASE_LEDS))
 
     custom_groups_configs = []
     for idx, group_cfg in enumerate(cfg.get('custom_groups', [])):
@@ -171,17 +164,10 @@ def build_leds_from_config(cfg, default_lumens=100.0, mirror_primary=None):
     expand_mirror_configs(custom_groups_configs, individual_leds_configs, _decode_mirror_primary(cfg, mirror_primary))
 
     return create_leds(
-        BASE_FRONT_ANGLE_DEG, BASE_SIDE_ANGLE_DEG,
-        cfg.get('viewing_angle', 120), cfg.get('radius', 35), cfg.get('circle_center_x', -35),
+        cfg.get('viewing_angle', 120),
         default_lumens=float(default_lumens),
-        group_rotations=cfg.get('group_rotations', (0.0, 0.0, 0.0, 0.0)),
-        group_rotations_y=cfg.get('group_rotations_y', (0.0, 0.0, 0.0, 0.0)),
-        row_enabled=row_enabled,
-        led_states=led_states,
-        group_offsets=[tuple(o) for o in cfg.get('group_offsets', [(0.0, 0.0, 0.0)] * 4)],
         custom_groups_configs=custom_groups_configs,
         individual_leds_configs=individual_leds_configs,
-        create_base_groups=any(led_states[:NUM_BASE_LEDS]),
     )
 
 
@@ -211,11 +197,6 @@ def build_scene_from_config(cfg, default_lumens=100.0, stl_mesh=None,
     if diffuser is not None:
         apply_diffuser(leds, *diffuser)
 
-    absorbers = build_elios_absorbers(
-        cfg.get('absorbers'), cfg.get('radius', 35), cfg.get('circle_center_x', -35), BASE_FRONT_ANGLE_DEG,
-    )
-    rotate_absorbers_z(absorbers, rot_z)
-
     mesh_data = None
     stl_cfg = cfg.get('stl_model')
     if stl_mesh is not None and stl_cfg and stl_cfg.get('absorber_enable', True):
@@ -225,7 +206,7 @@ def build_scene_from_config(cfg, default_lumens=100.0, stl_mesh=None,
             transform = global_z_rotation_4x4(rot_z) @ transform
         mesh_data = stl_mesh_data(stl_mesh, transform)
 
-    return Scene(leds=leds, absorbers=absorbers, stl_mesh_data=mesh_data)
+    return Scene(leds=leds, stl_mesh_data=mesh_data)
 
 
 def build_scene_from_layout(layout, platform=None, stl_mesh=None, diffuser=None, lumens=None, platforms_dir="platforms"):

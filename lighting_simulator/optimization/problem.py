@@ -572,7 +572,7 @@ class Problem:
                 sel = np.ones(len(room.pts), bool) if keep_grid else room.scored
                 e = np.zeros(len(room.pts))
                 e[sel] = direct_illuminance(room.pts[sel], room.nrm[sel], t3_leds, self.emission, lumens=t3_lumens,
-                                            absorbers=scene.absorbers, accel=accel)
+                                            accel=accel)
                 rec = {}
                 for key in ('up', 'down'):
                     sc, u, _, cov, _ = _judge(e[room.masks[key]])
@@ -626,7 +626,7 @@ class Problem:
             return np.zeros((wall.grid_size, wall.grid_size))
         settings = wall if budget_frac >= 1.0 else replace(wall, rays_per_pixel=max(1, int(round(
             wall.rays_per_pixel * budget_frac))))
-        grid = compute_wall_intensity(leds, settings, self.emission, absorbers=scene.absorbers,
+        grid = compute_wall_intensity(leds, settings, self.emission,
                                       stl_mesh_data=scene.stl_mesh_data, use_gpu=self.use_gpu,
                                       verbose=False, parallel=False)
         return np.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
@@ -658,7 +658,7 @@ class Problem:
         if not leds:
             return {name: np.zeros(mask.shape) for name, mask in self._vio_masks.items()}
         grids, _ = compute_room_intensity(leds, self.vio.room_settings(rpp), self.emission,
-                                          absorbers=scene.absorbers, stl_mesh_data=scene.stl_mesh_data,
+                                          stl_mesh_data=scene.stl_mesh_data,
                                           use_gpu=self.use_gpu, verbose=False)
         return {n: np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for n, g in grids.items() if n != 'back'}
 

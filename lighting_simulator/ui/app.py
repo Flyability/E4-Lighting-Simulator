@@ -81,7 +81,6 @@ from lighting_simulator.ui import exports as _exports
 from lighting_simulator.ui import config_io as _config_io
 from lighting_simulator.ui import panels as _panels
 from lighting_simulator.analysis.uniformity import compute_uniformity_html as _compute_uniformity_html
-from lighting_simulator.scene.absorbers import build_elios_absorbers, rotate_absorbers_z
 from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
 from lighting_simulator.scene.step_import import STEP_MM_TO_CM, is_step_file, load_step_mesh
 from lighting_simulator.scene.stl import (
@@ -166,35 +165,7 @@ def main():
     if not os.path.exists(custom_groups_templates_dir):
         os.makedirs(custom_groups_templates_dir)
     print(f"  📁  Configs: {os.path.abspath(config_dir)}")
-    
-    # Save the Elios 3 configuration if it doesn't exist
-    elios3_config = {
-        "name": "Elios 3",
-        "description": "Standard configuration: front +/-, side +/-",
-        "viewing_angle": 120,
-        "radius": 35,
-        "circle_center_x": -35,
-        "group_rotations": [0.7, -0.7, 18, -18],
-        "group_rotations_y": [0, 0, 0, 0],
-        "group_offsets": [
-            [0.0, 1.6, 0.0],
-            [0.0, -1.6, 0.0],
-            [-1.3, -33.1, 0.0],
-            [-1.3, 33.1, 0.0]
-        ],
-        "row_enabled": [False, True, True, False],
-        "led_states": [True] * 48,
-        "custom_groups": []
-    }
-    elios3_path = os.path.join(config_dir, "elios3.json")
-    if not os.path.exists(elios3_path):
-        with open(elios3_path, "w") as f:
-            json.dump(elios3_config, f, indent=4)
 
-    # LED state array: 4 groups × 4 rows × 3 LEDs = 48 LEDs total
-    # Start with all LEDs disabled (user must load a project or create new)
-    led_states = [False] * 48
-    
     # Flag to track if a project is loaded
     project_loaded = [False]  # Use list for mutability in nested functions
     current_config_name = [""]  # Track which configuration is loaded
@@ -221,14 +192,6 @@ def main():
     _mirror_primary = [None]           # owner tuple ('slot', idx) / ('custom_group', id)
     _mirror_disabled_handles = []      # enable checkboxes we turned off (to restore)
     _mirror_counterpart_name = [None]  # display name of the disabled panel
-    
-    # Store button handles for LED control
-    led_buttons = {}
-    row_buttons = {}
-    group_buttons = {}
-    
-    # Group colors (defined early for use in config functions)
-    group_colors_hex = ["#FF3333", "#33FF33", "#3333FF", "#FFFF33"]
 
     # --- UI layout: docked/floating panels + main-panel tabs (viser 1.1+) ---
     server.gui.set_panel_label("Controls")
@@ -458,62 +421,10 @@ def main():
                 else:
                     print("Error: No custom groups or individual LEDs to save as template")
 
-    # Store reference to LED Configuration folder and visibility state
-    base_groups_active = [False]  # Track if base LED groups are active in current project
-    
-    with tab_panels:
-        led_config_folder = server.gui.add_folder("LED Configuration (Base Groups)")
-    led_config_folder.visible = False  # Hidden by default (empty project)
-    
-    with led_config_folder:
-        viewing_angle_slider = server.gui.add_slider(
-            "Viewing angle (°) [GWP9LR35: 120°]", min=10, max=130, step=5, initial_value=120
-        )
-        # Per-group rotation sliders Z axis (rotate beam and visual together)
-        rot_front_pos = server.gui.add_slider("Rotate front+ Z (°)", min=-180, max=180, step=1, initial_value=0.7)
-        rot_front_neg = server.gui.add_slider("Rotate front- Z (°)", min=-180, max=180, step=1, initial_value=-0.7)
-        rot_side_pos = server.gui.add_slider("Rotate side+ Z (°)", min=-180, max=180, step=1, initial_value=18)
-        rot_side_neg = server.gui.add_slider("Rotate side- Z (°)", min=-180, max=180, step=1, initial_value=-18)
-        
-        # Per-group rotation sliders Y axis (local tangent axis - tilts forward/backward)
-        rot_y_front_pos = server.gui.add_slider("Rotate front+ local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
-        rot_y_front_neg = server.gui.add_slider("Rotate front- local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
-        rot_y_side_pos = server.gui.add_slider("Rotate side+ local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
-        rot_y_side_neg = server.gui.add_slider("Rotate side- local Y (tilt °)", min=-180, max=180, step=1, initial_value=0)
-        
-        # Per-group translation sliders (move entire group along X, Y, Z axes)
-        with server.gui.add_folder("Group Positions"):
-            # Front+ (Red group)
-            with server.gui.add_folder("Front+ (Red)"):
-                offset_front_pos_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
-                offset_front_pos_y = server.gui.add_slider("Offset Y (cm)", min=-30, max=30, step=0.1, initial_value=1.6)
-                offset_front_pos_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
-            # Front- (Green group)
-            with server.gui.add_folder("Front- (Green)"):
-                offset_front_neg_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
-                offset_front_neg_y = server.gui.add_slider("Offset Y (cm)", min=-30, max=30, step=0.1, initial_value=-1.6)
-                offset_front_neg_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
-            # Side+ (Blue group)
-            with server.gui.add_folder("Side+ (Blue)"):
-                offset_side_pos_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=-1.3)
-                offset_side_pos_y = server.gui.add_slider("Offset Y (cm)", min=-40, max=40, step=0.1, initial_value=-33.1)
-                offset_side_pos_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
-            # Side- (Yellow group)
-            with server.gui.add_folder("Side- (Yellow)"):
-                offset_side_neg_x = server.gui.add_slider("Offset X (cm)", min=-30, max=30, step=0.1, initial_value=-1.3)
-                offset_side_neg_y = server.gui.add_slider("Offset Y (cm)", min=-40, max=50, step=0.1, initial_value=33.1)
-                offset_side_neg_z = server.gui.add_slider("Offset Z (cm)", min=-30, max=30, step=0.1, initial_value=0.0)
-
     with global_tab:
         server.gui.add_markdown("**Geometry**")
-        radius_slider = server.gui.add_slider(
-            "Circle radius (cm)", min=10, max=60, step=1, initial_value=35
-        )
         wall_dist_slider = server.gui.add_slider(
             "Wall distance (cm)", min=10, max=1500, step=5, initial_value=50
-        )
-        circle_center_slider = server.gui.add_slider(
-            "Circle center X (cm)", min=-60, max=0, step=5, initial_value=-35
         )
         server.gui.add_html("<hr style='margin:8px 0;'><b>Global Rotation:</b>")
         global_rotation_z_slider = server.gui.add_slider(
@@ -694,16 +605,6 @@ def main():
         server.gui.add_html("<div style='color:#888;font-size:10px;margin-top:-4px;'>Fixed cap for CSV pattern legend. AUTO if peak exceeds it.</div>")
         csv_legend_html = server.gui.add_html("")
         csv_diff_html = server.gui.add_html("")
-
-        # Reset button: some Viser button handles don't support on_update;
-        # we'll detect clicks by polling `reset_button.value` in the main loop.
-        reset_button = server.gui.add_button("Reset to original positions")
-        # Per-row enable toggles
-        row1_chk = server.gui.add_checkbox("Row 1 on", initial_value=False)
-        row2_chk = server.gui.add_checkbox("Row 2 on", initial_value=True)
-        row3_chk = server.gui.add_checkbox("Row 3 on", initial_value=True)
-        row4_chk = server.gui.add_checkbox("Row 4 on", initial_value=False)
-        # Absorber controls moved to dedicated folder for clarity
 
     # 3D Model Import (STL files)
     stl_mesh_handle = [None]  # Store mesh handle for removal/update
@@ -1250,33 +1151,10 @@ def main():
     intensity_handles = []
     room_intensity_handles = []
     room_wall_handles = []
-    absorber_handles = []
     imported_csv_handles = []
     
     # Store current LED objects (for reuse in room intensity calculation)
     current_leds = []
-
-    # Absorbers folder (separate group for easier access)
-    with tab_advanced:
-        absorbers_folder = server.gui.add_folder("Absorbers")
-    absorbers_folder.visible = False  # Hidden by default
-    
-    with absorbers_folder:
-        absorbers_enable = server.gui.add_checkbox("Enable absorbers", initial_value=False)
-        abs0_off_x = server.gui.add_slider("Abs0 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1)
-        abs0_off_y = server.gui.add_slider("Abs0 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=2.5)
-        abs0_off_z = server.gui.add_slider("Abs0 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-        abs1_off_x = server.gui.add_slider("Abs1 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1)
-        abs1_off_y = server.gui.add_slider("Abs1 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=-2.5)
-        abs1_off_z = server.gui.add_slider("Abs1 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-        abs2_off_x = server.gui.add_slider("Abs2 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1.8)
-        abs2_off_y = server.gui.add_slider("Abs2 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=-10.5)
-        abs2_off_z = server.gui.add_slider("Abs2 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-        abs2_rot_z = server.gui.add_slider("Abs2 rotation Z (deg)", min=-180, max=180, step=1, initial_value=-14)
-        abs3_off_x = server.gui.add_slider("Abs3 offset X (cm)", min=-50, max=200, step=0.1, initial_value=-1.8)
-        abs3_off_y = server.gui.add_slider("Abs3 offset Y (cm)", min=-50, max=50, step=0.1, initial_value=10.5)
-        abs3_off_z = server.gui.add_slider("Abs3 offset Z (cm)", min=-50, max=50, step=0.1, initial_value=0.0)
-        abs3_rot_z = server.gui.add_slider("Abs3 rotation Z (deg)", min=-180, max=180, step=1, initial_value=14)
 
     # Custom LED Groups folder (dynamic groups)
     with tab_panels:
@@ -1603,41 +1481,6 @@ def main():
             export_custom_group_dxf()
 
 
-    # LED Control Matrix (individual LED and row control for base groups)
-    # These controls are placed inside led_config_folder so they are hidden when no base groups are active
-    group_names = ["Front+", "Front-", "Side+", "Side-"]
-    
-    # Create control folders for each group with HTML buttons inside led_config_folder
-    with led_config_folder:
-        for group_idx, (group_name, color_hex) in enumerate(zip(group_names, group_colors_hex)):
-            with server.gui.add_folder(f"{group_name}"):
-                # Group control button (toggle entire group)
-                group_btn = server.gui.add_button(f"ALL", color=color_hex)
-                group_buttons[group_idx] = group_btn
-                
-                server.gui.add_html("<hr style='margin:4px 0;'>")
-                
-                # Create controls for each row in the group
-                for row_idx in range(4):
-                    # Row header with row toggle button
-                    html_content = f"""
-                    <div style='margin:6px 0 2px 0;'>
-                        <span style='font-weight:600;font-size:11px;'>Row {row_idx + 1}:</span>
-                    </div>
-                    """
-                    server.gui.add_html(html_content)
-                    
-                    # Row toggle button
-                    row_btn = server.gui.add_button(f"Row {row_idx + 1}", color="#666666")
-                    row_buttons[(group_idx, row_idx)] = row_btn
-                    
-                    # LED buttons for this row (3 LEDs) - small square buttons
-                    for led_in_row_idx in range(3):
-                        led_global_idx = group_idx * 12 + row_idx * 3 + led_in_row_idx
-                        led_btn = server.gui.add_button(f"L{led_in_row_idx+1}", color=color_hex)
-                        led_buttons[led_global_idx] = led_btn
-
-
     _scene_view_late = _SimpleNamespace()  # filled after ui.scene_view.build()
 
     def update_scene(*a, **k):
@@ -1682,24 +1525,6 @@ def main():
         _panel_dropdowns=_panel_dropdowns,
         _panel_slot_data=_panel_slot_data,
         _refresh_vio_fov_label=_refresh_vio_fov_label,
-        abs0_off_x=abs0_off_x,
-        abs0_off_y=abs0_off_y,
-        abs0_off_z=abs0_off_z,
-        abs1_off_x=abs1_off_x,
-        abs1_off_y=abs1_off_y,
-        abs1_off_z=abs1_off_z,
-        abs2_off_x=abs2_off_x,
-        abs2_off_y=abs2_off_y,
-        abs2_off_z=abs2_off_z,
-        abs2_rot_z=abs2_rot_z,
-        abs3_off_x=abs3_off_x,
-        abs3_off_y=abs3_off_y,
-        abs3_off_z=abs3_off_z,
-        abs3_rot_z=abs3_rot_z,
-        absorbers_enable=absorbers_enable,
-        absorbers_folder=absorbers_folder,
-        base_groups_active=base_groups_active,
-        circle_center_slider=circle_center_slider,
         clear_stl_model=clear_stl_model,
         create_custom_group=create_custom_group,
         create_individual_led=create_individual_led,
@@ -1709,39 +1534,10 @@ def main():
         global_pos_y_slider=global_pos_y_slider,
         global_pos_z_slider=global_pos_z_slider,
         global_rotation_z_slider=global_rotation_z_slider,
-        group_colors_hex=group_colors_hex,
         individual_leds=individual_leds,
-        led_buttons=led_buttons,
-        led_config_folder=led_config_folder,
-        led_states=led_states,
         load_stl_file=load_stl_file,
         loading_in_progress=loading_in_progress,
-        offset_front_neg_x=offset_front_neg_x,
-        offset_front_neg_y=offset_front_neg_y,
-        offset_front_neg_z=offset_front_neg_z,
-        offset_front_pos_x=offset_front_pos_x,
-        offset_front_pos_y=offset_front_pos_y,
-        offset_front_pos_z=offset_front_pos_z,
-        offset_side_neg_x=offset_side_neg_x,
-        offset_side_neg_y=offset_side_neg_y,
-        offset_side_neg_z=offset_side_neg_z,
-        offset_side_pos_x=offset_side_pos_x,
-        offset_side_pos_y=offset_side_pos_y,
-        offset_side_pos_z=offset_side_pos_z,
         project_loaded=project_loaded,
-        radius_slider=radius_slider,
-        rot_front_neg=rot_front_neg,
-        rot_front_pos=rot_front_pos,
-        rot_side_neg=rot_side_neg,
-        rot_side_pos=rot_side_pos,
-        rot_y_front_neg=rot_y_front_neg,
-        rot_y_front_pos=rot_y_front_pos,
-        rot_y_side_neg=rot_y_side_neg,
-        rot_y_side_pos=rot_y_side_pos,
-        row1_chk=row1_chk,
-        row2_chk=row2_chk,
-        row3_chk=row3_chk,
-        row4_chk=row4_chk,
         select_panel=select_panel,
         server=server,
         show_led_markers=show_led_markers,
@@ -1762,7 +1558,6 @@ def main():
         tab_panels=tab_panels,
         template_folders=template_folders,
         update_scene=update_scene,
-        viewing_angle_slider=viewing_angle_slider,
         vio_cam1_pitch=vio_cam1_pitch,
         vio_cam1_yaw=vio_cam1_yaw,
         vio_cam2_pitch=vio_cam2_pitch,
@@ -1774,15 +1569,12 @@ def main():
         vio_pos_y=vio_pos_y,
         vio_pos_z=vio_pos_z,
     ))
-    _absorber_config = _config_io_ns._absorber_config
     apply_config = _config_io_ns.apply_config
     get_current_config = _config_io_ns.get_current_config
     new_project = _config_io_ns.new_project
-    update_all_led_buttons = _config_io_ns.update_all_led_buttons
     update_ui_visibility = _config_io_ns.update_ui_visibility
     # --- Wall intensity map (see ui/intensity_map.py) ---
     _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
-        _absorber_config=_absorber_config,
         _expand_mirror_configs=_expand_mirror_configs,
         _panel_slot_data=_panel_slot_data,
         apply_view_mode=apply_view_mode,
@@ -1795,7 +1587,6 @@ def main():
         camera_pos_y=camera_pos_y,
         cell_readout_chk=cell_readout_chk,
         cell_readout_html=cell_readout_html,
-        circle_center_slider=circle_center_slider,
         custom_groups=custom_groups,
         custom_reflectance_slider=custom_reflectance_slider,
         diffuser_angle_slider=diffuser_angle_slider,
@@ -1811,38 +1602,12 @@ def main():
         intensity_rays_slider=intensity_rays_slider,
         intensity_threshold_slider=intensity_threshold_slider,
         led_lumens_slider=led_lumens_slider,
-        led_states=led_states,
         legend_html=legend_html,
         legend_max_input=legend_max_input,
         max_bounces_slider_room=max_bounces_slider_room,
-        offset_front_neg_x=offset_front_neg_x,
-        offset_front_neg_y=offset_front_neg_y,
-        offset_front_neg_z=offset_front_neg_z,
-        offset_front_pos_x=offset_front_pos_x,
-        offset_front_pos_y=offset_front_pos_y,
-        offset_front_pos_z=offset_front_pos_z,
-        offset_side_neg_x=offset_side_neg_x,
-        offset_side_neg_y=offset_side_neg_y,
-        offset_side_neg_z=offset_side_neg_z,
-        offset_side_pos_x=offset_side_pos_x,
-        offset_side_pos_y=offset_side_pos_y,
-        offset_side_pos_z=offset_side_pos_z,
-        radius_slider=radius_slider,
         ray_uniformity_slider=ray_uniformity_slider,
         reflections_enable=reflections_enable,
         room_mode_enable=room_mode_enable,
-        rot_front_neg=rot_front_neg,
-        rot_front_pos=rot_front_pos,
-        rot_side_neg=rot_side_neg,
-        rot_side_pos=rot_side_pos,
-        rot_y_front_neg=rot_y_front_neg,
-        rot_y_front_pos=rot_y_front_pos,
-        rot_y_side_neg=rot_y_side_neg,
-        rot_y_side_pos=rot_y_side_pos,
-        row1_chk=row1_chk,
-        row2_chk=row2_chk,
-        row3_chk=row3_chk,
-        row4_chk=row4_chk,
         server=server,
         show_intensity_map=show_intensity_map,
         show_tilt_fovs=show_tilt_fovs,
@@ -1858,7 +1623,6 @@ def main():
         tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
         view_mode_dropdown=view_mode_dropdown,
-        viewing_angle_slider=viewing_angle_slider,
         vio_cam1_pitch=vio_cam1_pitch,
         vio_cam1_yaw=vio_cam1_yaw,
         vio_cam2_pitch=vio_cam2_pitch,
@@ -1914,22 +1678,6 @@ def main():
         _build_stl_transform=_build_stl_transform,
         _last_room_cache=_last_room_cache,
         _room_metrics_html=_room_metrics_html,
-        abs0_off_x=abs0_off_x,
-        abs0_off_y=abs0_off_y,
-        abs0_off_z=abs0_off_z,
-        abs1_off_x=abs1_off_x,
-        abs1_off_y=abs1_off_y,
-        abs1_off_z=abs1_off_z,
-        abs2_off_x=abs2_off_x,
-        abs2_off_y=abs2_off_y,
-        abs2_off_z=abs2_off_z,
-        abs2_rot_z=abs2_rot_z,
-        abs3_off_x=abs3_off_x,
-        abs3_off_y=abs3_off_y,
-        abs3_off_z=abs3_off_z,
-        abs3_rot_z=abs3_rot_z,
-        absorbers_enable=absorbers_enable,
-        circle_center_slider=circle_center_slider,
         compute_room_intensity=compute_room_intensity,
         current_leds=current_leds,
         global_rotation_z_slider=global_rotation_z_slider,
@@ -1937,7 +1685,6 @@ def main():
         intensity_to_color=intensity_to_color,
         legend_html=legend_html,
         legend_max_input=legend_max_input,
-        radius_slider=radius_slider,
         room_back_dist=room_back_dist,
         room_front_dist=room_front_dist,
         room_grid_size=room_grid_size,
@@ -1967,28 +1714,12 @@ def main():
         _expand_mirror_configs=_expand_mirror_configs,
         _panel_slot_data=_panel_slot_data,
         apply_view_mode=apply_view_mode,
-        abs0_off_x=abs0_off_x,
-        abs0_off_y=abs0_off_y,
-        abs0_off_z=abs0_off_z,
-        abs1_off_x=abs1_off_x,
-        abs1_off_y=abs1_off_y,
-        abs1_off_z=abs1_off_z,
-        abs2_off_x=abs2_off_x,
-        abs2_off_y=abs2_off_y,
-        abs2_off_z=abs2_off_z,
-        abs2_rot_z=abs2_rot_z,
-        abs3_off_x=abs3_off_x,
-        abs3_off_y=abs3_off_y,
-        abs3_off_z=abs3_off_z,
-        abs3_rot_z=abs3_rot_z,
-        absorbers_enable=absorbers_enable,
         calibration_factor_slider=calibration_factor_slider,
         camera_fov_h=camera_fov_h,
         camera_fov_v=camera_fov_v,
         camera_pitch=camera_pitch,
         camera_pos_x=camera_pos_x,
         camera_pos_y=camera_pos_y,
-        circle_center_slider=circle_center_slider,
         custom_groups=custom_groups,
         diffuser_angle_slider=diffuser_angle_slider,
         diffuser_enable_chk=diffuser_enable_chk,
@@ -1997,35 +1728,9 @@ def main():
         intensity_rays_slider=intensity_rays_slider,
         intensity_to_color=intensity_to_color,
         led_lumens_slider=led_lumens_slider,
-        led_states=led_states,
-        offset_front_neg_x=offset_front_neg_x,
-        offset_front_neg_y=offset_front_neg_y,
-        offset_front_neg_z=offset_front_neg_z,
-        offset_front_pos_x=offset_front_pos_x,
-        offset_front_pos_y=offset_front_pos_y,
-        offset_front_pos_z=offset_front_pos_z,
-        offset_side_neg_x=offset_side_neg_x,
-        offset_side_neg_y=offset_side_neg_y,
-        offset_side_neg_z=offset_side_neg_z,
-        offset_side_pos_x=offset_side_pos_x,
-        offset_side_pos_y=offset_side_pos_y,
-        offset_side_pos_z=offset_side_pos_z,
-        radius_slider=radius_slider,
         ray_uniformity_slider=ray_uniformity_slider,
         room_front_dist=room_front_dist,
         room_mode_enable=room_mode_enable,
-        rot_front_neg=rot_front_neg,
-        rot_front_pos=rot_front_pos,
-        rot_side_neg=rot_side_neg,
-        rot_side_pos=rot_side_pos,
-        rot_y_front_neg=rot_y_front_neg,
-        rot_y_front_pos=rot_y_front_pos,
-        rot_y_side_neg=rot_y_side_neg,
-        rot_y_side_pos=rot_y_side_pos,
-        row1_chk=row1_chk,
-        row2_chk=row2_chk,
-        row3_chk=row3_chk,
-        row4_chk=row4_chk,
         stl_absorber_enable=stl_absorber_enable,
         stl_mesh_data=stl_mesh_data,
         stl_pos_x=stl_pos_x,
@@ -2035,7 +1740,6 @@ def main():
         stl_rot_y=stl_rot_y,
         stl_rot_z=stl_rot_z,
         stl_scale=stl_scale,
-        viewing_angle_slider=viewing_angle_slider,
         wall_dist_slider=wall_dist_slider,
     ))
     capture_camera_fov_image = _fov_capture_ns.capture_camera_fov_image
@@ -2070,22 +1774,6 @@ def main():
         _refresh_uniformity=_refresh_uniformity,
         _refresh_vio_fov_label=_refresh_vio_fov_label,
         _select_panel_impl=_select_panel_impl,
-        abs0_off_x=abs0_off_x,
-        abs0_off_y=abs0_off_y,
-        abs0_off_z=abs0_off_z,
-        abs1_off_x=abs1_off_x,
-        abs1_off_y=abs1_off_y,
-        abs1_off_z=abs1_off_z,
-        abs2_off_x=abs2_off_x,
-        abs2_off_y=abs2_off_y,
-        abs2_off_z=abs2_off_z,
-        abs2_rot_z=abs2_rot_z,
-        abs3_off_x=abs3_off_x,
-        abs3_off_y=abs3_off_y,
-        abs3_off_z=abs3_off_z,
-        abs3_rot_z=abs3_rot_z,
-        absorber_handles=absorber_handles,
-        absorbers_enable=absorbers_enable,
         apply_view_mode=apply_view_mode,
         flash_lumens=flash_lumens,
         camera_fov_h=camera_fov_h,
@@ -2097,7 +1785,6 @@ def main():
         capture_camera_fov_image=capture_camera_fov_image,
         capture_fov_btn=capture_fov_btn,
         cell_area_html=cell_area_html,
-        circle_center_slider=circle_center_slider,
         clear_csv_pattern=clear_csv_pattern,
         create_custom_group=create_custom_group,
         csv_clear_btn=csv_clear_btn,
@@ -2122,8 +1809,6 @@ def main():
         global_pos_y_slider=global_pos_y_slider,
         global_pos_z_slider=global_pos_z_slider,
         global_rotation_z_slider=global_rotation_z_slider,
-        group_buttons=group_buttons,
-        group_colors_hex=group_colors_hex,
         guide_handles=guide_handles,
         import_csv_pattern=import_csv_pattern,
         imported_csv_handles=imported_csv_handles,
@@ -2133,26 +1818,11 @@ def main():
         intensity_handles=intensity_handles,
         intensity_rays_slider=intensity_rays_slider,
         intensity_threshold_slider=intensity_threshold_slider,
-        led_buttons=led_buttons,
         led_handles=led_handles,
         led_lumens_slider=led_lumens_slider,
-        led_states=led_states,
         legend_html=legend_html,
         loading_in_progress=loading_in_progress,
-        offset_front_neg_x=offset_front_neg_x,
-        offset_front_neg_y=offset_front_neg_y,
-        offset_front_neg_z=offset_front_neg_z,
-        offset_front_pos_x=offset_front_pos_x,
-        offset_front_pos_y=offset_front_pos_y,
-        offset_front_pos_z=offset_front_pos_z,
-        offset_side_neg_x=offset_side_neg_x,
-        offset_side_neg_y=offset_side_neg_y,
-        offset_side_neg_z=offset_side_neg_z,
-        offset_side_pos_x=offset_side_pos_x,
-        offset_side_pos_y=offset_side_pos_y,
-        offset_side_pos_z=offset_side_pos_z,
         open_panel_designer_btn=open_panel_designer_btn,
-        radius_slider=radius_slider,
         ray_handles=ray_handles,
         ray_length_slider=ray_length_slider,
         read_cell_at_ray=read_cell_at_ray,
@@ -2164,19 +1834,6 @@ def main():
         room_side_dist=room_side_dist,
         room_top_bottom_dist=room_top_bottom_dist,
         room_wall_handles=room_wall_handles,
-        rot_front_neg=rot_front_neg,
-        rot_front_pos=rot_front_pos,
-        rot_side_neg=rot_side_neg,
-        rot_side_pos=rot_side_pos,
-        rot_y_front_neg=rot_y_front_neg,
-        rot_y_front_pos=rot_y_front_pos,
-        rot_y_side_neg=rot_y_side_neg,
-        rot_y_side_pos=rot_y_side_pos,
-        row1_chk=row1_chk,
-        row2_chk=row2_chk,
-        row3_chk=row3_chk,
-        row4_chk=row4_chk,
-        row_buttons=row_buttons,
         run_benchmark=run_benchmark,
         run_benchmark_button=run_benchmark_button,
         save_custom_group_template=save_custom_group_template,
@@ -2207,7 +1864,6 @@ def main():
         template_dropdown=template_dropdown,
         tilt_fov_deg=tilt_fov_deg,
         uniformity_percentile_slider=uniformity_percentile_slider,
-        update_all_led_buttons=update_all_led_buttons,
         update_intensity_button=update_intensity_button,
         update_intensity_map=update_intensity_map,
         update_room_button=update_room_button,
@@ -2218,7 +1874,6 @@ def main():
         flash_current_input=flash_current_input,
         led_voltage_input=led_voltage_input,
         led_efficacy_input=led_efficacy_input,
-        viewing_angle_slider=viewing_angle_slider,
         vio_cam1_pitch=vio_cam1_pitch,
         vio_cam1_yaw=vio_cam1_yaw,
         vio_cam2_pitch=vio_cam2_pitch,
@@ -2282,28 +1937,6 @@ def main():
         wall_dist_slider=wall_dist_slider,
         wall_view_size=wall_view_size,
     ))
-    # Capture default values so reset restores them
-    defaults = {
-        "viewing_angle": viewing_angle_slider.value,
-        "rot_front_pos": rot_front_pos.value,
-        "rot_front_neg": rot_front_neg.value,
-        "rot_side_pos": rot_side_pos.value,
-        "rot_side_neg": rot_side_neg.value,
-        "radius": radius_slider.value,
-        "circle_center_x": circle_center_slider.value,
-        "wall_dist": wall_dist_slider.value,
-        "row1": row1_chk.value,
-        "row2": row2_chk.value,
-        "row3": row3_chk.value,
-        "row4": row4_chk.value,
-        "absorbers_enable": absorbers_enable.value,
-        "abs0_off_x": abs0_off_x.value,
-        "abs0_off_y": abs0_off_y.value,
-        "abs0_off_z": abs0_off_z.value,
-        "abs1_off_x": abs1_off_x.value,
-        "abs1_off_y": abs1_off_y.value,
-        "abs1_off_z": abs1_off_z.value,
-    }
 
     # Initial draw
     update_scene()
@@ -2317,54 +1950,9 @@ def main():
     print("Use the sliders on the left to adjust LED parameters")
     print("=" * 60 + "\n")
 
-    # Keep server running; poll the reset button (some Viser button handles
-    # don't expose event callbacks). When pressed, restore defaults and redraw.
     try:
         while True:
-            time.sleep(0.2)
-            try:
-                if getattr(reset_button, "value", False):
-                    # Restore default slider values
-                    viewing_angle_slider.value = defaults["viewing_angle"]
-                    rot_front_pos.value = defaults["rot_front_pos"]
-                    rot_front_neg.value = defaults["rot_front_neg"]
-                    rot_side_pos.value = defaults["rot_side_pos"]
-                    rot_side_neg.value = defaults["rot_side_neg"]
-                    radius_slider.value = defaults["radius"]
-                    circle_center_slider.value = defaults["circle_center_x"]
-                    wall_dist_slider.value = defaults["wall_dist"]
-                    # Restore row checkbox states
-                    try:
-                        row1_chk.value = defaults["row1"]
-                        row2_chk.value = defaults["row2"]
-                        row3_chk.value = defaults["row3"]
-                        row4_chk.value = defaults["row4"]
-                    except Exception:
-                        pass
-                    # Restore absorber controls
-                    try:
-                        absorbers_enable.value = defaults["absorbers_enable"]
-                        abs0_off_x.value = defaults["abs0_off_x"]
-                        abs0_off_y.value = defaults["abs0_off_y"]
-                        abs0_off_z.value = defaults["abs0_off_z"]
-                        abs1_off_x.value = defaults["abs1_off_x"]
-                        abs1_off_y.value = defaults["abs1_off_y"]
-                        abs1_off_z.value = defaults["abs1_off_z"]
-                    except Exception:
-                        pass
-
-                    # Force wall update and scene redraw
-                    update_wall()
-                    update_scene()
-
-                    # Clear the button press (Viser button may keep value True)
-                    try:
-                        reset_button.value = False
-                    except Exception:
-                        pass
-            except Exception:
-                # Be defensive: ignore polling errors to keep server alive
-                pass
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("Shutting down...")
 

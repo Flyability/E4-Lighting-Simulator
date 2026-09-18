@@ -1,6 +1,5 @@
 """Scene construction (LED rig + occluders) from saved configuration files."""
 
-from .absorbers import build_elios_absorbers, rotate_absorbers_z
 from .builder import (
     Scene,
     apply_diffuser,
@@ -44,7 +43,6 @@ __all__ = [
     "VioCameras",
     "apply_diffuser",
     "apply_global_transform",
-    "build_elios_absorbers",
     "build_leds_from_config",
     "build_leds_from_layout",
     "build_panel_leds",
@@ -59,7 +57,6 @@ __all__ = [
     "load_config",
     "load_layout",
     "load_platform",
-    "rotate_absorbers_z",
     "save_json",
     "stl_mesh_data",
     "stl_transform",

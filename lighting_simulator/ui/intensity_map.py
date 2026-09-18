@@ -16,7 +16,6 @@ from lighting_simulator.camera.fov import (
 )
 from lighting_simulator.domain.guides import dynamic_group_world_geometry as _dynamic_group_world_geometry
 from lighting_simulator.domain.led_factory import create_leds
-from lighting_simulator.scene.absorbers import build_elios_absorbers, rotate_absorbers_z
 from lighting_simulator.scene.builder import apply_diffuser, apply_global_transform
 from lighting_simulator.scene.stl import global_z_rotation_4x4, stl_mesh_data as stl_mesh_data_payload
 from lighting_simulator.simulation import (
@@ -29,7 +28,6 @@ from lighting_simulator.ui.mesh_lighting import _build_stl_transform
 
 
 def build(ctx):
-    _absorber_config = ctx._absorber_config
     _expand_mirror_configs = ctx._expand_mirror_configs
     _panel_slot_data = ctx._panel_slot_data
     apply_view_mode = ctx.apply_view_mode
@@ -43,7 +41,6 @@ def build(ctx):
     camera_pos_y = ctx.camera_pos_y
     cell_readout_chk = ctx.cell_readout_chk
     cell_readout_html = ctx.cell_readout_html
-    circle_center_slider = ctx.circle_center_slider
     custom_groups = ctx.custom_groups
     custom_reflectance_slider = ctx.custom_reflectance_slider
     diffuser_angle_slider = ctx.diffuser_angle_slider
@@ -59,38 +56,12 @@ def build(ctx):
     intensity_rays_slider = ctx.intensity_rays_slider
     intensity_threshold_slider = ctx.intensity_threshold_slider
     led_lumens_slider = ctx.led_lumens_slider
-    led_states = ctx.led_states
     legend_html = ctx.legend_html
     legend_max_input = ctx.legend_max_input
     max_bounces_slider_room = ctx.max_bounces_slider_room
-    offset_front_neg_x = ctx.offset_front_neg_x
-    offset_front_neg_y = ctx.offset_front_neg_y
-    offset_front_neg_z = ctx.offset_front_neg_z
-    offset_front_pos_x = ctx.offset_front_pos_x
-    offset_front_pos_y = ctx.offset_front_pos_y
-    offset_front_pos_z = ctx.offset_front_pos_z
-    offset_side_neg_x = ctx.offset_side_neg_x
-    offset_side_neg_y = ctx.offset_side_neg_y
-    offset_side_neg_z = ctx.offset_side_neg_z
-    offset_side_pos_x = ctx.offset_side_pos_x
-    offset_side_pos_y = ctx.offset_side_pos_y
-    offset_side_pos_z = ctx.offset_side_pos_z
-    radius_slider = ctx.radius_slider
     ray_uniformity_slider = ctx.ray_uniformity_slider
     reflections_enable = ctx.reflections_enable
     room_mode_enable = ctx.room_mode_enable
-    rot_front_neg = ctx.rot_front_neg
-    rot_front_pos = ctx.rot_front_pos
-    rot_side_neg = ctx.rot_side_neg
-    rot_side_pos = ctx.rot_side_pos
-    rot_y_front_neg = ctx.rot_y_front_neg
-    rot_y_front_pos = ctx.rot_y_front_pos
-    rot_y_side_neg = ctx.rot_y_side_neg
-    rot_y_side_pos = ctx.rot_y_side_pos
-    row1_chk = ctx.row1_chk
-    row2_chk = ctx.row2_chk
-    row3_chk = ctx.row3_chk
-    row4_chk = ctx.row4_chk
     server = ctx.server
     show_tilt_fovs = ctx.show_tilt_fovs
     tilt_fov_deg = ctx.tilt_fov_deg
@@ -106,7 +77,6 @@ def build(ctx):
     stl_scale = ctx.stl_scale
     uniformity_percentile_slider = ctx.uniformity_percentile_slider
     vio_occupancy_lux = ctx.vio_occupancy_lux
-    viewing_angle_slider = ctx.viewing_angle_slider
     vio_cam1_pitch = ctx.vio_cam1_pitch
     vio_cam1_yaw = ctx.vio_cam1_yaw
     vio_cam2_pitch = ctx.vio_cam2_pitch
@@ -156,7 +126,6 @@ def build(ctx):
             front_dist=float(front_dist), side_dist=float(side_dist),
             top_bottom_dist=float(top_bottom_dist), back_dist=back_dist,
             grid_size=int(grid_size), rays_per_pixel=int(num_rays_per_led),
-            led_x_center=float(circle_center_slider.value),
             max_bounces=int(max_bounces_slider_room.value) if reflections_on else 0,
             wall_reflectance=float(custom_reflectance_slider.value) if reflections_on else 0.0,
         )
@@ -424,27 +393,8 @@ def build(ctx):
         )
 
     def _build_current_leds_and_absorbers():
-        """Build LEDs and absorbers from current GUI state."""
-        front_angle = 0.0
-        side_angle = 90.0
-        viewing_angle = viewing_angle_slider.value
-        radius = radius_slider.value
-        circle_center_x = circle_center_slider.value
-
-        rotations = [
-            rot_front_pos.value, rot_front_neg.value,
-            rot_side_pos.value, rot_side_neg.value,
-        ]
-        rotations_y = [
-            rot_y_front_pos.value, rot_y_front_neg.value,
-            rot_y_side_pos.value, rot_y_side_neg.value,
-        ]
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
+        """Build LEDs (and the STL occluder payload) from current GUI state."""
+        viewing_angle = 120.0  # fallback beam angle for LEDs without their own
 
         custom_groups_configs = []
         for group in custom_groups:
@@ -456,7 +406,6 @@ def build(ctx):
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
                 'led_roles': group.get('led_roles') or [],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
             if group.get('is_dynamic', False):
                 config['num_leds'] = group.get('num_leds', 0)
@@ -508,14 +457,10 @@ def build(ctx):
         _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
 
         leds = create_leds(
-            front_angle, side_angle, viewing_angle, radius, circle_center_x,
+            viewing_angle,
             default_lumens=float(led_lumens_slider.value),
-            group_rotations=rotations, group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states, group_offsets=offsets,
             custom_groups_configs=custom_groups_configs,
             individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
         )
         apply_view_mode(leds)
 
@@ -529,10 +474,7 @@ def build(ctx):
             apply_diffuser(leds, diffuser_angle_slider.value,
                            float(diffuser_transmission_slider.value) / 100.0)
 
-        absorbers = build_elios_absorbers(
-            _absorber_config(), radius, circle_center_x, front_angle,
-        )
-        rotate_absorbers_z(absorbers, _g_rot_z_deg)
+        absorbers = []  # box occluders are gone; the STL mesh is the only occluder
 
         stl_mesh_for_raytracing = None
         if stl_absorber_enable.value and stl_mesh_data[0] is not None:

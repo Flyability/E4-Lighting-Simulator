@@ -23,28 +23,12 @@ def build(ctx):
     _expand_mirror_configs = ctx._expand_mirror_configs
     _panel_slot_data = ctx._panel_slot_data
     apply_view_mode = ctx.apply_view_mode
-    abs0_off_x = ctx.abs0_off_x
-    abs0_off_y = ctx.abs0_off_y
-    abs0_off_z = ctx.abs0_off_z
-    abs1_off_x = ctx.abs1_off_x
-    abs1_off_y = ctx.abs1_off_y
-    abs1_off_z = ctx.abs1_off_z
-    abs2_off_x = ctx.abs2_off_x
-    abs2_off_y = ctx.abs2_off_y
-    abs2_off_z = ctx.abs2_off_z
-    abs2_rot_z = ctx.abs2_rot_z
-    abs3_off_x = ctx.abs3_off_x
-    abs3_off_y = ctx.abs3_off_y
-    abs3_off_z = ctx.abs3_off_z
-    abs3_rot_z = ctx.abs3_rot_z
-    absorbers_enable = ctx.absorbers_enable
     calibration_factor_slider = ctx.calibration_factor_slider
     camera_fov_h = ctx.camera_fov_h
     camera_fov_v = ctx.camera_fov_v
     camera_pitch = ctx.camera_pitch
     camera_pos_x = ctx.camera_pos_x
     camera_pos_y = ctx.camera_pos_y
-    circle_center_slider = ctx.circle_center_slider
     custom_groups = ctx.custom_groups
     diffuser_angle_slider = ctx.diffuser_angle_slider
     diffuser_enable_chk = ctx.diffuser_enable_chk
@@ -53,35 +37,9 @@ def build(ctx):
     intensity_rays_slider = ctx.intensity_rays_slider
     intensity_to_color = ctx.intensity_to_color
     led_lumens_slider = ctx.led_lumens_slider
-    led_states = ctx.led_states
-    offset_front_neg_x = ctx.offset_front_neg_x
-    offset_front_neg_y = ctx.offset_front_neg_y
-    offset_front_neg_z = ctx.offset_front_neg_z
-    offset_front_pos_x = ctx.offset_front_pos_x
-    offset_front_pos_y = ctx.offset_front_pos_y
-    offset_front_pos_z = ctx.offset_front_pos_z
-    offset_side_neg_x = ctx.offset_side_neg_x
-    offset_side_neg_y = ctx.offset_side_neg_y
-    offset_side_neg_z = ctx.offset_side_neg_z
-    offset_side_pos_x = ctx.offset_side_pos_x
-    offset_side_pos_y = ctx.offset_side_pos_y
-    offset_side_pos_z = ctx.offset_side_pos_z
-    radius_slider = ctx.radius_slider
     ray_uniformity_slider = ctx.ray_uniformity_slider
     room_front_dist = ctx.room_front_dist
     room_mode_enable = ctx.room_mode_enable
-    rot_front_neg = ctx.rot_front_neg
-    rot_front_pos = ctx.rot_front_pos
-    rot_side_neg = ctx.rot_side_neg
-    rot_side_pos = ctx.rot_side_pos
-    rot_y_front_neg = ctx.rot_y_front_neg
-    rot_y_front_pos = ctx.rot_y_front_pos
-    rot_y_side_neg = ctx.rot_y_side_neg
-    rot_y_side_pos = ctx.rot_y_side_pos
-    row1_chk = ctx.row1_chk
-    row2_chk = ctx.row2_chk
-    row3_chk = ctx.row3_chk
-    row4_chk = ctx.row4_chk
     stl_absorber_enable = ctx.stl_absorber_enable
     stl_mesh_data = ctx.stl_mesh_data
     stl_pos_x = ctx.stl_pos_x
@@ -91,7 +49,6 @@ def build(ctx):
     stl_rot_y = ctx.stl_rot_y
     stl_rot_z = ctx.stl_rot_z
     stl_scale = ctx.stl_scale
-    viewing_angle_slider = ctx.viewing_angle_slider
     wall_dist_slider = ctx.wall_dist_slider
 
     def capture_camera_fov_image():
@@ -128,34 +85,8 @@ def build(ctx):
         # Create grid for FOV region
         fov_grid = np.zeros((grid_height, grid_width))
         
-        # Get LEDs configuration (fixed angles: front=0°, side=90°)
-        front_angle = 0.0  # Fixed front angle
-        side_angle = 90.0  # Fixed side angle
-        viewing_angle = viewing_angle_slider.value
-        radius = radius_slider.value
-        circle_center_x = circle_center_slider.value
-        
-        rotations = [
-            rot_front_pos.value,
-            rot_front_neg.value,
-            rot_side_pos.value,
-            rot_side_neg.value,
-        ]
-        
-        rotations_y = [
-            rot_y_front_pos.value,
-            rot_y_front_neg.value,
-            rot_y_side_pos.value,
-            rot_y_side_neg.value,
-        ]
-        
-        offsets = [
-            (offset_front_pos_x.value, offset_front_pos_y.value, offset_front_pos_z.value),
-            (offset_front_neg_x.value, offset_front_neg_y.value, offset_front_neg_z.value),
-            (offset_side_pos_x.value, offset_side_pos_y.value, offset_side_pos_z.value),
-            (offset_side_neg_x.value, offset_side_neg_y.value, offset_side_neg_z.value),
-        ]
-        
+        viewing_angle = 120.0  # fallback beam angle for LEDs without their own
+
         # Build custom groups configs list
         custom_groups_configs = []
         for group in custom_groups:
@@ -167,7 +98,6 @@ def build(ctx):
                 'rotation_z': group['rot_tilt_lr'].value if 'rot_tilt_lr' in group else 0,
                 'led_states': group['led_states'],
                 'led_roles': group.get('led_roles') or [],
-                'row_enabled': [row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
             }
             # Add dynamic group info if present
             if group.get('is_dynamic', False):
@@ -229,20 +159,10 @@ def build(ctx):
         _expand_mirror_configs(custom_groups_configs, individual_leds_configs)
 
         leds = create_leds(
-            front_angle,
-            side_angle,
             viewing_angle,
-            radius,
-            circle_center_x,
             default_lumens=float(led_lumens_slider.value),
-            group_rotations=rotations,
-            group_rotations_y=rotations_y,
-            row_enabled=[row1_chk.value, row2_chk.value, row3_chk.value, row4_chk.value],
-            led_states=led_states,
-            group_offsets=offsets,
             custom_groups_configs=custom_groups_configs,
             individual_leds_configs=individual_leds_configs,
-            create_base_groups=any(led_states[:48]),
         )
         apply_view_mode(leds)
         
@@ -255,90 +175,8 @@ def build(ctx):
                 if led.lumens is not None:
                     led.lumens = led.lumens * _diff_trans
 
-        # Build absorbers
-        absorbers = []
-        angles_deg = [front_angle, -front_angle, side_angle, -side_angle]
-        for i, angle_deg in enumerate(angles_deg):
-            if i not in (0, 1):
-                continue
-            angle_rad = np.radians(angle_deg)
-            gx = circle_center_x + radius * np.cos(angle_rad)
-            gy = radius * np.sin(angle_rad)
-            y_offset = 6.5 if i == 0 else -6.5
-            gy = gy + y_offset
-            
-            radial = np.array((gx - circle_center_x, gy, 0.0), dtype=float)
-            if np.linalg.norm(radial) == 0:
-                radial_unit = np.array((1.0, 0.0, 0.0))
-            else:
-                radial_unit = radial / np.linalg.norm(radial)
-            
-            base_abs_cx = gx + radial_unit[0] * 5.0 - 5.0
-            y_base_offset = -4.2 if i == 0 else 4.2
-            base_abs_cy = gy + radial_unit[1] * 5.0 + y_base_offset
-            base_abs_cz = 0.0
-            
-            if not absorbers_enable.value:
-                continue
-            if i == 0:
-                abs_cx = base_abs_cx + abs0_off_x.value
-                abs_cy = base_abs_cy + abs0_off_y.value
-                abs_cz = base_abs_cz + abs0_off_z.value
-            else:
-                abs_cx = base_abs_cx + abs1_off_x.value
-                abs_cy = base_abs_cy + abs1_off_y.value
-                abs_cz = base_abs_cz + abs1_off_z.value
-            
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': None,
-            })
-        
-        # Add abs2 and abs3 at origin with offsets (if absorbers enabled)
-        if absorbers_enable.value:
-            # Abs2 with rotation
-            abs_cx = 0.0 + abs2_off_x.value
-            abs_cy = 0.0 + abs2_off_y.value
-            abs_cz = 0.0 + abs2_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs2_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-            
-            # Abs3 with rotation
-            abs_cx = 0.0 + abs3_off_x.value
-            abs_cy = 0.0 + abs3_off_y.value
-            abs_cz = 0.0 + abs3_off_z.value
-            half_length_x = 5.0 / 2.0
-            half_width_y = 1.5 / 2.0
-            half_thickness_z = 3.0 / 2.0
-            # Convert rotation angle to quaternion (rotation around Z axis)
-            angle_rad = np.radians(abs3_rot_z.value)
-            qw = np.cos(angle_rad / 2)
-            qx = 0.0
-            qy = 0.0
-            qz = np.sin(angle_rad / 2)
-            absorbers.append({
-                'center': (abs_cx, abs_cy, abs_cz),
-                'half_sizes': (half_length_x, half_width_y, half_thickness_z),
-                'rotation': (qw, qx, qy, qz),
-            })
-        
+        absorbers = []  # box occluders are gone; the STL mesh is the only occluder
+
         # Ray tracing for FOV region
         lumens_per_led = float(led_lumens_slider.value) * float(calibration_factor_slider.value)
         # Apply diffuser transmission loss
