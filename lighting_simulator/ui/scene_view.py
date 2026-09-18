@@ -1621,4 +1621,11 @@ def build(ctx):
 
 
 
-    return SimpleNamespace(update_scene=update_scene, update_wall=update_wall)
+    def hide_wall():
+        """Remove the flat wall (sphere mode); ``update_wall`` brings it back."""
+        try:
+            wall_handle.remove()
+        except (AttributeError, KeyError):
+            pass
+
+    return SimpleNamespace(update_scene=update_scene, update_wall=update_wall, hide_wall=hide_wall)

@@ -70,6 +70,7 @@ from lighting_simulator.simulation import gpu_backend as _gpu_backend
 from lighting_simulator.ui import csv_overlay as _csv_overlay
 from lighting_simulator.ui import optimize_tab as _optimize_tab
 from lighting_simulator.ui import room_mode as _room_mode
+from lighting_simulator.ui import sphere_mode as _sphere_mode
 from lighting_simulator.ui.mesh_lighting import _build_stl_transform, calculate_mesh_lighting
 from types import SimpleNamespace as _SimpleNamespace
 from lighting_simulator.ui import scene_view as _scene_view
@@ -1489,6 +1490,38 @@ def main():
     update_scene = _scene_view_ns.update_scene
     update_wall = _scene_view_ns.update_wall
     _scene_view_late.update_scene = _scene_view_ns.update_scene
+    # --- Sphere mode (see ui/sphere_mode.py) ---
+    _sphere_mode.build(_SimpleNamespace(
+        _build_current_leds_and_absorbers=_build_current_leds_and_absorbers,
+        _build_lux_legend_html=_build_lux_legend_html,
+        _emission_settings=_intensity_map_ns._emission_settings,
+        camera_fov_h=camera_fov_h,
+        camera_fov_v=camera_fov_v,
+        camera_pitch=camera_pitch,
+        camera_pos_x=camera_pos_x,
+        camera_pos_y=camera_pos_y,
+        hide_wall=_scene_view_ns.hide_wall,
+        intensity_threshold_slider=intensity_threshold_slider,
+        intensity_to_color=intensity_to_color,
+        legend_html=legend_html,
+        legend_max_input=legend_max_input,
+        server=server,
+        state=state,
+        tab_advanced=tab_advanced,
+        uniformity_percentile_slider=uniformity_percentile_slider,
+        update_wall=update_wall,
+        view_mode_dropdown=view_mode_dropdown,
+        vio_cam1_pitch=vio_cam1_pitch,
+        vio_cam1_yaw=vio_cam1_yaw,
+        vio_cam2_pitch=vio_cam2_pitch,
+        vio_cam2_yaw=vio_cam2_yaw,
+        vio_landscape=vio_landscape,
+        vio_long_fov=vio_long_fov,
+        vio_occupancy_lux=vio_occupancy_lux,
+        vio_pos_x=vio_pos_x,
+        vio_pos_y=vio_pos_y,
+        vio_pos_z=vio_pos_z,
+    ))
     # --- Optimize tab (see ui/optimize_tab.py) ---
     _optimize_tab_ns = _optimize_tab.build(_SimpleNamespace(
         _project_root=_project_root,

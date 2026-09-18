@@ -20,7 +20,7 @@ python -m pytest tests           # engine regression tests
 | `domain/` | `LED`, `LEDPlacement`, `create_leds` factory, optics (Lambertian/lens), geometry, panel guides, XZ mirroring |
 | `camera/` | Main pinhole camera and VD66GY fisheye VIO FOV geometry |
 | `raytracing/` | Intersection kernels: box occluders, STL meshes (trimesh BVH), GPU (CuPy/Taichi) |
-| `simulation/` | The engine: `compute_wall_intensity`, `compute_room_intensity`, ray emission, room geometry, `WallSettings`/`RoomSettings`/`EmissionSettings` |
+| `simulation/` | The engine: `compute_wall_intensity`, `compute_room_intensity`, ray emission, room geometry, `WallSettings`/`RoomSettings`/`EmissionSettings`; `sphere.py` = analytic illuminance on a sphere around the drone (Advanced → *Sphere Mode*: equal-distance VIO / main-camera coverage, editable radius) |
 | `scene/` | Layout / platform files (`layouts/*.json`, `platforms/*.json`, schema v2 in `scene/layout.py`) → LEDs + STL occluder (`build_scene_from_config`, `build_scene_from_layout`); `convert_v1` upgrades pre-v2 configs |
 | `analysis/` | `uniformity_metrics` (U0, U1, CV, ΔEV) and legend HTML |
 | `pipeline.py` | Headless facade: `simulate_wall(cfg, settings)` / `simulate_room(...)` → grid + metrics |
