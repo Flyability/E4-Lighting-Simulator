@@ -15,6 +15,7 @@ from lighting_simulator.camera.fov import (
     vio_hfov_vfov_deg,
 )
 from lighting_simulator.scene.builder import apply_diffuser
+from lighting_simulator.simulation.direct import direct_room_intensity, direct_wall_intensity
 from lighting_simulator.scene.stl import stl_mesh_data as stl_mesh_data_payload
 from lighting_simulator.simulation import (
     EmissionSettings, RoomSettings, WallSettings, room_wall_cell_centers, wall_grid_cell_centers_cm,
@@ -27,6 +28,7 @@ from lighting_simulator.ui.mesh_lighting import _build_stl_transform
 
 def build(ctx):
     state = ctx.state
+    analytic_chk = ctx.analytic_chk
     apply_view_mode = ctx.apply_view_mode
     view_mode_dropdown = ctx.view_mode_dropdown
     bw_scale_chk = ctx.bw_scale_chk
@@ -102,6 +104,13 @@ def build(ctx):
             wall_dist=float(wall_dist), grid_size=int(grid_size),
             wall_size=float(wall_size), rays_per_pixel=int(num_rays_per_led),
         )
+        if analytic_chk.value:
+            t0 = _time.perf_counter()
+            grid = direct_wall_intensity(leds, settings, _emission_settings(),
+                                         absorbers=absorbers or (), stl_mesh_data=stl_mesh_data)
+            print(f"=== WALL MODE (analytic) === wall x={settings.wall_dist:g} cm, grid {settings.grid_size}², "
+                  f"{sum(1 for l in leds if getattr(l, 'enabled', True))} active LEDs, {_time.perf_counter() - t0:.2f}s")
+            return grid, wall_size
         grid = _wall_engine.compute_wall_intensity(
             leds, settings, _emission_settings(),
             absorbers=absorbers, stl_mesh_data=stl_mesh_data,
@@ -120,6 +129,14 @@ def build(ctx):
             max_bounces=int(max_bounces_slider_room.value) if reflections_on else 0,
             wall_reflectance=float(custom_reflectance_slider.value) if reflections_on else 0.0,
         )
+        if analytic_chk.value:
+            t0 = _time.perf_counter()
+            grids, specs = direct_room_intensity(leds, settings, _emission_settings(),
+                                                 absorbers=absorbers or (), stl_mesh_data=stl_mesh_data)
+            print(f"=== ROOM MODE (analytic, direct light only) === front x={settings.front_dist:g}, grid "
+                  f"{settings.grid_size}²/wall, {_time.perf_counter() - t0:.2f}s"
+                  + ("  ⚠ reflections ignored — untick 'Analytic' to trace bounces" if reflections_on else ""))
+            return grids, specs
         return _room_engine.compute_room_intensity(
             leds, settings, _emission_settings(),
             absorbers=absorbers, stl_mesh_data=stl_mesh_data,
@@ -314,9 +331,12 @@ def build(ctx):
         mode = view_mode_dropdown.value
         flash = mode.startswith("Flash")
         color = "#FF8C00" if flash else "#4CAF50"
+        method = ("<span style='color:#7fbfff;'>analytic direct light</span>" if analytic_chk.value
+                  else "<span style='color:#bbb;'>Monte-Carlo ray tracing</span>")
         return (f"<div style='font-size:11px;margin:6px 0 -4px;color:{color};'>Operating mode: <b>{mode}</b>"
                 + (" — Flash + Both LEDs at the flash current, VIO LEDs continuous" if flash
-                   else " — VIO + Both LEDs continuous, Flash-only LEDs off") + "</div>")
+                   else " — VIO + Both LEDs continuous, Flash-only LEDs off")
+                + f"<br>Method: {method}</div>")
 
     def _wall_metrics_html(grid, wall_size_cm, wall_dist):
         _trap = _camera_fov_wall_trapezoid(
@@ -382,6 +402,16 @@ def build(ctx):
         legend_html.content = legend + _wall_metrics_html(
             cache['grid'], cache['wall_size_cm'], cache['wall_dist'],
         )
+
+    def _on_method_change(_):
+        stale = _last_room_cache['grids'] is not None if room_mode_enable.value else _last_intensity_cache['grid'] is not None
+        if stale:
+            legend_html.content = (
+                "<div style='font-family: sans-serif;'><div style='font-weight:600;margin-bottom:6px;'>Intensity legend</div>"
+                f"<div style='color:#F0AD4E;font-size:12px;'>⚠ Method is now <b>{'analytic' if analytic_chk.value else 'ray tracing'}</b>."
+                "<br>Click 'Update Intensity Map' / 'Update Room Intensity' to recalculate.</div></div>")
+
+    analytic_chk.on_update(_on_method_change)
 
     def _build_current_leds_and_absorbers():
         """LEDs of the layout in the current operating mode + the STL occluder payload."""

@@ -348,6 +348,12 @@ def main():
 
     with quick_tab:
         update_intensity_button = server.gui.add_button("Update Intensity Map")
+        analytic_chk = server.gui.add_checkbox(
+            "Analytic direct light (no ray tracing)", initial_value=False,
+            hint="Compute each cell's lux from the closed-form LED emission model (the tracer's expected value: "
+                 "no ray noise, instant, 'Rays per pixel' ignored). Frame shadows are kept; wall reflections "
+                 "are NOT modelled — untick to compare with the Monte-Carlo tracer or to include bounces.",
+        )
         view_mode_dropdown = server.gui.add_dropdown(
             "Operating mode", options=[_VIEW_FLIGHT, _VIEW_FLASH], initial_value=_VIEW_FLIGHT,
             hint="Flight: VIO + Both LEDs at their continuous flux, Flash-only LEDs off. "
@@ -1208,6 +1214,7 @@ def main():
     # --- Wall intensity map (see ui/intensity_map.py) ---
     _intensity_map_ns = _intensity_map.build(_SimpleNamespace(
         state=state,
+        analytic_chk=analytic_chk,
         apply_view_mode=apply_view_mode,
         bw_scale_chk=bw_scale_chk,
         calibration_factor_slider=calibration_factor_slider,

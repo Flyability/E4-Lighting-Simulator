@@ -68,3 +68,37 @@ def direct_illuminance(points_cm, inward_normals, leds, emission, lumens=None, a
         intensity = flux * (n + 1.0) * np.power(cos_theta[lit], n) / (2.0 * np.pi * denom)  # cd
         out[lit] += intensity * cos_phi[lit] / (d_cm[lit] / 100.0) ** 2
     return out
+
+
+def direct_wall_intensity(leds, settings, emission, absorbers=(), stl_mesh_data=None):
+    """Analytic counterpart of ``wall.compute_wall_intensity``: lux grid (rows = Z, cols = Y)."""
+    from lighting_simulator.simulation.room_geometry import wall_grid_cell_centers_cm
+    shape = (int(settings.grid_size), int(settings.grid_size))
+    pts = wall_grid_cell_centers_cm(shape, float(settings.wall_size), float(settings.wall_dist))
+    normals = np.tile([-1.0, 0.0, 0.0], (pts.size // 3, 1))
+    active = [led for led in leds if getattr(led, 'enabled', True)]
+    return direct_illuminance(pts.reshape(-1, 3), normals, active, emission, absorbers=absorbers,
+                              stl_mesh_data=stl_mesh_data).reshape(shape)
+
+
+def direct_room_intensity(leds, settings, emission, absorbers=(), stl_mesh_data=None):
+    """Analytic counterpart of ``room.compute_room_intensity`` (direct light only): ``(grids, wall_specs)``."""
+    from lighting_simulator.raytracing.mesh import prepare_mesh_ray_accelerator
+    from lighting_simulator.simulation.room_geometry import (
+        WALL_INWARD_NORMALS, build_wall_specs, room_wall_cell_centers, wall_grid_shape,
+    )
+    wall_specs = build_wall_specs(
+        settings.front_dist, settings.side_dist, settings.top_bottom_dist,
+        int(settings.grid_size), settings.led_x_center, settings.back_dist, settings.lateral_depth,
+    )
+    active = [led for led in leds if getattr(led, 'enabled', True)]
+    accel = prepare_mesh_ray_accelerator(stl_mesh_data) if stl_mesh_data is not None else None
+    grids = {}
+    for name, spec in wall_specs.items():
+        pts = room_wall_cell_centers(name, spec, settings.front_dist, settings.side_dist,
+                                     settings.top_bottom_dist, settings.back_dist)
+        shape = wall_grid_shape(spec, name)
+        normals = np.tile(WALL_INWARD_NORMALS[name], (pts.size // 3, 1))
+        grids[name] = direct_illuminance(pts.reshape(-1, 3), normals, active, emission, absorbers=absorbers,
+                                         stl_mesh_data=stl_mesh_data, accel=accel).reshape(shape)
+    return grids, wall_specs
